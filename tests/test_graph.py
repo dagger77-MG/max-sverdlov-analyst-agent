@@ -1,8 +1,24 @@
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app import graph
+
+
+@pytest.fixture(autouse=True)
+def patch_checkpointer(monkeypatch: pytest.MonkeyPatch):
+    """Keep graph unit tests independent from optional SQLite checkpoints."""
+    graph.build_graph.cache_clear()
+
+    if hasattr(graph.get_checkpointer, "cache_clear"):
+        graph.get_checkpointer.cache_clear()
+
+    monkeypatch.setattr(graph, "get_checkpointer", lambda: None)
+
+    yield
+
+    graph.build_graph.cache_clear()
 
 
 class FakeActionLLM:
@@ -365,3 +381,88 @@ def test_route_specific_instructions_for_unstructured_route() -> None:
     assert "UNSTRUCTURED queries" in instructions
     assert "Then use summarize_rows" in instructions
     assert "Do not answer from general knowledge" in instructions
+
+
+def test_build_graph_config_uses_session_id_as_thread_id() -> None:
+    config = graph._build_graph_config(
+        session_id="demo_session",
+        user_id="max",
+        max_iterations=12,
+    )
+
+    assert config["configurable"]["thread_id"] == "demo_session"
+    assert config["configurable"]["user_id"] == "max"
+    assert config["recursion_limit"] == 17
+
+
+def test_create_invocation_state_returns_full_state_for_new_thread() -> None:
+    class EmptyCheckpointState:
+        values = {}
+
+    class FakeGraph:
+        def get_state(self, config):
+            return EmptyCheckpointState()
+
+    config = graph._build_graph_config(
+        session_id="new_session",
+        user_id="max",
+        max_iterations=12,
+    )
+
+    result = graph._create_invocation_state(
+        graph=FakeGraph(),
+        query="How many refund requests?",
+        session_id="new_session",
+        user_id="max",
+        max_iterations=12,
+        config=config,
+    )
+
+    assert result["session_id"] == "new_session"
+    assert result["user_id"] == "max"
+    assert result["last_structured_results"] == []
+    assert isinstance(result["messages"][0], HumanMessage)
+    assert result["messages"][0].content == "How many refund requests?"
+
+
+def test_create_invocation_state_returns_partial_update_for_existing_thread() -> None:
+    class ExistingCheckpointState:
+        values = {
+            "messages": [HumanMessage(content="Previous question")],
+            "last_structured_results": [
+                {
+                    "label": "count_rows",
+                    "value": 3,
+                    "query_type": "count",
+                    "row_ids": [1, 2, 3],
+                }
+            ],
+        }
+
+    class FakeGraph:
+        def get_state(self, config):
+            return ExistingCheckpointState()
+
+    config = graph._build_graph_config(
+        session_id="existing_session",
+        user_id="max",
+        max_iterations=12,
+    )
+
+    result = graph._create_invocation_state(
+        graph=FakeGraph(),
+        query="Show me 3 more.",
+        session_id="existing_session",
+        user_id="max",
+        max_iterations=12,
+        config=config,
+    )
+
+    assert result["session_id"] == "existing_session"
+    assert result["user_id"] == "max"
+    assert result["tool_trace"] == []
+    assert result["iteration_count"] == 0
+    assert result["final_answer"] is None
+    assert "last_structured_results" not in result
+    assert isinstance(result["messages"][0], HumanMessage)
+    assert result["messages"][0].content == "Show me 3 more."
