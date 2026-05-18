@@ -404,13 +404,9 @@ def _execute_tool(
         )
         observation = (
             f"Found {result.match_count} matching rows. "
-            f"Returned row_ids for the matching subset: {summarize_row_ids(result.row_ids)}. "
-            "This filter step is complete. Do not call filter_rows again with the same filters. "
-            f"If the user asked how many/count/number of, the answer is {result.match_count}; "
-            "choose final_answer now. Do not call count_rows with the previewed row IDs shown "
-            "in this observation. "
-            "If the user asked for examples/samples/show me N, call sample_examples with these row_ids. "
-            "If the user asked for a summary/themes/patterns, call summarize_rows with these row_ids."
+            f"match_count={result.match_count}. "
+            f"Returned row_ids for the matching subset: {summarize_row_ids(result.row_ids)}."
+
         )
 
         _append_trace(state, tool_name, tool_input, observation)
@@ -428,12 +424,7 @@ def _execute_tool(
     if tool_name == "count_rows":
         row_ids = _safe_int_list(tool_input.get("row_ids"))
         result = count_rows_impl(row_ids=row_ids)
-        observation = (
-            f"Count = {result.count}. "
-            "The requested count is now available in this observation. "
-            "If the user asked for a count, choose final_answer now. "
-            "Do not call count_rows again with the same input."
-        )
+        observation = f"Count = {result.count}."
         _append_trace(
             state,
             tool_name,
@@ -464,12 +455,7 @@ def _execute_tool(
         observation = (
             f"Returned {len(result.examples)} examples. "
             f"Next offset = {result.next_offset}. "
-            "The requested examples are now available in this observation. "
-            "If the user asked for examples, choose final_answer now. "
-            "Do not call sample_examples again with the same input. "
-            "If the user later asks for more examples from this same subset, "
-            "call sample_examples with the same row_ids and this next offset.\n"
-            + "\n".join(example_lines)
+            + ("\n" + "\n".join(example_lines) if example_lines else "")
         )
         _append_trace(
             state,
