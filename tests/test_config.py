@@ -28,8 +28,8 @@ def test_app_config_from_env_uses_expected_project_paths() -> None:
 def test_app_config_keeps_model_names_in_config() -> None:
     config = AppConfig.from_env()
 
-    assert config.router_model == "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    assert config.agent_model == "meta-llama/Llama-3.3-70B-Instruct"
+    assert config.router_model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert config.agent_model == "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 def test_normalize_max_iterations_uses_default_when_missing() -> None:

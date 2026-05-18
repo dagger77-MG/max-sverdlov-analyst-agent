@@ -112,8 +112,8 @@ app/config.py
 Current model configuration:
 
 ```text
-router_model = meta-llama/Meta-Llama-3.1-8B-Instruct
-agent_model = meta-llama/Llama-3.3-70B-Instruct
+router_model = Qwen/Qwen3-30B-A3B-Instruct-2507
+agent_model = Qwen/Qwen3-235B-A22B-Instruct-2507
 nebius_base_url = https://api.tokenfactory.nebius.com/v1/
 ```
 
@@ -377,6 +377,21 @@ The ReAct agent receives route-specific instructions:
 - Unstructured route: identify relevant rows and then use `summarize_rows`.
 - Out-of-scope route: skip data tools and return a scoped refusal.
 
+### ReAct Implementation Note
+
+This project uses a custom educational ReAct-style loop inside the LangGraph
+`react_data_agent_node`.
+
+It does not use LangGraph's prebuilt `create_react_agent` helper. This is an
+intentional design choice for assignment clarity: the code explicitly shows how
+the agent selects actions, calls tools, records observations, tracks recent
+structured results for follow-up questions, enforces the max-iteration limit,
+and returns a final answer.
+
+The graph is still a LangGraph ReAct-style graph: routing happens before tool
+selection, dataset questions enter a tool-use loop, tool observations are fed
+back into the next action decision, and out-of-scope questions bypass tools.
+
 ## Tool Reference
 
 ### get_dataset_schema
@@ -587,7 +602,7 @@ Expected:
 
 ## Known Limitations
 
-- Follow-up behavior depends on the agent correctly using recent structured results from checkpointed graph state.
+- Follow-up behavior depends on the agent correctly using recent structured results from checkpointed graph state. The graph stores the relevant context, but the LLM still chooses how to apply it.
 - SQLite checkpoint persistence requires `langgraph-checkpoint-sqlite` to be installed.
 - The router and agent rely on Nebius model support for structured output through LangChain.
 - The exact FastMCP transport URL should be verified from server startup logs.

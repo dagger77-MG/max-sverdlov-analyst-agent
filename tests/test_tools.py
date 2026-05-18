@@ -179,7 +179,15 @@ def test_summarize_rows_falls_back_to_deterministic_summary(
     assert "Top categories: REFUND (2)" in result.summary
 
 
-def test_summarize_rows_returns_non_empty_summary() -> None:
+def test_summarize_rows_returns_non_empty_summary(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools,
+        "get_summarizer_llm",
+        lambda: (_ for _ in ()).throw(RuntimeError("No summarizer available.")),
+    )
+
     result = tools.summarize_rows_impl(
         row_ids=[0, 3],
         focus="refund requests",
@@ -223,8 +231,17 @@ def test_summarize_rows_uses_llm_summary_when_available(
     assert fake_llm.received_messages is not None
     assert "Focus: refund requests" in fake_llm.received_messages[1].content
 
-    
-def test_schema_based_wrappers_call_implementations() -> None:
+
+def test_schema_based_wrappers_call_implementations(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools,
+        "get_summarizer_llm",
+
+        lambda: (_ for _ in ()).throw(RuntimeError("No summarizer available.")),
+    )
+
     filter_result = tools.filter_rows(
         tools.FilterRowsInput(category="REFUND"),
     )
@@ -246,3 +263,27 @@ def test_schema_based_wrappers_call_implementations() -> None:
     assert len(examples_result.examples) == 1
     assert group_result.counts[0].label == "REFUND"
     assert summary_result.row_count_used == 2
+
+
+def test_summarize_rows_falls_back_when_llm_call_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingSummarizerLLM:
+        def invoke(self, messages):
+            raise ValueError("Simulated provider failure.")
+
+    monkeypatch.setattr(
+        tools,
+        "get_summarizer_llm",
+        lambda: FailingSummarizerLLM(),
+    )
+
+    result = tools.summarize_rows_impl(
+        row_ids=[0, 3],
+        focus="refund requests",
+        max_examples=10,
+    )
+
+    assert result.row_count_used == 2
+    assert "Rows reviewed: 2" in result.summary
+    assert "Top categories: REFUND (2)" in result.summary

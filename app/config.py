@@ -65,8 +65,8 @@ class AppConfig:
             required_analysis_columns=("instruction", "response", "category", "intent"),
             nebius_api_key=os.getenv("NEBIUS_API_KEY"),
             nebius_base_url="https://api.tokenfactory.nebius.com/v1/",
-            router_model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-            agent_model="meta-llama/Llama-3.3-70B-Instruct",
+            router_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+            agent_model="Qwen/Qwen3-235B-A22B-Instruct-2507",
         )
 
     def ensure_runtime_dirs(self) -> None:
