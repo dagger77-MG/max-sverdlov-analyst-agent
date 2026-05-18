@@ -466,3 +466,51 @@ def test_create_invocation_state_returns_partial_update_for_existing_thread() ->
     assert "last_structured_results" not in result
     assert isinstance(result["messages"][0], HumanMessage)
     assert result["messages"][0].content == "Show me 3 more."
+
+
+def test_load_user_profile_node_returns_partial_state_update(monkeypatch) -> None:
+    monkeypatch.setattr(
+        graph,
+        "read_user_profile_impl",
+        lambda user_id: type(
+            "ProfileResult",
+            (),
+            {"user_id": user_id, "profile": "# User Profile\n\n- Test profile\n"},
+        )(),
+    )
+
+    state = graph.create_initial_state(
+        query="What do you remember about me?",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    result = graph.load_user_profile_node(state)
+
+    assert result == {
+        "user_profile": "# User Profile\n\n- Test profile\n",
+    }
+
+
+def test_router_node_returns_partial_state_update(monkeypatch) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The query asks for an exact dataset count.",
+        ),
+    )
+
+    state = graph.create_initial_state(
+        query="How many refund requests?",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    result = graph.router_node(state)
+
+    assert result == {
+        "route": "structured",
+        "route_reason": "The query asks for an exact dataset count.",
+    }

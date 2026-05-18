@@ -437,32 +437,34 @@ def _execute_tool(
     raise ValueError(f"Unsupported tool name: {tool_name}")
 
 
-def load_user_profile_node(state: AgentState) -> AgentState:
+def load_user_profile_node(state: AgentState) -> dict[str, Any]:
     """Load persistent profile memory into graph state."""
     profile = read_user_profile_impl(state["user_id"])
-    state["user_profile"] = profile.profile
-    return state
+    return {
+        "user_profile": profile.profile,
+    }
 
 
-def router_node(state: AgentState) -> AgentState:
+def router_node(state: AgentState) -> dict[str, Any]:
     """Classify the latest user query before tool selection."""
     user_query = _latest_user_message(state["messages"])
     decision: RouteDecision = route_query_with_reason(user_query)
 
-    state["route"] = decision.route
-    state["route_reason"] = decision.reason
+    return {
+        "route": decision.route,
+        "route_reason": decision.reason,
+    }
 
-    return state
 
-
-def refusal_node(state: AgentState) -> AgentState:
+def refusal_node(state: AgentState) -> dict[str, Any]:
     """Return a scoped refusal for out-of-scope queries."""
-    state["final_answer"] = OUT_OF_SCOPE_REFUSAL
-    state["messages"].append(AIMessage(content=OUT_OF_SCOPE_REFUSAL))
-    return state
+    return {
+        "final_answer": OUT_OF_SCOPE_REFUSAL,
+        "messages": [AIMessage(content=OUT_OF_SCOPE_REFUSAL)],
+    }
 
 
-def react_data_agent_node(state: AgentState) -> AgentState:
+def react_data_agent_node(state: AgentState) -> dict[str, Any]:
     """Run a ReAct-style tool-use loop for dataset questions."""
     structured_llm = get_structured_action_llm()
 
@@ -478,8 +480,13 @@ def react_data_agent_node(state: AgentState) -> AgentState:
                 "I completed the analysis, but no final answer was provided."
             )
             state["final_answer"] = final_answer
-            state["messages"].append(AIMessage(content=final_answer))
-            return state
+            return {
+                "tool_trace": state["tool_trace"],
+                "last_structured_results": state["last_structured_results"],
+                "iteration_count": state["iteration_count"],
+                "final_answer": final_answer,
+                "messages": [AIMessage(content=final_answer)],
+            }
 
         _execute_tool(
             state=state,
@@ -492,16 +499,21 @@ def react_data_agent_node(state: AgentState) -> AgentState:
         "reasoning steps. Please try asking a more specific dataset question."
     )
     state["final_answer"] = fallback
-    state["messages"].append(AIMessage(content=fallback))
-    return state
+    return {
+        "tool_trace": state["tool_trace"],
+        "last_structured_results": state["last_structured_results"],
+        "iteration_count": state["iteration_count"],
+        "final_answer": fallback,
+        "messages": [AIMessage(content=fallback)],
+    }
 
 
-def profile_update_node(state: AgentState) -> AgentState:
+def profile_update_node(state: AgentState) -> dict[str, Any]:
     """Update the persistent profile only when a durable fact is detected."""
     user_query = _latest_user_message(state["messages"])
 
     if not user_query.strip():
-        return state
+        return {}
 
     try:
         profile_llm = get_structured_profile_llm()
@@ -514,19 +526,19 @@ def profile_update_node(state: AgentState) -> AgentState:
         if not isinstance(decision, ProfileObservationDecision):
             decision = ProfileObservationDecision.model_validate(decision)
     except Exception:
-        return state
+        return {}
 
     observation = decision.observation.strip()
     if not observation:
-        return state
+        return {}
 
     updated_profile = update_user_profile_impl(
         user_id=state["user_id"],
         new_observation=observation,
     )
-    state["user_profile"] = updated_profile.profile
-
-    return state
+    return {
+        "user_profile": updated_profile.profile,
+    }
 
 
 def route_after_router(state: AgentState) -> str:
@@ -552,7 +564,10 @@ def get_checkpointer():
     checkpoint_path = settings.checkpoint_dir / "checkpoint.sqlite"
     connection = sqlite3.connect(str(checkpoint_path), check_same_thread=False)
 
-    return SqliteSaver(connection)
+    checkpointer = SqliteSaver(connection)
+    checkpointer.setup()
+
+    return checkpointer
 
 
 @lru_cache(maxsize=1)

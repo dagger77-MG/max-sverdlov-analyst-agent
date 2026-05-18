@@ -402,7 +402,7 @@ def summarize_rows_impl(
 
     try:
         summary = _llm_rows_summary(df=df, focus=focus)
-    except RuntimeError:
+    except Exception:
         summary = _deterministic_rows_summary(df=df, focus=focus)
 
     return SummarizeRowsOutput(
