@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "dotenv>=0.9.9",
+    "fastmcp>=3.3.1",
     "langchain-core>=1.4.0",
     "langgraph>=1.2.0",
     "pandas>=3.0.3",
