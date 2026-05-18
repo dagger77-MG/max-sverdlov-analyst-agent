@@ -108,6 +108,7 @@ def create_initial_state(
     query: str,
     session_id: str,
     user_id: str,
+    max_iterations: int | None = None,
 ) -> AgentState:
     """Create the initial graph state for one user query."""
     return AgentState(
@@ -120,6 +121,7 @@ def create_initial_state(
         last_structured_results=[],
         user_profile="",
         iteration_count=0,
+        max_iterations=settings.normalize_max_iterations(max_iterations),
         final_answer=None,
     )
 
@@ -462,7 +464,7 @@ def react_data_agent_node(state: AgentState) -> AgentState:
     """Run a ReAct-style tool-use loop for dataset questions."""
     structured_llm = get_structured_action_llm()
 
-    while state["iteration_count"] < settings.max_iterations:
+    while state["iteration_count"] < state["max_iterations"]:
         state["iteration_count"] += 1
 
         decision = structured_llm.invoke(_build_action_messages(state))
@@ -564,6 +566,7 @@ def invoke_agent(
     query: str,
     session_id: str | None = None,
     user_id: str | None = None,
+    max_iterations: int | None = None,
 ) -> AgentState:
     """Invoke the compiled graph for one user query."""
     graph = build_graph()
@@ -572,6 +575,7 @@ def invoke_agent(
         query=query,
         session_id=session_id or settings.default_session_id,
         user_id=user_id or settings.default_user_id,
+        max_iterations=max_iterations,
     )
 
     return graph.invoke(initial_state)

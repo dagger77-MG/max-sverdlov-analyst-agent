@@ -36,4 +36,5 @@ class AgentState(TypedDict):
     last_structured_results: list[AnalysisResult]
     user_profile: str
     iteration_count: int
+    max_iterations: int
     final_answer: str | None
