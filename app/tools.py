@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 from typing import Literal
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
-
+from app.config import settings
 from app.data_loader import get_dataset_df, get_dataset_metadata
 
 
@@ -270,20 +272,32 @@ def group_counts_impl(
     return GroupCountsOutput(group_by=group_by, counts=counts)
 
 
-def summarize_rows_impl(
-    row_ids: list[int],
-    focus: str,
-    max_examples: int = 100,
-) -> SummarizeRowsOutput:
-    df = _subset_by_row_ids(row_ids).head(max_examples)
-
-    if df.empty:
-        return SummarizeRowsOutput(
-            summary="No matching rows were found, so there is nothing to summarize.",
-            row_count_used=0,
-            focus=focus,
+@lru_cache(maxsize=1)
+def get_summarizer_llm():
+    """Return a cached OpenAI-compatible chat model for row summarization."""
+    if not settings.nebius_api_key:
+        raise RuntimeError(
+            "NEBIUS_API_KEY is missing. Falling back to deterministic summary."
         )
 
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "LLM summarization requires 'langchain-openai'. "
+            "Falling back to deterministic summary."
+        ) from exc
+
+    return ChatOpenAI(
+        model=settings.agent_model,
+        api_key=settings.nebius_api_key,
+        base_url=settings.nebius_base_url,
+        temperature=0,
+    )
+
+
+def _deterministic_rows_summary(df, focus: str) -> str:
+    """Return a deterministic fallback summary for selected rows."""
     category_counts = Counter(
         df["category"].fillna("UNKNOWN").astype(str).replace("", "UNKNOWN").tolist()
     )
@@ -311,13 +325,85 @@ def summarize_rows_impl(
 
     examples_text = "\n".join(f"- {example}" for example in example_instructions)
 
-    summary = (
+    return (
         f"Summary focus: {focus}\n"
         f"Rows reviewed: {len(df)}\n"
         f"Top categories: {top_categories or 'N/A'}\n"
         f"Top intents: {top_intents or 'N/A'}\n"
         f"Representative customer instructions:\n{examples_text or '- N/A'}"
     )
+
+
+def _rows_to_summary_context(df) -> str:
+    """Format selected rows as compact text for grounded LLM summarization."""
+    lines: list[str] = []
+
+    for _, row in df.iterrows():
+        row_id = int(row["row_id"])
+        category = "" if row["category"] is None else str(row["category"])
+        intent = "" if row["intent"] is None else str(row["intent"])
+        instruction = "" if row["instruction"] is None else str(row["instruction"])
+        response = "" if row["response"] is None else str(row["response"])
+
+        lines.append(
+            f"row_id={row_id}\n"
+            f"category={category}\n"
+            f"intent={intent}\n"
+            f"customer_instruction={instruction}\n"
+            f"support_response={response}"
+        )
+
+    return "\n\n---\n\n".join(lines)
+
+
+def _llm_rows_summary(df, focus: str) -> str:
+    """Summarize selected rows with an LLM, grounded only in provided rows."""
+    llm = get_summarizer_llm()
+    row_context = _rows_to_summary_context(df)
+
+    response = llm.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You summarize rows from the Bitext Customer Service dataset. "
+                    "Use only the provided rows. Do not add general knowledge. "
+                    "Be concise, concrete, and dataset-grounded. Mention recurring "
+                    "themes, customer needs, tone, or support patterns only when "
+                    "they are visible in the provided rows."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"Focus: {focus}\n"
+                    f"Rows provided: {len(df)}\n\n"
+                    f"{row_context}\n\n"
+                    "Write a short qualitative summary grounded in these rows."
+                )
+            ),
+        ]
+    )
+
+    return str(response.content).strip()
+
+
+def summarize_rows_impl(
+    row_ids: list[int],
+    focus: str,
+    max_examples: int = 100,
+) -> SummarizeRowsOutput:
+    df = _subset_by_row_ids(row_ids).head(max_examples)
+
+    if df.empty:
+        return SummarizeRowsOutput(
+            summary="No matching rows were found, so there is nothing to summarize.",
+            row_count_used=0,
+            focus=focus,
+        )
+
+    try:
+        summary = _llm_rows_summary(df=df, focus=focus)
+    except RuntimeError:
+        summary = _deterministic_rows_summary(df=df, focus=focus)
 
     return SummarizeRowsOutput(
         summary=summary,
