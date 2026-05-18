@@ -208,6 +208,13 @@ def _route_specific_instructions(route: str | None) -> str:
 - Use sample_examples when the user asks for examples, samples, or "show me more".
 - Use group_counts when the user asks for distributions, most common categories, or counts by category/intent.
 - Do not use summarize_rows unless the user explicitly asks for a summary, themes, tone, patterns, or qualitative interpretation.
+- For example/sample requests, do not stop after filter_rows.
+- If the user asks "Show me N examples from CATEGORY/INTENT/TOPIC":
+  1. Call filter_rows with the category, intent, or text condition and no limit.
+  2. Call sample_examples with the returned row_ids, n=N, and offset=0.
+  3. Answer using the sampled examples.
+- Do not use filter_rows(limit=N) as a substitute for sample_examples(n=N).
+- Never repeat the same filter_rows call if it already returned matching row IDs.
 - Final answers should include exact values from tool observations.
 """
 
@@ -248,18 +255,32 @@ Tool trace so far:
 
 Available tools:
 - get_dataset_schema(include_sample_values: bool = True)
+  Inspect dataset columns, row count, and sample values.
 - filter_rows(category: str | None = None, intent: str | None = None, text_query: str | None = None, limit: int | None = None)
+  Find matching row IDs for a category, intent, or text query.
+  This tool does not show examples.
+  Do not use limit to satisfy "show N examples".
+  For example requests, call filter_rows without limit, then call sample_examples with n=N.
 - count_rows(row_ids: list[int] | None = None)
+  Count all rows or a provided row_id subset.
 - sample_examples(row_ids: list[int] | None = None, n: int = 3, offset: int = 0)
+  Show actual example rows.
+  Use this whenever the user asks for examples, samples, rows, cases, or "show me N".
+  Usually call filter_rows first to get row_ids, then call sample_examples(row_ids=..., n=N, offset=0).
 - group_counts(group_by: "category" | "intent", row_ids: list[int] | None = None, top_k: int = 20)
+  Count rows grouped by category or intent.
 - summarize_rows(row_ids: list[int], focus: str, max_examples: int = 100)
+  Summarize selected rows for qualitative questions about themes, tone, or patterns.
 - read_user_profile(user_id: str)
+  Read the saved durable user profile.
 - final_answer
 
 Important:
 - Use tools before answering dataset questions.
 - For "show more" follow-ups, reuse previous row IDs and the previous next offset if available in the trace.
 - For "total of the last two", use recent stored count results if available.
+- If a tool call already returned useful results, do not repeat the same tool call with the same input.
+- After filter_rows returns matching row IDs for an example request, the next action should usually be sample_examples.
 - When enough evidence is available, choose final_answer.
 """
 

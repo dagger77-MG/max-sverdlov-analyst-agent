@@ -26,21 +26,37 @@ class DatasetSchemaOutput(BaseModel):
 class FilterRowsInput(BaseModel):
     category: str | None = Field(
         default=None,
-        description="Dataset category to filter by.",
+        description=(
+            "Dataset category to filter by. Use this to find the matching row "
+            "subset before counting, grouping, sampling examples, or summarizing."
+        ),
     )
     intent: str | None = Field(
         default=None,
-        description="Dataset intent to filter by.",
+        description=(
+         "Dataset intent to filter by. Use this to find the matching row "
+         "subset before counting, grouping, sampling examples, or summarizing."
+        ),
     )
     text_query: str | None = Field(
         default=None,
-        description="Case-insensitive text search over instruction and response text.",
+        description=(
+            "Case-insensitive text search over instruction and response text. "
+            "Use this to find rows related to a topic when category or intent is "
+            "not enough."
+        ),
     )
     limit: int | None = Field(
         default=None,
         ge=1,
         le=100,
-        description="Maximum number of matching row IDs to return.",
+        description=(
+            "Optional cap on returned matching row IDs. Do not use this to satisfy "
+            "requests like 'show 3 examples'. For example/sample requests, call "
+            "filter_rows without limit to get the matching subset, then call "
+            "sample_examples with n set to the requested number. Use limit only "
+            "when intentionally restricting the subset for performance or preview."
+        ),
     )
 
 
@@ -72,18 +88,29 @@ class ExampleRow(BaseModel):
 class SampleExamplesInput(BaseModel):
     row_ids: list[int] | None = Field(
         default=None,
-        description="Optional row IDs to sample from. If omitted, sample from all rows.",
+        description=(
+            "Optional row IDs to sample from. Usually this should be the row_ids "
+            "returned by filter_rows. If omitted, examples are sampled from all rows."
+        ),
     )
     n: int = Field(
         default=3,
         ge=1,
         le=20,
-        description="Number of examples to return.",
+        description=(
+            "Number of examples to return. Use this field, not filter_rows.limit, "
+            "to satisfy requests like 'show 3 examples', 'give me 5 samples', or "
+            "'list 2 cases'."
+        ),
     )
     offset: int = Field(
         default=0,
         ge=0,
-        description="Offset for follow-up requests like 'show 3 more'.",
+        description=(
+            "Offset for follow-up requests like 'show 3 more'. Use 0 for the "
+            "first example request, then reuse the previous next_offset for "
+            "additional examples from the same row_ids subset."
+        ),
     )
 
 

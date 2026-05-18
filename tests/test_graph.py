@@ -373,6 +373,25 @@ def test_route_specific_instructions_for_structured_route() -> None:
     assert "STRUCTURED queries" in instructions
     assert "Prefer deterministic tools" in instructions
     assert "Do not use summarize_rows unless" in instructions
+    assert "For example/sample requests, do not stop after filter_rows." in instructions
+    assert "Call sample_examples with the returned row_ids, n=N, and offset=0." in instructions
+    assert "Do not use filter_rows(limit=N) as a substitute for sample_examples(n=N)." in instructions
+
+
+def test_action_prompt_describes_correct_example_tool_sequence() -> None:
+    state = graph.create_initial_state(
+        query="Show me 3 examples from the REFUND category.",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for examples from a dataset category."
+    state["user_profile"] = "# User Profile\n"
+    messages = graph._build_action_messages(state)
+    prompt_text = "\n\n".join(str(message.content) for message in messages)
+
+    assert "Do not use limit to satisfy \"show N examples\"." in prompt_text
+    assert "After filter_rows returns matching row IDs for an example request" in prompt_text
 
 
 def test_route_specific_instructions_for_unstructured_route() -> None:
@@ -756,3 +775,32 @@ def test_follow_up_total_count_of_last_two_uses_stored_structured_results(
 
     assert result["final_answer"] == "The total count of the last two results is 1,356."
     assert result["tool_trace"] == []
+
+
+def test_create_invocation_state_falls_back_to_initial_state_when_checkpoint_read_fails() -> None:
+    class FailingCheckpointGraph:
+        def get_state(self, config):
+            raise RuntimeError("No checkpointer available in this test.")
+
+    config = graph._build_graph_config(
+        session_id="fallback_session",
+        user_id="max",
+        max_iterations=12,
+    )
+
+    result = graph._create_invocation_state(
+        graph=FailingCheckpointGraph(),
+        query="How many rows are in the dataset?",
+        session_id="fallback_session",
+        user_id="max",
+        max_iterations=12,
+        config=config,
+    )
+
+    assert result["session_id"] == "fallback_session"
+    assert result["user_id"] == "max"
+    assert result["route"] is None
+    assert result["tool_trace"] == []
+    assert result["last_structured_results"] == []
+    assert isinstance(result["messages"][0], HumanMessage)
+    assert result["messages"][0].content == "How many rows are in the dataset?"
