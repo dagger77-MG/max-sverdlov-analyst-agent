@@ -91,6 +91,11 @@ def get_agent_llm():
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         temperature=0,
+        max_tokens=1024,
+        extra_body={
+            "enable_thinking": False,
+            "thinking_budget": 0,
+        },
     )
 
 
@@ -204,10 +209,18 @@ def _route_specific_instructions(route: str | None) -> str:
 - The user is asking for exact dataset analysis.
 - Prefer deterministic tools such as filter_rows, count_rows, sample_examples, and group_counts.
 - Use filter_rows first when the user mentions a category, intent, topic, or text condition.
-- Use count_rows when the user asks "how many", "count", "number of", or asks for totals.
+- Prefer exact category or intent filters over text_query when the user wording clearly maps to a known dataset category or intent.
+- Use text_query only when the user asks about a topic that is not clearly represented by a known category or intent.
+- For filtered count questions, use filter_rows.match_count directly in final_answer.
+- Use count_rows only for whole-dataset counts or complete row_id lists.
 - Use sample_examples when the user asks for examples, samples, or "show me more".
 - Use group_counts when the user asks for distributions, most common categories, or counts by category/intent.
 - Do not use summarize_rows unless the user explicitly asks for a summary, themes, tone, patterns, or qualitative interpretation.
+- Known category mappings:
+  - refund, refunds, refund requests, reimbursement, reimbursement cases, money back, guarantee -> category="REFUND"
+  - feedback, product feedback, customer feedback -> category="FEEDBACK"
+  - complaint, complaints -> category="COMPLAINT"
+  - contact, contact support, customer service contact -> category="CONTACT"
 - For example/sample requests, do not stop after filter_rows.
 - If the user asks "Show me N examples from CATEGORY/INTENT/TOPIC":
   1. Call filter_rows with the category, intent, or text condition and no limit.
@@ -259,10 +272,12 @@ Available tools:
 - filter_rows(category: str | None = None, intent: str | None = None, text_query: str | None = None, limit: int | None = None)
   Find matching row IDs for a category, intent, or text query.
   This tool does not show examples.
+  Prefer category or intent when the user phrase maps to a known dataset category/intent.
   Do not use limit to satisfy "show N examples".
   For example requests, call filter_rows without limit, then call sample_examples with n=N.
 - count_rows(row_ids: list[int] | None = None)
-  Count all rows or a provided row_id subset.
+  Count all rows or a complete row_id subset. Do not use count_rows with previewed row IDs from an observation such as "[1, 2, 3...]".
+  For filtered count questions, prefer filter_rows.match_count and then final_answer.
 - sample_examples(row_ids: list[int] | None = None, n: int = 3, offset: int = 0)
   Show actual example rows.
   Use this whenever the user asks for examples, samples, rows, cases, or "show me N".
@@ -279,13 +294,21 @@ Important:
 - Use tools before answering dataset questions.
 - For "show more" follow-ups, reuse previous row IDs and the previous next offset if available in the trace.
 - For "total of the last two", use recent stored count results if available.
+- After every tool observation, compare the observation with the original user question:
+  - If the observation already contains the information needed to answer the question, choose final_answer.
+  - If the observation is only an intermediate result, choose the next missing tool.
+  - Do not call another tool just because more tools are available.
+  - Do not repeat a tool call that produced the same answer-ready observation.
 - If a tool call already returned useful results, do not repeat the same tool call with the same input.
 - After filter_rows returns matching row IDs for an example request, the next action should usually be sample_examples.
 - When enough evidence is available, choose final_answer.
 """
 
     return [
-        SystemMessage(content=DATA_AGENT_SYSTEM_PROMPT),
+        SystemMessage(
+            content="/no_think\n"
+                    + DATA_AGENT_SYSTEM_PROMPT
+        ),
         SystemMessage(content=context),
         HumanMessage(content=user_query),
     ]
@@ -307,6 +330,52 @@ def _safe_int_list(value: Any) -> list[int] | None:
             continue
 
     return result
+
+
+def _normalized_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Normalize tool input for repeated-call detection."""
+    normalized: dict[str, Any] = {}
+
+    for key, value in tool_input.items():
+        if value is None:
+            continue
+
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                normalized[key] = stripped
+            continue
+
+        normalized[key] = value
+
+    return normalized
+
+
+def _is_repeated_tool_call(
+    state: AgentState,
+    tool_name: ToolName,
+    tool_input: dict[str, Any],
+) -> bool:
+    """Return True when the exact same tool call already ran this turn."""
+    normalized_input = _normalized_tool_input(tool_input)
+
+    for trace_item in state["tool_trace"]:
+        if trace_item["tool_name"] != tool_name:
+            continue
+
+        if _normalized_tool_input(trace_item["tool_input"]) == normalized_input:
+            return True
+
+    return False
+
+
+def _answer_from_existing_trace(state: AgentState) -> str:
+    """Ask the model to answer from existing observations after a repeated call."""
+    return (
+        "The needed tool result is already available in the trace. "
+        "Please answer using the latest relevant observation instead of repeating "
+        "the same tool call."
+    )
 
 
 def _execute_tool(
@@ -335,8 +404,15 @@ def _execute_tool(
         )
         observation = (
             f"Found {result.match_count} matching rows. "
-            f"Returned {summarize_row_ids(result.row_ids)}."
+            f"Returned row_ids for the matching subset: {summarize_row_ids(result.row_ids)}. "
+            "This filter step is complete. Do not call filter_rows again with the same filters. "
+            f"If the user asked how many/count/number of, the answer is {result.match_count}; "
+            "choose final_answer now. Do not call count_rows with the previewed row IDs shown "
+            "in this observation. "
+            "If the user asked for examples/samples/show me N, call sample_examples with these row_ids. "
+            "If the user asked for a summary/themes/patterns, call summarize_rows with these row_ids."
         )
+
         _append_trace(state, tool_name, tool_input, observation)
         _append_structured_result(
             state,
@@ -352,7 +428,12 @@ def _execute_tool(
     if tool_name == "count_rows":
         row_ids = _safe_int_list(tool_input.get("row_ids"))
         result = count_rows_impl(row_ids=row_ids)
-        observation = f"Count = {result.count}."
+        observation = (
+            f"Count = {result.count}. "
+            "The requested count is now available in this observation. "
+            "If the user asked for a count, choose final_answer now. "
+            "Do not call count_rows again with the same input."
+        )
         _append_trace(
             state,
             tool_name,
@@ -382,7 +463,12 @@ def _execute_tool(
         ]
         observation = (
             f"Returned {len(result.examples)} examples. "
-            f"Next offset = {result.next_offset}.\n"
+            f"Next offset = {result.next_offset}. "
+            "The requested examples are now available in this observation. "
+            "If the user asked for examples, choose final_answer now. "
+            "Do not call sample_examples again with the same input. "
+            "If the user later asks for more examples from this same subset, "
+            "call sample_examples with the same row_ids and this next offset.\n"
             + "\n".join(example_lines)
         )
         _append_trace(
@@ -500,6 +586,21 @@ def react_data_agent_node(state: AgentState) -> dict[str, Any]:
             final_answer = decision.final_answer or (
                 "I completed the analysis, but no final answer was provided."
             )
+            state["final_answer"] = final_answer
+            return {
+                "tool_trace": state["tool_trace"],
+                "last_structured_results": state["last_structured_results"],
+                "iteration_count": state["iteration_count"],
+                "final_answer": final_answer,
+                "messages": [AIMessage(content=final_answer)],
+            }
+
+        if _is_repeated_tool_call(
+            state=state,
+            tool_name=decision.tool_name,
+            tool_input=decision.tool_input,
+        ):
+            final_answer = _answer_from_existing_trace(state)
             state["final_answer"] = final_answer
             return {
                 "tool_trace": state["tool_trace"],

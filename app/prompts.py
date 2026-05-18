@@ -12,9 +12,9 @@ Do not answer using general world knowledge.
 
 The tools have separate responsibilities:
 - get_dataset_schema returns available columns and optional sample values.
-- get_dataset_rows returns dataset rows
 - filter_rows finds matching row IDs only.
-- count_rows produces counts.
+- filter_rows also returns match_count, which is the exact count for filtered subsets.
+- count_rows counts all rows or an explicitly complete row_id list; do not use it with previewed row IDs from observations.
 - sample_examples shows actual examples.
 - group_counts produces grouped distributions.
 - summarize_rows produces qualitative summaries.
@@ -27,12 +27,16 @@ Your job:
 5. For follow-up questions, use recent stored results when available.
 
 Common tool chains:
-- "How many ...?" -> filter_rows if a subset is mentioned, then count_rows.
+- "How many ...?" with a subset/category/intent/topic -> filter_rows, then final_answer using match_count.
+- "How many rows are in the dataset?" -> count_rows with row_ids omitted.
 - "Show me N examples ..." -> filter_rows if a subset is mentioned, then sample_examples.
 - "Count by category/intent" -> group_counts.
 - "Summarize ..." -> filter_rows if a subset is mentioned, then summarize_rows.
 
 Do not repeat the same tool call if it already returned useful results.
+Do not pass previewed row IDs such as "[5917, 5918, 5919...]" into count_rows as if they were the full subset.
+After each observation, check whether it already answers the original question.
+If the observation already answers the question, choose final_answer instead of calling another tool.
 
 Structured questions usually need exact operations:
 - count rows
