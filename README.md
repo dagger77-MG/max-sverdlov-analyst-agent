@@ -8,14 +8,15 @@ The agent can answer structured analytical questions and qualitative dataset que
 
 - LangGraph ReAct-style agent loop
 - LLM-based query router
+- SQLite-backed LangGraph checkpoint persistence for conversation state
 - Structured dataset tools
-- Qualitative row summarization tool
+- LLM-backed qualitative row summarization tool with deterministic fallback
 - Persistent user profile memory
 - CLI chat interface
 - Streamlit chat interface
 - FastMCP server exposing dataset tools
 - Visible reasoning traces with route decisions, tool calls, inputs, and observations
-- Unit tests for loader, tools, router, memory, and graph behavior
+- Unit tests for loader, tools, router, memory, graph behavior, and config behavior
 
 ## Dataset
 
@@ -65,14 +66,20 @@ bitext_agent/
 │   ├── config.py
 │   └── logging_utils.py
 ├── tests/
+│   ├── test_config.py
 │   ├── test_data_loader.py
 │   ├── test_tools.py
 │   ├── test_router.py
 │   ├── test_memory.py
 │   └── test_graph.py
+├── .checkpoints/
+│   └── checkpoint.sqlite
 └── .user_profiles/
-    └── .gitkeep
+    └── <user_id>/
+        └── context.md
 ```
+
+Runtime folders such as `data/`, `.checkpoints/`, and `.user_profiles/` are created automatically when needed.
 
 ## Environment Setup
 
@@ -109,6 +116,8 @@ router_model = meta-llama/Meta-Llama-3.1-8B-Instruct
 agent_model = meta-llama/Llama-3.3-70B-Instruct
 nebius_base_url = https://api.tokenfactory.nebius.com/v1/
 ```
+
+Configuration is centralized in `app/config.py`. The app loads `.env` before creating the global `settings` object, so `NEBIUS_API_KEY` is available consistently to the CLI, Streamlit app, router, graph agent, and summarizer.
 
 ## Running the CLI Agent
 
@@ -309,6 +318,20 @@ The graph state stores:
 - iteration count
 - final answer
 
+LangGraph checkpoints are stored under:
+
+```text
+.checkpoints/checkpoint.sqlite
+```
+
+The graph uses the CLI/Streamlit `session_id` as the LangGraph `thread_id`, so the same session can restore prior conversation context and recent structured results across app restarts.
+
+Checkpoint persistence requires the SQLite checkpoint package:
+
+```text
+langgraph-checkpoint-sqlite
+```
+
 Recent structured results support follow-up questions such as:
 
 ```text
@@ -316,8 +339,6 @@ Show me 3 more.
 What about refunds?
 What is the total count of the last two?
 ```
-
-Current limitation: durable LangGraph checkpoint persistence is not yet wired through a SQLite checkpointer. The current implementation carries state inside one graph invocation and stores persistent user profiles on disk.
 
 ## LangGraph Graph Design
 
@@ -410,6 +431,8 @@ Use for:
 - tone
 - customer pain points
 
+When `NEBIUS_API_KEY` and `langchain-openai` are available, this tool uses the configured agent model to summarize only the selected rows. If the summarizer is unavailable, it falls back to a deterministic summary with row counts, top categories, top intents, and representative customer instructions.
+
 ### read_user_profile
 
 Reads the persistent profile for a user.
@@ -429,6 +452,7 @@ LangGraph Studio can be used to inspect:
 - state transitions
 - tool traces
 - final answers
+- checkpoint behavior
 - max-iteration fallback behavior
 
 The current graph is built by:
@@ -449,12 +473,13 @@ pytest
 
 The test suite covers:
 
+- config and environment behavior
 - data loader normalization
 - stable row IDs
 - tool filtering/counting/sampling/grouping/summarization
 - LLM router behavior with mocked model calls
 - persistent profile file behavior
-- graph routing, tool traces, refusal, profile updates, and max-iteration fallback
+- graph routing, tool traces, refusal, profile updates, checkpoint config, and max-iteration fallback
 
 ## Validation Checklist
 
@@ -504,6 +529,19 @@ Expected:
 - Uses previous offset
 - Shows the next examples
 
+### Follow-Up After Restart
+
+Run the CLI with the same session ID after restarting the app:
+
+```bash
+python -m app.main --session demo --user max
+```
+
+Expected:
+
+- The agent restores checkpointed conversation state for `demo`.
+- The agent can use recent structured results for follow-up questions.
+
 ### Unstructured Summary
 
 Question:
@@ -549,8 +587,7 @@ Expected:
 
 ## Known Limitations
 
-- LangGraph SQLite checkpoint persistence is not yet implemented.
-- `summarize_rows` currently creates a deterministic summary from row metadata and representative instructions. It does not yet call a separate summarization LLM.
-- Follow-up behavior depends on recent structured results stored in graph state. Durable cross-restart follow-up memory requires checkpoint integration.
+- Follow-up behavior depends on the agent correctly using recent structured results from checkpointed graph state.
+- SQLite checkpoint persistence requires `langgraph-checkpoint-sqlite` to be installed.
 - The router and agent rely on Nebius model support for structured output through LangChain.
 - The exact FastMCP transport URL should be verified from server startup logs.

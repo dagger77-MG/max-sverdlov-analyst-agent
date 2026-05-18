@@ -9,6 +9,7 @@ dependencies = [
     "fastmcp>=3.3.1",
     "langchain-core>=1.4.0",
     "langgraph>=1.2.0",
+    "langgraph-checkpoint-sqlite>=3.1.0",
     "pandas>=3.0.3",
     "pydantic>=2.13.4",
     "pytest>=9.0.3",

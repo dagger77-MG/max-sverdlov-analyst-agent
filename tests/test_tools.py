@@ -149,6 +149,36 @@ def test_group_counts_groups_selected_row_ids_only() -> None:
     assert result.counts[0].count == 2
 
 
+def test_rows_to_summary_context_formats_selected_rows(sample_df: pd.DataFrame) -> None:
+    context = tools._rows_to_summary_context(sample_df.head(1))
+
+    assert "row_id=0" in context
+    assert "category=REFUND" in context
+    assert "intent=get_refund" in context
+    assert "customer_instruction=I want a refund for my order" in context
+    assert "support_response=You can request a refund through your account." in context
+
+
+def test_summarize_rows_falls_back_to_deterministic_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools,
+        "get_summarizer_llm",
+        lambda: (_ for _ in ()).throw(RuntimeError("No summarizer available.")),
+    )
+
+    result = tools.summarize_rows_impl(
+        row_ids=[0, 3],
+        focus="refund requests",
+        max_examples=10,
+    )
+
+    assert result.row_count_used == 2
+    assert "Rows reviewed: 2" in result.summary
+    assert "Top categories: REFUND (2)" in result.summary
+
+
 def test_summarize_rows_returns_non_empty_summary() -> None:
     result = tools.summarize_rows_impl(
         row_ids=[0, 3],
@@ -163,6 +193,37 @@ def test_summarize_rows_returns_non_empty_summary() -> None:
     assert "refund" in result.summary.lower()
 
 
+def test_summarize_rows_uses_llm_summary_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLLMResponse:
+        content = "Refund rows mainly describe customers asking for refunds or refund status."
+
+    class FakeSummarizerLLM:
+        def __init__(self) -> None:
+            self.received_messages = None
+
+        def invoke(self, messages):
+            self.received_messages = messages
+            return FakeLLMResponse()
+
+    fake_llm = FakeSummarizerLLM()
+    monkeypatch.setattr(tools, "get_summarizer_llm", lambda: fake_llm)
+
+    result = tools.summarize_rows_impl(
+        row_ids=[0, 3],
+        focus="refund requests",
+        max_examples=10,
+    )
+
+    assert result.summary == (
+        "Refund rows mainly describe customers asking for refunds or refund status."
+    )
+    assert result.row_count_used == 2
+    assert fake_llm.received_messages is not None
+    assert "Focus: refund requests" in fake_llm.received_messages[1].content
+
+    
 def test_schema_based_wrappers_call_implementations() -> None:
     filter_result = tools.filter_rows(
         tools.FilterRowsInput(category="REFUND"),
