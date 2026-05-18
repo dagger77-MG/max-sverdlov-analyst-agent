@@ -5,12 +5,7 @@ from typing import Any
 
 import pandas as pd
 
-from app.config import (
-    DATASET_CACHE_FILE,
-    DATASET_NAME,
-    REQUIRED_ANALYSIS_COLUMNS,
-    ensure_runtime_dirs,
-)
+from app.config import settings
 
 
 _COLUMN_ALIASES: dict[str, str] = {
@@ -75,7 +70,7 @@ def _load_from_huggingface() -> pd.DataFrame:
             "Install project dependencies first."
         ) from exc
 
-    dataset = load_dataset(DATASET_NAME)
+    dataset = load_dataset(settings.dataset_name)
 
     if "train" in dataset:
         split = dataset["train"]
@@ -88,23 +83,23 @@ def _load_from_huggingface() -> pd.DataFrame:
 
 def _load_from_cache() -> pd.DataFrame | None:
     """Load the local cached CSV if it exists."""
-    if not DATASET_CACHE_FILE.exists():
+    if not settings.dataset_cache_file.exists():
         return None
 
-    return pd.read_csv(DATASET_CACHE_FILE)
+    return pd.read_csv(settings.dataset_cache_file)
 
 
 def _save_cache(df: pd.DataFrame) -> None:
     """Persist the normalized dataset locally for repeatable offline runs."""
-    ensure_runtime_dirs()
-    df.to_csv(DATASET_CACHE_FILE, index=False)
+    settings.ensure_runtime_dirs()
+    df.to_csv(settings.dataset_cache_file, index=False)
 
 
 def _ensure_analysis_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure expected analysis columns exist, filling unavailable ones with None."""
     normalized = df.copy()
 
-    for column in REQUIRED_ANALYSIS_COLUMNS:
+    for column in settings.required_analysis_columns:
         if column not in normalized.columns:
             normalized[column] = None
 
@@ -113,7 +108,7 @@ def _ensure_analysis_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_dataset_df(force_reload: bool = False) -> pd.DataFrame:
     """Load, normalize, and cache the Bitext Customer Service dataset."""
-    ensure_runtime_dirs()
+    settings.ensure_runtime_dirs()
 
     cached_df = None if force_reload else _load_from_cache()
 
