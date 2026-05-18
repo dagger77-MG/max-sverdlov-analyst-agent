@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import TypedDict, Annotated
 
 from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
 from app.router import RouteType
 
@@ -27,7 +28,7 @@ class AnalysisResult(TypedDict):
 class AgentState(TypedDict):
     """LangGraph state shared across graph nodes."""
 
-    messages: list[BaseMessage]
+    messages: Annotated[list[BaseMessage], add_messages]
     session_id: str
     user_id: str
     route: RouteType | None

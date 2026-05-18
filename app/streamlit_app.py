@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dotenv import load_dotenv
 import streamlit as st
 
 from app.config import settings
@@ -78,7 +77,6 @@ def append_assistant_message(content: str, trace: str) -> None:
 
 
 def main() -> None:
-    load_dotenv()
 
     st.set_page_config(
         page_title="Bitext Data Analyst Agent",

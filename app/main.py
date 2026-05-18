@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 
-from dotenv import load_dotenv
-
 from app.config import settings
 from app.graph import invoke_agent
 from app.logging_utils import format_reasoning_trace
@@ -42,7 +40,6 @@ def print_welcome(session_id: str, user_id: str, max_iterations: int) -> None:
 
 
 def run_cli() -> None:
-    load_dotenv()
 
     args = parse_args()
     max_iterations = settings.normalize_max_iterations(args.max_iterations)
