@@ -514,3 +514,245 @@ def test_router_node_returns_partial_state_update(monkeypatch) -> None:
         "route": "structured",
         "route_reason": "The query asks for an exact dataset count.",
     }
+
+
+def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
+    monkeypatch,
+) -> None:
+    state = graph.create_initial_state(
+        query="Show me 3 more.",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for more examples from the previous subset."
+    state["user_profile"] = "# User Profile\n"
+    state["tool_trace"] = [
+        {
+            "tool_name": "sample_examples",
+            "tool_input": {
+                "row_ids": [10, 11, 12, 13, 14, 15],
+                "n": 3,
+                "offset": 0,
+            },
+            "observation": "Returned 3 examples. Next offset = 3.",
+        }
+    ]
+    state["last_structured_results"] = [
+        {
+            "label": "sample_examples",
+            "value": 3,
+            "query_type": "sample",
+            "row_ids": [10, 11, 12, 13, 14, 15],
+        }
+    ]
+
+    captured_inputs: list[dict] = []
+
+    monkeypatch.setattr(
+        graph,
+        "sample_examples_impl",
+        lambda row_ids=None, n=3, offset=0: (
+            captured_inputs.append(
+                {
+                    "row_ids": row_ids,
+                    "n": n,
+                    "offset": offset,
+                }
+            )
+            or type(
+                "SampleExamplesResult",
+                (),
+                {
+                    "examples": [
+                        type(
+                            "ExampleRow",
+                            (),
+                            {
+                                "row_id": 13,
+                                "instruction": "Example 4",
+                            },
+                        )(),
+                        type(
+                            "ExampleRow",
+                            (),
+                            {
+                                "row_id": 14,
+                                "instruction": "Example 5",
+                            },
+                        )(),
+                        type(
+                            "ExampleRow",
+                            (),
+                            {
+                                "row_id": 15,
+                                "instruction": "Example 6",
+                            },
+                        )(),
+                    ],
+                    "next_offset": 6,
+                },
+            )()
+        ),
+    )
+
+    fake_action_llm = FakeActionLLM(
+        [
+            graph.AgentActionDecision(
+                thought="Continue from the previous sample offset.",
+                tool_name="sample_examples",
+                tool_input={
+                    "row_ids": [10, 11, 12, 13, 14, 15],
+                    "n": 3,
+                    "offset": 3,
+                },
+            ),
+            graph.AgentActionDecision(
+                thought="Answer with the next examples.",
+                tool_name="final_answer",
+                final_answer="Here are the next 3 examples: 13, 14, and 15.",
+            ),
+        ]
+    )
+    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+
+    result = graph.react_data_agent_node(state)
+
+    assert captured_inputs == [
+        {
+            "row_ids": [10, 11, 12, 13, 14, 15],
+            "n": 3,
+            "offset": 3,
+        }
+    ]
+    assert result["final_answer"] == "Here are the next 3 examples: 13, 14, and 15."
+    assert state["last_structured_results"][-1] == {
+        "label": "sample_examples",
+        "value": 6,
+        "query_type": "sample",
+        "row_ids": [10, 11, 12, 13, 14, 15],
+    }
+
+
+def test_follow_up_what_about_refunds_preserves_count_pattern(monkeypatch) -> None:
+    state = graph.create_initial_state(
+        query="What about refunds?",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks a follow-up structured count question."
+    state["user_profile"] = "# User Profile\n"
+    state["last_structured_results"] = [
+        {
+            "label": "count_rows",
+            "value": 5,
+            "query_type": "count",
+            "row_ids": [1, 2, 3, 4, 5],
+        }
+    ]
+
+    monkeypatch.setattr(
+        graph,
+        "filter_rows_impl",
+        lambda **kwargs: type(
+            "FilterRowsResult",
+            (),
+            {
+                "row_ids": [10, 11, 12],
+                "match_count": 3,
+                "applied_filters": kwargs,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        graph,
+        "count_rows_impl",
+        lambda row_ids=None: type(
+            "CountRowsResult",
+            (),
+            {"count": len(row_ids or [])},
+        )(),
+    )
+
+    fake_action_llm = FakeActionLLM(
+        [
+            graph.AgentActionDecision(
+                thought="Find refund rows like the previous count question.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+            graph.AgentActionDecision(
+                thought="Count the refund rows.",
+                tool_name="count_rows",
+                tool_input={"row_ids": [10, 11, 12]},
+            ),
+            graph.AgentActionDecision(
+                thought="Answer with the refund count.",
+                tool_name="final_answer",
+                final_answer="There are 3 refund rows.",
+            ),
+        ]
+    )
+    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+
+    result = graph.react_data_agent_node(state)
+
+    assert result["final_answer"] == "There are 3 refund rows."
+    assert [step["tool_name"] for step in result["tool_trace"]] == [
+        "filter_rows",
+        "count_rows",
+    ]
+    assert state["last_structured_results"][-1]["value"] == 3
+
+
+def test_follow_up_total_count_of_last_two_uses_stored_structured_results(
+    monkeypatch,
+) -> None:
+    state = graph.create_initial_state(
+        query="What is the total count of the last two?",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks to combine recent count results."
+    state["user_profile"] = "# User Profile\n"
+    state["last_structured_results"] = [
+        {
+            "label": "complaints",
+            "value": 514,
+            "query_type": "count",
+            "row_ids": None,
+        },
+        {
+            "label": "refunds",
+            "value": 842,
+            "query_type": "count",
+            "row_ids": None,
+        },
+    ]
+
+    def fail_if_tool_called(*args, **kwargs):
+        raise AssertionError("No dataset tool should be needed for stored count totals.")
+
+    monkeypatch.setattr(graph, "filter_rows_impl", fail_if_tool_called)
+    monkeypatch.setattr(graph, "count_rows_impl", fail_if_tool_called)
+    monkeypatch.setattr(graph, "sample_examples_impl", fail_if_tool_called)
+    monkeypatch.setattr(graph, "group_counts_impl", fail_if_tool_called)
+    monkeypatch.setattr(graph, "summarize_rows_impl", fail_if_tool_called)
+
+    fake_action_llm = FakeActionLLM(
+        [
+            graph.AgentActionDecision(
+                thought="Use the last two stored count results: 514 and 842.",
+                tool_name="final_answer",
+                final_answer="The total count of the last two results is 1,356.",
+            ),
+        ]
+    )
+    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+
+    result = graph.react_data_agent_node(state)
+
+    assert result["final_answer"] == "The total count of the last two results is 1,356."
+    assert result["tool_trace"] == []
