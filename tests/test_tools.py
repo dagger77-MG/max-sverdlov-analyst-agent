@@ -94,6 +94,47 @@ def test_filter_rows_filters_by_category_case_insensitive() -> None:
     assert result.row_ids == [0, 3]
 
 
+@pytest.mark.parametrize(
+    "category_alias",
+   [
+        "refunds",
+        "refund requests",
+        "reimbursement",
+        "reimbursement cases",
+        "money back",
+        "guarantee",
+    ],
+)
+def test_filter_rows_normalizes_refund_category_aliases(
+    category_alias: str,
+) -> None:
+    result = tools.filter_rows_impl(category=category_alias)
+
+    assert result.match_count == 2
+    assert result.row_ids == [0, 3]
+
+
+@pytest.mark.parametrize(
+    ("category_alias", "expected_row_ids"),
+    [
+        ("customer feedback", [2]),
+        ("product feedback", [2]),
+        ("complaints", [4]),
+        ("contact support", [1]),
+        ("customer service", [1]),
+        ("contact customer service", [1]),
+    ],
+)
+def test_filter_rows_normalizes_non_refund_category_aliases(
+    category_alias: str,
+    expected_row_ids: list[int],
+) -> None:
+    result = tools.filter_rows_impl(category=category_alias)
+
+    assert result.match_count == len(expected_row_ids)
+    assert result.row_ids == expected_row_ids
+
+
 def test_filter_rows_filters_by_intent_case_insensitive() -> None:
     result = tools.filter_rows_impl(intent="GET_REFUND")
 

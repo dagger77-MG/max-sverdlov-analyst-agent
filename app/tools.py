@@ -177,6 +177,39 @@ def _normalize_filter_value(value: str | None) -> str | None:
     return normalized.lower()
 
 
+_CATEGORY_ALIASES: dict[str, str] = {
+    "refund": "refund",
+    "refunds": "refund",
+    "refund request": "refund",
+    "refund requests": "refund",
+    "reimbursement": "refund",
+    "reimbursements": "refund",
+    "reimbursement case": "refund",
+    "reimbursement cases": "refund",
+    "money back": "refund",
+    "guarantee": "refund",
+    "feedback": "feedback",
+    "product feedback": "feedback",
+    "customer feedback": "feedback",
+    "complaint": "complaint",
+    "complaints": "complaint",
+    "contact": "contact",
+    "contact support": "contact",
+    "customer service": "contact",
+    "customer service contact": "contact",
+    "contact customer service": "contact",
+}
+
+
+def _normalize_category_filter(value: str | None) -> str | None:
+    """Normalize category filter values, including common natural-language aliases."""
+    normalized = _normalize_filter_value(value)
+
+    if normalized is None:
+        return None
+
+    return _CATEGORY_ALIASES.get(normalized, normalized)
+
 def _subset_by_row_ids(row_ids: list[int] | None):
     df = get_dataset_df()
 
@@ -202,7 +235,7 @@ def filter_rows_impl(
 ) -> FilterRowsOutput:
     df = get_dataset_df()
 
-    category_filter = _normalize_filter_value(category)
+    category_filter = _normalize_category_filter(category)
     intent_filter = _normalize_filter_value(intent)
     text_filter = _normalize_filter_value(text_query)
 

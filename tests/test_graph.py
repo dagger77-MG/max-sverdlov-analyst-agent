@@ -280,24 +280,36 @@ def test_max_iteration_fallback(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         graph,
-        "get_dataset_schema_impl",
-        lambda include_sample_values=True: type(
-            "SchemaResult",
+        "group_counts_impl",
+        lambda group_by, row_ids=None, top_k=20: type(
+            "GroupCountsResult",
             (),
             {
-                "row_count": 5,
-                "columns": ["row_id", "instruction", "response", "category", "intent"],
+                "group_by": group_by,
+                "counts": [
+                    type(
+                        "GroupCountRow",
+                        (),
+                        {
+                            "label": f"GROUP_{top_k}",
+                            "count": top_k,
+                        },
+                    )()
+                ],
             },
         )(),
     )
 
     repeated_decisions = [
         graph.AgentActionDecision(
-            thought="Inspect schema again.",
-            tool_name="get_dataset_schema",
-            tool_input={"include_sample_values": False},
+            thought="Keep inspecting grouped counts without finalizing.",
+            tool_name="group_counts",
+            tool_input={
+                "group_by": "category",
+                "top_k": index + 1,
+            },
         )
-        for _ in range(graph.settings.max_iterations)
+        for index in range(graph.settings.max_iterations)
     ]
 
     monkeypatch.setattr(
@@ -317,6 +329,185 @@ def test_max_iteration_fallback(monkeypatch) -> None:
         "I could not complete the analysis within the allowed number of "
         "reasoning steps. Please try asking a more specific dataset question."
     )
+
+
+def test_repeated_tool_call_prompts_revised_final_answer(monkeypatch) -> None:
+    state = graph.create_initial_state(
+        query="How many refund requests did we get?",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for an exact refund count."
+    state["user_profile"] = "# User Profile\n"
+
+    monkeypatch.setattr(
+        graph,
+        "filter_rows_impl",
+       lambda **kwargs: type(
+            "FilterRowsResult",
+            (),
+            {
+                "row_ids": [1, 2, 3],
+                "match_count": 3,
+                "applied_filters": kwargs,
+            },
+        )(),
+    )
+
+    fake_action_llm = FakeActionLLM(
+        [
+            graph.AgentActionDecision(
+                thought="Find refund rows.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+            graph.AgentActionDecision(
+                thought="Find refund rows again.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+            graph.AgentActionDecision(
+                thought="The trace already contains the refund count.",
+                tool_name="final_answer",
+                final_answer="There are 3 REFUND rows in the dataset.",
+            ),
+        ]
+    )
+    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+
+    result = graph.react_data_agent_node(state)
+    assert result["final_answer"] == "There are 3 REFUND rows in the dataset."
+    assert [step["tool_name"] for step in result["tool_trace"]] == ["filter_rows"]
+    assert result["iteration_count"] == 2
+    assert fake_action_llm.call_count == 3
+
+
+def test_repeated_tool_call_allows_revised_different_tool(monkeypatch) -> None:
+    state = graph.create_initial_state(
+        query="How many refund requests did we get?",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for an exact refund count."
+    state["user_profile"] = "# User Profile\n"
+
+    monkeypatch.setattr(
+        graph,
+        "filter_rows_impl",
+        lambda **kwargs: type(
+            "FilterRowsResult",
+            (),
+            {
+                "row_ids": [10, 11, 12],
+                "match_count": 3,
+                "applied_filters": kwargs,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        graph,
+        "count_rows_impl",
+        lambda row_ids=None: type(
+            "CountRowsResult",
+            (),
+            {"count": len(row_ids or [])},
+        )(),
+    )
+
+    fake_action_llm = FakeActionLLM(
+        [
+            graph.AgentActionDecision(
+                thought="Find refund rows.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+            graph.AgentActionDecision(
+                thought="Find refund rows again.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+            graph.AgentActionDecision(
+                thought="Use a different needed tool to count the complete row IDs.",
+                tool_name="count_rows",
+                tool_input={"row_ids": [10, 11, 12]},
+            ),
+            graph.AgentActionDecision(
+                thought="Answer with the count.",
+                tool_name="final_answer",
+                final_answer="There are 3 refund rows.",
+            ),
+        ]
+    )
+    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+
+    result = graph.react_data_agent_node(state)
+
+    assert result["final_answer"] == "There are 3 refund rows."
+    assert [step["tool_name"] for step in result["tool_trace"]] == [
+        "filter_rows",
+        "count_rows",
+    ]
+    assert result["last_structured_results"][-1] == {
+        "label": "count_rows",
+        "value": 3,
+        "query_type": "count",
+        "row_ids": [10, 11, 12],
+    }
+
+
+def test_repeated_tool_call_falls_back_when_revised_decision_repeats(monkeypatch) -> None:
+    state = graph.create_initial_state(
+        query="How many refund requests did we get?",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for an exact refund count."
+    state["user_profile"] = "# User Profile\n"
+
+    monkeypatch.setattr(
+        graph,
+        "filter_rows_impl",
+        lambda **kwargs: type(
+            "FilterRowsResult",
+            (),
+            {
+                "row_ids": [1, 2, 3],
+                "match_count": 3,
+                "applied_filters": kwargs,
+            },
+        )(),
+    )
+
+    fake_action_llm = FakeActionLLM(
+        [
+            graph.AgentActionDecision(
+                thought="Find refund rows.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+            graph.AgentActionDecision(
+                thought="Find refund rows again.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+            graph.AgentActionDecision(
+                thought="Still repeating the same call.",
+                tool_name="filter_rows",
+                tool_input={"category": "REFUND"},
+            ),
+        ]
+    )
+    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+
+    result = graph.react_data_agent_node(state)
+
+    assert result["tool_trace"] == state["tool_trace"]
+    assert [step["tool_name"] for step in result["tool_trace"]] == ["filter_rows"]
+    assert "Latest observation: Found 3 matching rows." in result["final_answer"]
+    assert "Please answer using the latest relevant observation" not in result["final_answer"]
 
 
 def test_profile_update_node_saves_durable_observation(monkeypatch) -> None:
@@ -589,7 +780,10 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
                             (),
                             {
                                 "row_id": 13,
+                                "category": "REFUND",
+                                "intent": "check_refund_status",
                                 "instruction": "Example 4",
+                                "response": "Refunds usually take several business days.",
                             },
                         )(),
                         type(
@@ -597,7 +791,10 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
                             (),
                             {
                                 "row_id": 14,
+                                "category": "REFUND",
+                                "intent": "get_refund",
                                 "instruction": "Example 5",
+                                "response": "You can request a refund through your account.",
                             },
                         )(),
                         type(
@@ -605,7 +802,10 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
                             (),
                             {
                                 "row_id": 15,
+                                "category": "REFUND",
+                                "intent": "check_refund_status",
                                 "instruction": "Example 6",
+                                "response": "Your refund status is available in your account.",
                             },
                         )(),
                     ],
@@ -651,6 +851,57 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
         "query_type": "sample",
         "row_ids": [10, 11, 12, 13, 14, 15],
     }
+
+
+def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> None:
+    state = graph.create_initial_state(
+        query="Show me 1 example from the REFUND category.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    monkeypatch.setattr(
+        graph,
+        "sample_examples_impl",
+        lambda row_ids=None, n=3, offset=0: type(
+            "SampleExamplesResult",
+            (),
+            {
+                "examples": [
+                    type(
+                        "ExampleRow",
+                        (),
+                        {
+                            "row_id": 10,
+                            "category": "REFUND",
+                            "intent": "check_refund_status",
+                            "instruction": "Where is my refund?",
+                            "response": "You can check your refund status in your account.",
+                        },
+                    )()
+                ],
+                "next_offset": 1,
+            },
+        )(),
+    )
+
+    graph._execute_tool(
+        state=state,
+        tool_name="sample_examples",
+        tool_input={
+            "row_ids": [10],
+            "n": 1,
+            "offset": 0,
+        },
+    )
+
+    observation = state["tool_trace"][-1]["observation"]
+
+    assert "row_id=10" in observation
+    assert "category=REFUND" in observation
+    assert "intent=check_refund_status" in observation
+    assert "customer_instruction=Where is my refund?" in observation
+    assert "support_response=You can check your refund status in your account." in observation
 
 
 def test_follow_up_what_about_refunds_preserves_count_pattern(monkeypatch) -> None:

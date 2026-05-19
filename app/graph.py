@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import Any, Literal
 
 import sqlite3
+import re
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -91,7 +92,7 @@ def get_agent_llm():
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         temperature=0,
-        max_tokens=1024,
+        max_tokens=2056,
         extra_body={
             "enable_thinking": False,
             "thinking_budget": 0,
@@ -202,6 +203,108 @@ def _structured_results_for_prompt(results: list[AnalysisResult]) -> str:
     return "\n".join(lines)
 
 
+def _is_more_examples_query(query: str) -> bool:
+    """Return True when the user asks for additional examples from prior context."""
+    normalized = query.strip().lower()
+
+    if not normalized:
+        return False
+
+    more_markers = (
+        "more",
+        "another",
+        "additional",
+        "next",
+    )
+    example_markers = (
+        "example",
+        "examples",
+        "sample",
+        "samples",
+        "case",
+        "cases",
+        "row",
+        "rows",
+    )
+
+    return any(marker in normalized for marker in more_markers) and any(
+        marker in normalized for marker in example_markers
+    )
+
+
+def _requested_example_count(query: str, default: int = 3) -> int:
+    """Extract requested example count from a follow-up query."""
+    normalized = query.strip().lower()
+
+    patterns = [
+        r"\banother\s+(\d+)\b",
+        r"\bmore\s+(\d+)\b",
+        r"\bnext\s+(\d+)\b",
+        r"\bshow\s+(?:me\s+)?(\d+)\b",
+        r"\bgive\s+(?:me\s+)?(\d+)\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return max(1, min(20, int(match.group(1))))
+
+    return default
+
+
+def _latest_sample_context(
+    results: list[AnalysisResult],
+) -> tuple[list[int], int] | None:
+    """Return previous sample row IDs and next offset for 'show more' follow-ups."""
+    for result in reversed(results):
+        if result.get("query_type") != "sample":
+            continue
+
+        row_ids = result.get("row_ids")
+        offset = result.get("value")
+
+        if isinstance(row_ids, list) and isinstance(offset, int):
+            return row_ids, offset
+
+    return None
+
+
+def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
+    """Deterministically answer 'show more examples' without asking the LLM."""
+    user_query = _latest_user_message(state["messages"])
+
+    if not _is_more_examples_query(user_query):
+        return None
+
+    sample_context = _latest_sample_context(state["last_structured_results"])
+    if sample_context is None:
+        return None
+
+    row_ids, offset = sample_context
+    n = _requested_example_count(user_query)
+
+    observation = _execute_tool(
+        state=state,
+        tool_name="sample_examples",
+        tool_input={
+            "row_ids": row_ids,
+            "n": n,
+            "offset": offset,
+        },
+    )
+
+    final_answer = observation
+    state["final_answer"] = final_answer
+
+    return {
+        "tool_trace": state["tool_trace"],
+        "last_structured_results": state["last_structured_results"],
+        "iteration_count": state["iteration_count"],
+        "final_answer": final_answer,
+        "messages": [AIMessage(content=final_answer)],
+    }
+
+
 def _route_specific_instructions(route: str | None) -> str:
     """Return explicit behavior instructions for the selected route."""
     if route == "structured":
@@ -248,9 +351,18 @@ def _route_specific_instructions(route: str | None) -> str:
 """
 
 
-def _build_action_messages(state: AgentState) -> list[BaseMessage]:
+def _build_action_messages(
+        state: AgentState,
+        correction_message: str | None = None,
+) -> list[BaseMessage]:
     """Build messages for the ReAct-style action selector."""
     user_query = _latest_user_message(state["messages"])
+
+    correction_section = (
+        ""
+        if correction_message is None
+        else f"\n\nCorrection instruction:\n{correction_message}"
+    )
 
     context = f"""Current route: {state["route"]}
 Route reason: {state["route_reason"]}
@@ -302,6 +414,7 @@ Important:
 - If a tool call already returned useful results, do not repeat the same tool call with the same input.
 - After filter_rows returns matching row IDs for an example request, the next action should usually be sample_examples.
 - When enough evidence is available, choose final_answer.
++{correction_section}
 """
 
     return [
@@ -370,12 +483,60 @@ def _is_repeated_tool_call(
 
 
 def _answer_from_existing_trace(state: AgentState) -> str:
-    """Ask the model to answer from existing observations after a repeated call."""
+    """Return a safe answer from existing observations after repeated-call recovery fails."""
+    if not state["tool_trace"]:
+        return (
+            "I could not complete the analysis because the agent attempted to "
+            "repeat a tool call before producing an answer."
+        )
+
+    latest_trace_item = state["tool_trace"][-1]
     return (
-        "The needed tool result is already available in the trace. "
-        "Please answer using the latest relevant observation instead of repeating "
-        "the same tool call."
+        "I already have the needed tool result, but the agent attempted to "
+        "repeat the same call. Latest observation: "
+        f"{latest_trace_item['observation']}"
     )
+
+
+def _build_repeated_call_correction_message(
+    state: AgentState,
+    repeated_decision: AgentActionDecision,
+) -> str:
+    """Build a one-time correction prompt after a repeated tool call is detected."""
+    return (
+        "You attempted to repeat a tool call that already ran during this turn.\n\n"
+        f"Repeated tool: {repeated_decision.tool_name}\n"
+        f"Repeated input: {repeated_decision.tool_input}\n\n"
+        "Review the existing tool trace carefully. Do not call the same tool with "
+        "the same input again. If the existing observation already answers the "
+        "user's question, choose final_answer now. If another step is truly needed, "
+        "choose a different tool call with different parameters.\n\n"
+        "Important: prefer final_answer when the latest observation contains the "
+        "requested count, examples, grouped counts, summary, or profile text."
+    )
+
+
+def _invoke_revised_action_after_repeated_call(
+    state: AgentState,
+    repeated_decision: AgentActionDecision,
+):
+    """Ask the action model once to revise its decision after a repeated call."""
+    structured_llm = get_structured_action_llm()
+    correction_message = _build_repeated_call_correction_message(
+        state=state,
+        repeated_decision=repeated_decision,
+    )
+    revised_decision = structured_llm.invoke(
+        _build_action_messages(
+            state=state,
+            correction_message=correction_message,
+        )
+    )
+
+    if isinstance(revised_decision, AgentActionDecision):
+        return revised_decision
+
+    return AgentActionDecision.model_validate(revised_decision)
 
 
 def _execute_tool(
@@ -449,14 +610,22 @@ def _execute_tool(
         result = sample_examples_impl(row_ids=row_ids, n=n, offset=offset)
 
         example_lines = [
-            f"{example.row_id}: {example.instruction}"
+            (
+                f"row_id={example.row_id}\n"
+                f"category={example.category or ''}\n"
+                f"intent={example.intent or ''}\n"
+                f"customer_instruction={example.instruction}\n"
+                f"support_response={example.response or ''}"
+            )
             for example in result.examples
         ]
+
         observation = (
             f"Returned {len(result.examples)} examples. "
             f"Next offset = {result.next_offset}. "
-            + ("\n" + "\n".join(example_lines) if example_lines else "")
+            + ("\n\n" + "\n\n---\n\n".join(example_lines) if example_lines else "")
         )
+
         _append_trace(
             state,
             tool_name,
@@ -559,6 +728,10 @@ def refusal_node(state: AgentState) -> dict[str, Any]:
 
 def react_data_agent_node(state: AgentState) -> dict[str, Any]:
     """Run a ReAct-style tool-use loop for dataset questions."""
+    more_examples_result = _handle_more_examples_follow_up(state)
+    if more_examples_result is not None:
+        return more_examples_result
+
     structured_llm = get_structured_action_llm()
 
     while state["iteration_count"] < state["max_iterations"]:
@@ -586,15 +759,45 @@ def react_data_agent_node(state: AgentState) -> dict[str, Any]:
             tool_name=decision.tool_name,
             tool_input=decision.tool_input,
         ):
-            final_answer = _answer_from_existing_trace(state)
-            state["final_answer"] = final_answer
-            return {
-                "tool_trace": state["tool_trace"],
-                "last_structured_results": state["last_structured_results"],
-                "iteration_count": state["iteration_count"],
-                "final_answer": final_answer,
-                "messages": [AIMessage(content=final_answer)],
-            }
+            revised_decision = _invoke_revised_action_after_repeated_call(
+                state=state,
+                repeated_decision=decision,
+            )
+
+            if revised_decision.tool_name == "final_answer":
+                final_answer = revised_decision.final_answer or (
+                    "I completed the analysis, but no final answer was provided."
+                )
+                state["final_answer"] = final_answer
+                return {
+                    "tool_trace": state["tool_trace"],
+                    "last_structured_results": state["last_structured_results"],
+                    "iteration_count": state["iteration_count"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
+
+            if _is_repeated_tool_call(
+                state=state,
+                tool_name=revised_decision.tool_name,
+                tool_input=revised_decision.tool_input,
+            ):
+                final_answer = _answer_from_existing_trace(state)
+                state["final_answer"] = final_answer
+                return {
+                    "tool_trace": state["tool_trace"],
+                    "last_structured_results": state["last_structured_results"],
+                    "iteration_count": state["iteration_count"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
+
+            _execute_tool(
+                state=state,
+                tool_name=revised_decision.tool_name,
+                tool_input=revised_decision.tool_input,
+            )
+            continue
 
         _execute_tool(
             state=state,
