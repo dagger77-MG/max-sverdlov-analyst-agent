@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app import graph
 
@@ -14,22 +14,17 @@ def patch_checkpointer(monkeypatch: pytest.MonkeyPatch):
     if hasattr(graph.get_checkpointer, "cache_clear"):
         graph.get_checkpointer.cache_clear()
 
+    if hasattr(graph.get_langchain_data_agent, "cache_clear"):
+        graph.get_langchain_data_agent.cache_clear()
+
+    if hasattr(graph.get_structured_profile_llm, "cache_clear"):
+        graph.get_structured_profile_llm.cache_clear()
+
     monkeypatch.setattr(graph, "get_checkpointer", lambda: None)
 
     yield
 
     graph.build_graph.cache_clear()
-
-
-class FakeActionLLM:
-    def __init__(self, decisions: list[graph.AgentActionDecision]) -> None:
-        self.decisions = decisions
-        self.call_count = 0
-
-    def invoke(self, messages):
-        decision = self.decisions[self.call_count]
-        self.call_count += 1
-        return decision
 
 
 class FakeProfileLLM:
@@ -40,7 +35,39 @@ class FakeProfileLLM:
         return graph.ProfileObservationDecision(observation=self.observation)
 
 
-def test_structured_query_uses_tools_and_returns_final_answer(monkeypatch) -> None:
+class FakeLangChainAgent:
+    def __init__(self, result_messages):
+        self.result_messages = result_messages
+        self.received_input = None
+        self.received_config = None
+
+    def invoke(self, input_data, config=None):
+        self.received_input = input_data
+        self.received_config = config
+        return {
+            "messages": self.result_messages,
+        }
+
+
+class FailingLangChainAgent:
+    def invoke(self, input_data, config=None):
+        raise RuntimeError("Simulated agent failure.")
+
+
+def _profile_result(user_id: str, profile: str = "# User Profile\n"):
+    return type(
+        "ProfileResult",
+        (),
+        {
+            "user_id": user_id,
+            "profile": profile,
+        },
+    )()
+
+
+def test_structured_query_uses_standard_langchain_agent_and_returns_trace(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -52,36 +79,10 @@ def test_structured_query_uses_tools_and_returns_final_answer(monkeypatch) -> No
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
-        lambda user_id: type(
-            "ProfileResult",
-            (),
-            {
-                "user_id": user_id,
-                "profile": "# User Profile\n\n- No durable user facts or preferences have been saved yet.\n",
-            },
-        )(),
-    )
-    monkeypatch.setattr(
-        graph,
-        "filter_rows_impl",
-        lambda **kwargs: type(
-            "FilterRowsResult",
-            (),
-            {
-                "row_ids": [1, 2, 3],
-                "match_count": 3,
-                "applied_filters": kwargs,
-            },
-        )(),
-    )
-    monkeypatch.setattr(
-        graph,
-        "count_rows_impl",
-        lambda row_ids=None: type(
-            "CountRowsResult",
-            (),
-            {"count": len(row_ids or [])},
-        )(),
+        lambda user_id: _profile_result(
+            user_id,
+            "# User Profile\n\n- No durable user facts or preferences have been saved yet.\n",
+        ),
     )
     monkeypatch.setattr(
         graph,
@@ -89,26 +90,38 @@ def test_structured_query_uses_tools_and_returns_final_answer(monkeypatch) -> No
         lambda: FakeProfileLLM(),
     )
 
-    fake_action_llm = FakeActionLLM(
+    fake_agent = FakeLangChainAgent(
         [
-            graph.AgentActionDecision(
-                thought="Find refund rows.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_filter",
+                        "name": "filter_rows",
+                        "args": {"category": "REFUND"},
+                    }
+                ],
             ),
-            graph.AgentActionDecision(
-                thought="Count the filtered rows.",
-                tool_name="count_rows",
-                tool_input={"row_ids": [1, 2, 3]},
+            ToolMessage(
+                content=str(
+                    {
+                        "row_ids": [1, 2, 3],
+                        "match_count": 3,
+                        "applied_filters": {
+                            "category": "REFUND",
+                            "intent": None,
+                            "text_query": None,
+                            "limit": None,
+                        },
+                    }
+                ),
+                name="filter_rows",
+                tool_call_id="call_filter",
             ),
-            graph.AgentActionDecision(
-                thought="Answer with the count.",
-                tool_name="final_answer",
-                final_answer="There are 3 refund rows in the dataset.",
-            ),
+            AIMessage(content="There are 3 refund rows in the dataset."),
         ]
     )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
 
     result = graph.invoke_agent(
         query="How many refund requests did we get?",
@@ -118,15 +131,26 @@ def test_structured_query_uses_tools_and_returns_final_answer(monkeypatch) -> No
 
     assert result["route"] == "structured"
     assert result["final_answer"] == "There are 3 refund rows in the dataset."
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
-        "count_rows",
-    ]
-    assert result["last_structured_results"][-1]["value"] == 3
+    assert [step["tool_name"] for step in result["tool_trace"]] == ["filter_rows"]
+    assert result["tool_trace"][0]["tool_input"] == {"category": "REFUND"}
+    assert result["last_structured_results"][-1] == {
+        "label": str(
+            {
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+                "limit": None,
+            }
+        ),
+        "value": 3,
+        "query_type": "filter",
+        "row_ids": [1, 2, 3],
+    }
     assert isinstance(result["messages"][-1], AIMessage)
+    assert fake_agent.received_config == {"recursion_limit": result["max_iterations"] + 5}
 
 
-def test_unstructured_query_uses_filter_and_summarize_tools(monkeypatch) -> None:
+def test_unstructured_query_uses_standard_langchain_agent_trace(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -138,37 +162,7 @@ def test_unstructured_query_uses_filter_and_summarize_tools(monkeypatch) -> None
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
-        lambda user_id: type(
-            "ProfileResult",
-            (),
-            {"user_id": user_id, "profile": "# User Profile\n"},
-        )(),
-    )
-    monkeypatch.setattr(
-        graph,
-        "filter_rows_impl",
-        lambda **kwargs: type(
-            "FilterRowsResult",
-            (),
-            {
-                "row_ids": [10, 11],
-                "match_count": 2,
-                "applied_filters": kwargs,
-            },
-        )(),
-    )
-    monkeypatch.setattr(
-        graph,
-        "summarize_rows_impl",
-        lambda row_ids, focus, max_examples=100: type(
-            "SummarizeRowsResult",
-            (),
-            {
-                "summary": "Rows reviewed: 2\nCustomers mainly provide product feedback.",
-                "row_count_used": 2,
-                "focus": focus,
-            },
-        )(),
+        lambda user_id: _profile_result(user_id),
     )
     monkeypatch.setattr(
         graph,
@@ -176,30 +170,58 @@ def test_unstructured_query_uses_filter_and_summarize_tools(monkeypatch) -> None
         lambda: FakeProfileLLM(),
     )
 
-    fake_action_llm = FakeActionLLM(
+    fake_agent = FakeLangChainAgent(
         [
-            graph.AgentActionDecision(
-                thought="Find feedback rows.",
-                tool_name="filter_rows",
-                tool_input={"category": "FEEDBACK"},
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_filter",
+                        "name": "filter_rows",
+                        "args": {"category": "FEEDBACK"},
+                    }
+                ],
             ),
-            graph.AgentActionDecision(
-                thought="Summarize the selected rows.",
-                tool_name="summarize_rows",
-                tool_input={
-                    "row_ids": [10, 11],
-                    "focus": "Summarize the FEEDBACK category.",
-                    "max_examples": 100,
-                },
+            ToolMessage(
+                content=str(
+                    {
+                        "row_ids": [10, 11],
+                        "match_count": 2,
+                        "applied_filters": {"category": "FEEDBACK"},
+                    }
+                ),
+                name="filter_rows",
+                tool_call_id="call_filter",
             ),
-            graph.AgentActionDecision(
-                thought="Answer with the grounded summary.",
-                tool_name="final_answer",
-                final_answer="Customers mainly provide product feedback.",
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_summary",
+                        "name": "summarize_rows",
+                        "args": {
+                            "row_ids": [10, 11],
+                            "focus": "Summarize the FEEDBACK category.",
+                            "max_examples": 100,
+                        },
+                    }
+                ],
             ),
+            ToolMessage(
+                content=str(
+                    {
+                        "summary": "Customers mainly provide product feedback.",
+                        "row_count_used": 2,
+                        "focus": "Summarize the FEEDBACK category.",
+                    }
+                ),
+                name="summarize_rows",
+                tool_call_id="call_summary",
+            ),
+            AIMessage(content="Customers mainly provide product feedback."),
         ]
     )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
 
     result = graph.invoke_agent(
         query="Summarize the FEEDBACK category.",
@@ -213,9 +235,11 @@ def test_unstructured_query_uses_filter_and_summarize_tools(monkeypatch) -> None
         "filter_rows",
         "summarize_rows",
     ]
+    assert result["last_structured_results"][-1]["query_type"] == "filter"
+    assert result["last_structured_results"][-1]["value"] == 2
 
 
-def test_out_of_scope_query_refuses_without_data_tools(monkeypatch) -> None:
+def test_out_of_scope_query_refuses_without_data_agent(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -227,11 +251,7 @@ def test_out_of_scope_query_refuses_without_data_tools(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
-        lambda user_id: type(
-            "ProfileResult",
-            (),
-            {"user_id": user_id, "profile": "# User Profile\n"},
-        )(),
+        lambda user_id: _profile_result(user_id),
     )
     monkeypatch.setattr(
         graph,
@@ -242,7 +262,7 @@ def test_out_of_scope_query_refuses_without_data_tools(monkeypatch) -> None:
     def fail_if_data_agent_called():
         raise AssertionError("Data agent should not be called for out-of-scope queries.")
 
-    monkeypatch.setattr(graph, "get_structured_action_llm", fail_if_data_agent_called)
+    monkeypatch.setattr(graph, "get_langchain_data_agent", fail_if_data_agent_called)
 
     result = graph.invoke_agent(
         query="Who won the World Cup?",
@@ -255,7 +275,7 @@ def test_out_of_scope_query_refuses_without_data_tools(monkeypatch) -> None:
     assert result["tool_trace"] == []
 
 
-def test_max_iteration_fallback(monkeypatch) -> None:
+def test_standard_agent_failure_returns_graceful_fallback(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -267,11 +287,7 @@ def test_max_iteration_fallback(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
-        lambda user_id: type(
-            "ProfileResult",
-            (),
-            {"user_id": user_id, "profile": "# User Profile\n"},
-        )(),
+        lambda user_id: _profile_result(user_id),
     )
     monkeypatch.setattr(
         graph,
@@ -280,42 +296,8 @@ def test_max_iteration_fallback(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         graph,
-        "group_counts_impl",
-        lambda group_by, row_ids=None, top_k=20: type(
-            "GroupCountsResult",
-            (),
-            {
-                "group_by": group_by,
-                "counts": [
-                    type(
-                        "GroupCountRow",
-                        (),
-                        {
-                            "label": f"GROUP_{top_k}",
-                            "count": top_k,
-                        },
-                    )()
-                ],
-            },
-        )(),
-    )
-
-    repeated_decisions = [
-        graph.AgentActionDecision(
-            thought="Keep inspecting grouped counts without finalizing.",
-            tool_name="group_counts",
-            tool_input={
-                "group_by": "category",
-                "top_k": index + 1,
-            },
-        )
-        for index in range(graph.settings.max_iterations)
-    ]
-
-    monkeypatch.setattr(
-        graph,
-        "get_structured_action_llm",
-        lambda: FakeActionLLM(repeated_decisions),
+        "get_langchain_data_agent",
+        lambda: FailingLangChainAgent(),
     )
 
     result = graph.invoke_agent(
@@ -324,190 +306,11 @@ def test_max_iteration_fallback(monkeypatch) -> None:
         user_id="max",
     )
 
-    assert result["iteration_count"] == graph.settings.max_iterations
     assert result["final_answer"] == (
         "I could not complete the analysis within the allowed number of "
         "reasoning steps. Please try asking a more specific dataset question."
     )
-
-
-def test_repeated_tool_call_prompts_revised_final_answer(monkeypatch) -> None:
-    state = graph.create_initial_state(
-        query="How many refund requests did we get?",
-        session_id="test_session",
-        user_id="max",
-    )
-    state["route"] = "structured"
-    state["route_reason"] = "The user asks for an exact refund count."
-    state["user_profile"] = "# User Profile\n"
-
-    monkeypatch.setattr(
-        graph,
-        "filter_rows_impl",
-       lambda **kwargs: type(
-            "FilterRowsResult",
-            (),
-            {
-                "row_ids": [1, 2, 3],
-                "match_count": 3,
-                "applied_filters": kwargs,
-            },
-        )(),
-    )
-
-    fake_action_llm = FakeActionLLM(
-        [
-            graph.AgentActionDecision(
-                thought="Find refund rows.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
-            ),
-            graph.AgentActionDecision(
-                thought="Find refund rows again.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
-            ),
-            graph.AgentActionDecision(
-                thought="The trace already contains the refund count.",
-                tool_name="final_answer",
-                final_answer="There are 3 REFUND rows in the dataset.",
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
-
-    result = graph.react_data_agent_node(state)
-    assert result["final_answer"] == "There are 3 REFUND rows in the dataset."
-    assert [step["tool_name"] for step in result["tool_trace"]] == ["filter_rows"]
-    assert result["iteration_count"] == 2
-    assert fake_action_llm.call_count == 3
-
-
-def test_repeated_tool_call_allows_revised_different_tool(monkeypatch) -> None:
-    state = graph.create_initial_state(
-        query="How many refund requests did we get?",
-        session_id="test_session",
-        user_id="max",
-    )
-    state["route"] = "structured"
-    state["route_reason"] = "The user asks for an exact refund count."
-    state["user_profile"] = "# User Profile\n"
-
-    monkeypatch.setattr(
-        graph,
-        "filter_rows_impl",
-        lambda **kwargs: type(
-            "FilterRowsResult",
-            (),
-            {
-                "row_ids": [10, 11, 12],
-                "match_count": 3,
-                "applied_filters": kwargs,
-            },
-        )(),
-    )
-    monkeypatch.setattr(
-        graph,
-        "count_rows_impl",
-        lambda row_ids=None: type(
-            "CountRowsResult",
-            (),
-            {"count": len(row_ids or [])},
-        )(),
-    )
-
-    fake_action_llm = FakeActionLLM(
-        [
-            graph.AgentActionDecision(
-                thought="Find refund rows.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
-            ),
-            graph.AgentActionDecision(
-                thought="Find refund rows again.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
-            ),
-            graph.AgentActionDecision(
-                thought="Use a different needed tool to count the complete row IDs.",
-                tool_name="count_rows",
-                tool_input={"row_ids": [10, 11, 12]},
-            ),
-            graph.AgentActionDecision(
-                thought="Answer with the count.",
-                tool_name="final_answer",
-                final_answer="There are 3 refund rows.",
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
-
-    result = graph.react_data_agent_node(state)
-
-    assert result["final_answer"] == "There are 3 refund rows."
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
-        "count_rows",
-    ]
-    assert result["last_structured_results"][-1] == {
-        "label": "count_rows",
-        "value": 3,
-        "query_type": "count",
-        "row_ids": [10, 11, 12],
-    }
-
-
-def test_repeated_tool_call_falls_back_when_revised_decision_repeats(monkeypatch) -> None:
-    state = graph.create_initial_state(
-        query="How many refund requests did we get?",
-        session_id="test_session",
-        user_id="max",
-    )
-    state["route"] = "structured"
-    state["route_reason"] = "The user asks for an exact refund count."
-    state["user_profile"] = "# User Profile\n"
-
-    monkeypatch.setattr(
-        graph,
-        "filter_rows_impl",
-        lambda **kwargs: type(
-            "FilterRowsResult",
-            (),
-            {
-                "row_ids": [1, 2, 3],
-                "match_count": 3,
-                "applied_filters": kwargs,
-            },
-        )(),
-    )
-
-    fake_action_llm = FakeActionLLM(
-        [
-            graph.AgentActionDecision(
-                thought="Find refund rows.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
-            ),
-            graph.AgentActionDecision(
-                thought="Find refund rows again.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
-            ),
-            graph.AgentActionDecision(
-                thought="Still repeating the same call.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
-
-    result = graph.react_data_agent_node(state)
-
-    assert result["tool_trace"] == state["tool_trace"]
-    assert [step["tool_name"] for step in result["tool_trace"]] == ["filter_rows"]
-    assert "Latest observation: Found 3 matching rows." in result["final_answer"]
-    assert "Please answer using the latest relevant observation" not in result["final_answer"]
+    assert result["tool_trace"] == []
 
 
 def test_profile_update_node_saves_durable_observation(monkeypatch) -> None:
@@ -522,11 +325,7 @@ def test_profile_update_node_saves_durable_observation(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
-        lambda user_id: type(
-            "ProfileResult",
-            (),
-            {"user_id": user_id, "profile": "# User Profile\n"},
-        )(),
+        lambda user_id: _profile_result(user_id),
     )
     monkeypatch.setattr(
         graph,
@@ -556,41 +355,6 @@ def test_profile_update_node_saves_durable_observation(monkeypatch) -> None:
     )
 
     assert "- User prefers file-by-file implementation review." in result["user_profile"]
-
-
-def test_route_specific_instructions_for_structured_route() -> None:
-    instructions = graph._route_specific_instructions("structured")
-
-    assert "STRUCTURED queries" in instructions
-    assert "Prefer deterministic tools" in instructions
-    assert "Do not use summarize_rows unless" in instructions
-    assert "For example/sample requests, do not stop after filter_rows." in instructions
-    assert "Call sample_examples with the returned row_ids, n=N, and offset=0." in instructions
-    assert "Do not use filter_rows(limit=N) as a substitute for sample_examples(n=N)." in instructions
-
-
-def test_action_prompt_describes_correct_example_tool_sequence() -> None:
-    state = graph.create_initial_state(
-        query="Show me 3 examples from the REFUND category.",
-        session_id="test_session",
-        user_id="max",
-    )
-    state["route"] = "structured"
-    state["route_reason"] = "The user asks for examples from a dataset category."
-    state["user_profile"] = "# User Profile\n"
-    messages = graph._build_action_messages(state)
-    prompt_text = "\n\n".join(str(message.content) for message in messages)
-
-    assert "Do not use limit to satisfy \"show N examples\"." in prompt_text
-    assert "After filter_rows returns matching row IDs for an example request" in prompt_text
-
-
-def test_route_specific_instructions_for_unstructured_route() -> None:
-    instructions = graph._route_specific_instructions("unstructured")
-
-    assert "UNSTRUCTURED queries" in instructions
-    assert "Then use summarize_rows" in instructions
-    assert "Do not answer from general knowledge" in instructions
 
 
 def test_build_graph_config_uses_session_id_as_thread_id() -> None:
@@ -682,11 +446,10 @@ def test_load_user_profile_node_returns_partial_state_update(monkeypatch) -> Non
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
-        lambda user_id: type(
-            "ProfileResult",
-            (),
-            {"user_id": user_id, "profile": "# User Profile\n\n- Test profile\n"},
-        )(),
+        lambda user_id: _profile_result(
+            user_id,
+            "# User Profile\n\n- Test profile\n",
+        ),
     )
 
     state = graph.create_initial_state(
@@ -726,6 +489,32 @@ def test_router_node_returns_partial_state_update(monkeypatch) -> None:
     }
 
 
+def test_route_after_router_sends_dataset_queries_to_langchain_agent() -> None:
+    state = graph.create_initial_state(
+        query="How many refund requests?",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+
+    assert graph.route_after_router(state) == "langchain_data_agent_node"
+
+    state["route"] = "unstructured"
+
+    assert graph.route_after_router(state) == "langchain_data_agent_node"
+
+
+def test_route_after_router_sends_out_of_scope_to_refusal_node() -> None:
+    state = graph.create_initial_state(
+        query="Who won the World Cup?",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "out_of_scope"
+
+    assert graph.route_after_router(state) == "refusal_node"
+
+
 def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
     monkeypatch,
 ) -> None:
@@ -737,17 +526,6 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
     state["route"] = "structured"
     state["route_reason"] = "The user asks for more examples from the previous subset."
     state["user_profile"] = "# User Profile\n"
-    state["tool_trace"] = [
-        {
-            "tool_name": "sample_examples",
-            "tool_input": {
-                "row_ids": [10, 11, 12, 13, 14, 15],
-                "n": 3,
-                "offset": 0,
-            },
-            "observation": "Returned 3 examples. Next offset = 3.",
-        }
-    ]
     state["last_structured_results"] = [
         {
             "label": "sample_examples",
@@ -815,27 +593,12 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
         ),
     )
 
-    fake_action_llm = FakeActionLLM(
-        [
-            graph.AgentActionDecision(
-                thought="Continue from the previous sample offset.",
-                tool_name="sample_examples",
-                tool_input={
-                    "row_ids": [10, 11, 12, 13, 14, 15],
-                    "n": 3,
-                    "offset": 3,
-                },
-            ),
-            graph.AgentActionDecision(
-                thought="Answer with the next examples.",
-                tool_name="final_answer",
-                final_answer="Here are the next 3 examples: 13, 14, and 15.",
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
+    def fail_if_agent_called():
+        raise AssertionError("The standard agent should not be called for deterministic follow-up examples.")
 
-    result = graph.react_data_agent_node(state)
+    monkeypatch.setattr(graph, "get_langchain_data_agent", fail_if_agent_called)
+
+    result = graph.langchain_data_agent_node(state)
 
     assert captured_inputs == [
         {
@@ -844,7 +607,10 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
             "offset": 3,
         }
     ]
-    assert result["final_answer"] == "Here are the next 3 examples: 13, 14, and 15."
+    assert "row_id=13" in result["final_answer"]
+    assert "row_id=14" in result["final_answer"]
+    assert "row_id=15" in result["final_answer"]
+    assert result["tool_trace"][-1]["tool_name"] == "sample_examples"
     assert state["last_structured_results"][-1] == {
         "label": "sample_examples",
         "value": 6,
@@ -853,13 +619,37 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
     }
 
 
-def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> None:
+def test_follow_up_total_count_of_last_two_uses_stored_structured_results() -> None:
     state = graph.create_initial_state(
-        query="Show me 1 example from the REFUND category.",
+        query="What is the total count of the last two?",
         session_id="test_session",
         user_id="max",
     )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks to combine recent count results."
+    state["user_profile"] = "# User Profile\n"
+    state["last_structured_results"] = [
+        {
+            "label": "complaints",
+            "value": 514,
+            "query_type": "count",
+            "row_ids": None,
+        },
+        {
+            "label": "refunds",
+            "value": 842,
+            "query_type": "filter",
+            "row_ids": [1, 2, 3],
+        },
+    ]
 
+    result = graph.langchain_data_agent_node(state)
+
+    assert result["final_answer"] == "The total count of the last two results is 1,356."
+    assert result["tool_trace"] == []
+
+
+def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "sample_examples_impl",
@@ -885,18 +675,13 @@ def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> Non
         )(),
     )
 
-    graph._execute_tool(
-        state=state,
-        tool_name="sample_examples",
-        tool_input={
-            "row_ids": [10],
-            "n": 1,
-            "offset": 0,
-        },
+    observation, next_offset = graph._format_sample_examples_observation(
+        row_ids=[10],
+        n=1,
+        offset=0,
     )
 
-    observation = state["tool_trace"][-1]["observation"]
-
+    assert next_offset == 1
     assert "row_id=10" in observation
     assert "category=REFUND" in observation
     assert "intent=check_refund_status" in observation
@@ -904,128 +689,116 @@ def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> Non
     assert "support_response=You can check your refund status in your account." in observation
 
 
-def test_follow_up_what_about_refunds_preserves_count_pattern(monkeypatch) -> None:
-    state = graph.create_initial_state(
-        query="What about refunds?",
-        session_id="test_session",
-        user_id="max",
-    )
-    state["route"] = "structured"
-    state["route_reason"] = "The user asks a follow-up structured count question."
-    state["user_profile"] = "# User Profile\n"
-    state["last_structured_results"] = [
+def test_extract_langchain_tool_trace_and_results_for_count_rows() -> None:
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_count",
+                    "name": "count_rows",
+                    "args": {"row_ids": [1, 2, 3]},
+                }
+            ],
+        ),
+        ToolMessage(
+            content=str({"count": 3}),
+            name="count_rows",
+            tool_call_id="call_count",
+        ),
+        AIMessage(content="There are 3 rows."),
+    ]
+
+    trace, structured_results = graph._extract_langchain_tool_trace_and_results(messages)
+
+    assert trace == [
+        {
+            "tool_name": "count_rows",
+            "tool_input": {"row_ids": [1, 2, 3]},
+            "observation": "{'count': 3}",
+        }
+    ]
+    assert structured_results == [
         {
             "label": "count_rows",
-            "value": 5,
+            "value": 3,
             "query_type": "count",
-            "row_ids": [1, 2, 3, 4, 5],
+            "row_ids": [1, 2, 3],
         }
     ]
 
-    monkeypatch.setattr(
-        graph,
-        "filter_rows_impl",
-        lambda **kwargs: type(
-            "FilterRowsResult",
-            (),
-            {
-                "row_ids": [10, 11, 12],
-                "match_count": 3,
-                "applied_filters": kwargs,
-            },
-        )(),
-    )
-    monkeypatch.setattr(
-        graph,
-        "count_rows_impl",
-        lambda row_ids=None: type(
-            "CountRowsResult",
-            (),
-            {"count": len(row_ids or [])},
-        )(),
-    )
 
-    fake_action_llm = FakeActionLLM(
-        [
-            graph.AgentActionDecision(
-                thought="Find refund rows like the previous count question.",
-                tool_name="filter_rows",
-                tool_input={"category": "REFUND"},
+def test_extract_langchain_tool_trace_and_results_for_sample_examples() -> None:
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_sample",
+                    "name": "sample_examples",
+                    "args": {
+                        "row_ids": [10, 11, 12],
+                        "n": 2,
+                        "offset": 0,
+                    },
+                }
+            ],
+        ),
+        ToolMessage(
+            content=str(
+                {
+                    "examples": [
+                        {
+                            "row_id": 10,
+                            "instruction": "Example 1",
+                            "response": "Response 1",
+                            "category": "REFUND",
+                            "intent": "get_refund",
+                        }
+                    ],
+                    "next_offset": 1,
+                }
             ),
-            graph.AgentActionDecision(
-                thought="Count the refund rows.",
-                tool_name="count_rows",
-                tool_input={"row_ids": [10, 11, 12]},
-            ),
-            graph.AgentActionDecision(
-                thought="Answer with the refund count.",
-                tool_name="final_answer",
-                final_answer="There are 3 refund rows.",
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
-
-    result = graph.react_data_agent_node(state)
-
-    assert result["final_answer"] == "There are 3 refund rows."
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
-        "count_rows",
-    ]
-    assert state["last_structured_results"][-1]["value"] == 3
-
-
-def test_follow_up_total_count_of_last_two_uses_stored_structured_results(
-    monkeypatch,
-) -> None:
-    state = graph.create_initial_state(
-        query="What is the total count of the last two?",
-        session_id="test_session",
-        user_id="max",
-    )
-    state["route"] = "structured"
-    state["route_reason"] = "The user asks to combine recent count results."
-    state["user_profile"] = "# User Profile\n"
-    state["last_structured_results"] = [
-        {
-            "label": "complaints",
-            "value": 514,
-            "query_type": "count",
-            "row_ids": None,
-        },
-        {
-            "label": "refunds",
-            "value": 842,
-            "query_type": "count",
-            "row_ids": None,
-        },
+            name="sample_examples",
+            tool_call_id="call_sample",
+        ),
+        AIMessage(content="Here is one example."),
     ]
 
-    def fail_if_tool_called(*args, **kwargs):
-        raise AssertionError("No dataset tool should be needed for stored count totals.")
+    trace, structured_results = graph._extract_langchain_tool_trace_and_results(messages)
 
-    monkeypatch.setattr(graph, "filter_rows_impl", fail_if_tool_called)
-    monkeypatch.setattr(graph, "count_rows_impl", fail_if_tool_called)
-    monkeypatch.setattr(graph, "sample_examples_impl", fail_if_tool_called)
-    monkeypatch.setattr(graph, "group_counts_impl", fail_if_tool_called)
-    monkeypatch.setattr(graph, "summarize_rows_impl", fail_if_tool_called)
+    assert trace[0]["tool_name"] == "sample_examples"
+    assert structured_results == [
+        {
+            "label": "sample_examples",
+            "value": 1,
+            "query_type": "sample",
+            "row_ids": [10, 11, 12],
+        }
+    ]
 
-    fake_action_llm = FakeActionLLM(
-        [
-            graph.AgentActionDecision(
-                thought="Use the last two stored count results: 514 and 842.",
-                tool_name="final_answer",
-                final_answer="The total count of the last two results is 1,356.",
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_structured_action_llm", lambda: fake_action_llm)
 
-    result = graph.react_data_agent_node(state)
+def test_extract_final_answer_skips_ai_messages_with_tool_calls() -> None:
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_filter",
+                    "name": "filter_rows",
+                    "args": {"category": "REFUND"},
+                }
+            ],
+        ),
+        ToolMessage(
+            content=str({"row_ids": [1], "match_count": 1}),
+            name="filter_rows",
+            tool_call_id="call_filter",
+        ),
+        AIMessage(content="There is 1 refund row."),
+    ]
 
-    assert result["final_answer"] == "The total count of the last two results is 1,356."
-    assert result["tool_trace"] == []
+    assert graph._extract_final_answer(messages) == "There is 1 refund row."
 
 
 def test_create_invocation_state_falls_back_to_initial_state_when_checkpoint_read_fails() -> None:

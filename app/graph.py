@@ -1,64 +1,28 @@
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any, Literal
-
-import sqlite3
+import ast
+import json
 import re
+import sqlite3
+from functools import lru_cache
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.langchain_tools import LANGCHAIN_TOOLS
 from app.logging_utils import summarize_row_ids
 from app.memory import read_user_profile_impl, update_user_profile_impl
 from app.prompts import (
-    DATA_AGENT_SYSTEM_PROMPT,
+    LANGCHAIN_DATA_AGENT_SYSTEM_PROMPT,
     OUT_OF_SCOPE_REFUSAL,
     PROFILE_UPDATE_SYSTEM_PROMPT,
 )
 from app.router import RouteDecision, route_query_with_reason
 from app.state import AgentState, AnalysisResult, ToolTraceItem
-from app.tools import (
-    count_rows_impl,
-    filter_rows_impl,
-    get_dataset_schema_impl,
-    group_counts_impl,
-    sample_examples_impl,
-    summarize_rows_impl,
-)
-
-
-ToolName = Literal[
-    "get_dataset_schema",
-    "filter_rows",
-    "count_rows",
-    "sample_examples",
-    "group_counts",
-    "summarize_rows",
-    "read_user_profile",
-    "final_answer",
-]
-
-
-class AgentActionDecision(BaseModel):
-    """One ReAct-style action selected by the data agent."""
-
-    thought: str = Field(
-        description="Brief reasoning about what to do next."
-    )
-    tool_name: ToolName = Field(
-        description="Tool to call next, or final_answer when ready to answer."
-    )
-    tool_input: dict[str, Any] = Field(
-        default_factory=dict,
-        description="JSON-compatible input for the selected tool.",
-    )
-    final_answer: str | None = Field(
-        default=None,
-        description="Final user-facing answer when tool_name is final_answer.",
-    )
+from app.tools import sample_examples_impl
 
 
 class ProfileObservationDecision(BaseModel):
@@ -101,9 +65,21 @@ def get_agent_llm():
 
 
 @lru_cache(maxsize=1)
-def get_structured_action_llm():
-    """Return a cached agent model configured for structured action decisions."""
-    return get_agent_llm().with_structured_output(AgentActionDecision)
+def get_langchain_data_agent():
+    """Return the standard LangChain data agent runtime."""
+    try:
+        from langchain.agents import create_agent
+    except ImportError as exc:
+        raise RuntimeError(
+            "The standard LangChain agent requires 'langchain'. "
+            "Install project dependencies before running the agent."
+        ) from exc
+
+    return create_agent(
+        model=get_agent_llm(),
+        tools=LANGCHAIN_TOOLS,
+        system_prompt="/no_think\n" + LANGCHAIN_DATA_AGENT_SYSTEM_PROMPT,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -169,22 +145,6 @@ def _append_structured_result(
     state["last_structured_results"] = state["last_structured_results"][-max_results:]
 
 
-def _tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
-    """Format existing trace for the next LLM action decision."""
-    if not tool_trace:
-        return "No tools have been called yet."
-
-    lines: list[str] = []
-    for index, trace_item in enumerate(tool_trace, start=1):
-        lines.append(
-            f"{index}. Tool: {trace_item['tool_name']}\n"
-            f"   Input: {trace_item['tool_input']}\n"
-            f"   Observation: {trace_item['observation']}"
-        )
-
-    return "\n".join(lines)
-
-
 def _structured_results_for_prompt(results: list[AnalysisResult]) -> str:
     """Format recent structured results for follow-up resolution."""
     if not results:
@@ -227,8 +187,15 @@ def _is_more_examples_query(query: str) -> bool:
         "rows",
     )
 
-    return any(marker in normalized for marker in more_markers) and any(
-        marker in normalized for marker in example_markers
+    if any(marker in normalized for marker in more_markers) and any(
+            marker in normalized for marker in example_markers
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
+            normalized,
+        )
     )
 
 
@@ -269,6 +236,64 @@ def _latest_sample_context(
     return None
 
 
+def _is_total_of_last_two_query(query: str) -> bool:
+    """Return True when the user asks to total the two latest count results."""
+    normalized = query.strip().lower()
+    return (
+        "total" in normalized
+        and "last two" in normalized
+        and ("count" in normalized or "counts" in normalized)
+    )
+
+
+def _latest_two_count_results(
+    results: list[AnalysisResult],
+) -> list[AnalysisResult]:
+    """Return the latest two stored count-like results."""
+    count_results: list[AnalysisResult] = []
+
+    for result in reversed(results):
+        if result.get("query_type") not in {"count", "filter"}:
+            continue
+
+        value = result.get("value")
+        if isinstance(value, int | float):
+            count_results.append(result)
+
+        if len(count_results) == 2:
+            break
+
+    return list(reversed(count_results))
+
+
+def _format_sample_examples_observation(
+    row_ids: list[int] | None,
+    n: int,
+    offset: int,
+) -> tuple[str, int]:
+    """Call sample_examples and format the observation text."""
+    result = sample_examples_impl(row_ids=row_ids, n=n, offset=offset)
+
+    example_lines = [
+        (
+            f"row_id={example.row_id}\n"
+            f"category={example.category or ''}\n"
+            f"intent={example.intent or ''}\n"
+            f"customer_instruction={example.instruction}\n"
+            f"support_response={example.response or ''}"
+        )
+        for example in result.examples
+    ]
+
+    observation = (
+        f"Returned {len(result.examples)} examples. "
+        f"Next offset = {result.next_offset}. "
+        + ("\n\n" + "\n\n---\n\n".join(example_lines) if example_lines else "")
+    )
+
+    return observation, result.next_offset
+
+
 def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     """Deterministically answer 'show more examples' without asking the LLM."""
     user_query = _latest_user_message(state["messages"])
@@ -283,17 +308,57 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     row_ids, offset = sample_context
     n = _requested_example_count(user_query)
 
-    observation = _execute_tool(
-        state=state,
-        tool_name="sample_examples",
-        tool_input={
-            "row_ids": row_ids,
-            "n": n,
-            "offset": offset,
-        },
+    observation, next_offset = _format_sample_examples_observation(
+        row_ids=row_ids,
+        n=n,
+        offset=offset,
     )
 
-    final_answer = observation
+    tool_input = {
+        "row_ids": row_ids,
+        "n": n,
+        "offset": offset,
+    }
+    _append_trace(state, "sample_examples", tool_input, observation)
+    _append_structured_result(
+        state,
+        AnalysisResult(
+            label="sample_examples",
+            value=next_offset,
+            query_type="sample",
+            row_ids=row_ids,
+        ),
+    )
+
+    state["final_answer"] = observation
+
+    return {
+        "tool_trace": state["tool_trace"],
+        "last_structured_results": state["last_structured_results"],
+        "iteration_count": state["iteration_count"],
+        "final_answer": observation,
+        "messages": [AIMessage(content=observation)],
+    }
+
+
+def _handle_total_of_last_two_follow_up(state: AgentState) -> dict[str, Any] | None:
+    """Deterministically answer total-of-last-two count follow-ups."""
+    user_query = _latest_user_message(state["messages"])
+
+    if not _is_total_of_last_two_query(user_query):
+        return None
+
+    count_results = _latest_two_count_results(state["last_structured_results"])
+    if len(count_results) < 2:
+        return None
+
+    first, second = count_results
+    total = first["value"] + second["value"]
+    final_answer = (
+        "The total count of the last two results is "
+        f"{int(total):,}."
+    )
+
     state["final_answer"] = final_answer
 
     return {
@@ -305,64 +370,55 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     }
 
 
-def _route_specific_instructions(route: str | None) -> str:
-    """Return explicit behavior instructions for the selected route."""
-    if route == "structured":
-        return """Route-specific instructions for STRUCTURED queries:
-- The user is asking for exact dataset analysis.
-- Prefer deterministic tools such as filter_rows, count_rows, sample_examples, and group_counts.
-- Use filter_rows first when the user mentions a category, intent, topic, or text condition.
-- Prefer exact category or intent filters over text_query when the user wording clearly maps to a known dataset category or intent.
-- Use text_query only when the user asks about a topic that is not clearly represented by a known category or intent.
-- For filtered count questions, use filter_rows.match_count directly in final_answer.
-- Use count_rows only for whole-dataset counts or complete row_id lists.
-- Use sample_examples when the user asks for examples, samples, or "show me more".
-- Use group_counts when the user asks for distributions, most common categories, or counts by category/intent.
-- Do not use summarize_rows unless the user explicitly asks for a summary, themes, tone, patterns, or qualitative interpretation.
-- Known category mappings:
-  - refund, refunds, refund requests, reimbursement, reimbursement cases, money back, guarantee -> category="REFUND"
-  - feedback, product feedback, customer feedback -> category="FEEDBACK"
-  - complaint, complaints -> category="COMPLAINT"
-  - contact, contact support, customer service contact -> category="CONTACT"
-- For example/sample requests, do not stop after filter_rows.
-- If the user asks "Show me N examples from CATEGORY/INTENT/TOPIC":
-  1. Call filter_rows with the category, intent, or text condition and no limit.
-  2. Call sample_examples with the returned row_ids, n=N, and offset=0.
-  3. Answer using the sampled examples.
-- Do not use filter_rows(limit=N) as a substitute for sample_examples(n=N).
-- Never repeat the same filter_rows call if it already returned matching row IDs.
-- Final answers should include exact values from tool observations.
-"""
+def _handle_deterministic_follow_up(state: AgentState) -> dict[str, Any] | None:
+    """Handle known high-risk follow-ups before invoking the LLM agent."""
+    more_examples_result = _handle_more_examples_follow_up(state)
+    if more_examples_result is not None:
+        return more_examples_result
 
-    if route == "unstructured":
-        return """Route-specific instructions for UNSTRUCTURED queries:
-- The user is asking for qualitative analysis over dataset rows.
-- First identify the relevant row subset with filter_rows when the user mentions a category, intent, topic, or text condition.
-- Then use summarize_rows on the selected row IDs.
-- If the user asks about the whole dataset qualitatively, you may use get_dataset_schema first, then filter_rows or summarize_rows as needed.
-- Do not answer from general knowledge.
-- Final answers should describe only patterns supported by the rows passed to summarize_rows.
-- Mention the number of rows used when helpful.
-"""
+    total_result = _handle_total_of_last_two_follow_up(state)
+    if total_result is not None:
+        return total_result
 
-    return """Route-specific instructions:
-- If the route is unclear, inspect the dataset with get_dataset_schema or use the safest relevant dataset tool.
-- Do not answer from general knowledge.
-"""
+    return None
 
 
-def _build_action_messages(
-        state: AgentState,
-        correction_message: str | None = None,
-) -> list[BaseMessage]:
-    """Build messages for the ReAct-style action selector."""
+def _message_content_as_text(message: BaseMessage) -> str:
+    """Return message content as display-safe text."""
+    content = getattr(message, "content", "")
+
+    if isinstance(content, str):
+        return content
+
+    return str(content)
+
+
+def _safe_parse_tool_output(content: Any) -> Any:
+    """Best-effort parse of a LangChain tool message content."""
+    if isinstance(content, dict | list):
+        return content
+
+    if not isinstance(content, str):
+        return content
+
+    stripped = content.strip()
+    if not stripped:
+        return stripped
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        return ast.literal_eval(stripped)
+    except (SyntaxError, ValueError):
+        return stripped
+
+
+def _build_langchain_agent_messages(state: AgentState) -> list[BaseMessage]:
+    """Build compact input messages for the standard LangChain agent."""
     user_query = _latest_user_message(state["messages"])
-
-    correction_section = (
-        ""
-        if correction_message is None
-        else f"\n\nCorrection instruction:\n{correction_message}"
-    )
 
     context = f"""Current route: {state["route"]}
 Route reason: {state["route_reason"]}
@@ -373,330 +429,113 @@ User profile:
 Recent structured results:
 {_structured_results_for_prompt(state["last_structured_results"])}
 
-Tool trace so far:
-{_tool_trace_for_prompt(state["tool_trace"])}
-
-{_route_specific_instructions(state["route"])}
-
-Available tools:
-- get_dataset_schema(include_sample_values: bool = True)
-  Inspect dataset columns, row count, and sample values.
-- filter_rows(category: str | None = None, intent: str | None = None, text_query: str | None = None, limit: int | None = None)
-  Find matching row IDs for a category, intent, or text query.
-  This tool does not show examples.
-  Prefer category or intent when the user phrase maps to a known dataset category/intent.
-  Do not use limit to satisfy "show N examples".
-  For example requests, call filter_rows without limit, then call sample_examples with n=N.
-- count_rows(row_ids: list[int] | None = None)
-  Count all rows or a complete row_id subset. Do not use count_rows with previewed row IDs from an observation such as "[1, 2, 3...]".
-  For filtered count questions, prefer filter_rows.match_count and then final_answer.
-- sample_examples(row_ids: list[int] | None = None, n: int = 3, offset: int = 0)
-  Show actual example rows.
-  Use this whenever the user asks for examples, samples, rows, cases, or "show me N".
-  Usually call filter_rows first to get row_ids, then call sample_examples(row_ids=..., n=N, offset=0).
-- group_counts(group_by: "category" | "intent", row_ids: list[int] | None = None, top_k: int = 20)
-  Count rows grouped by category or intent.
-- summarize_rows(row_ids: list[int], focus: str, max_examples: int = 100)
-  Summarize selected rows for qualitative questions about themes, tone, or patterns.
-- read_user_profile(user_id: str)
-  Read the saved durable user profile.
-- final_answer
-
-Important:
-- Use tools before answering dataset questions.
-- For "show more" follow-ups, reuse previous row IDs and the previous next offset if available in the trace.
-- For "total of the last two", use recent stored count results if available.
-- After every tool observation, compare the observation with the original user question:
-  - If the observation already contains the information needed to answer the question, choose final_answer.
-  - If the observation is only an intermediate result, choose the next missing tool.
-  - Do not call another tool just because more tools are available.
-  - Do not repeat a tool call that produced the same answer-ready observation.
-- If a tool call already returned useful results, do not repeat the same tool call with the same input.
-- After filter_rows returns matching row IDs for an example request, the next action should usually be sample_examples.
-- When enough evidence is available, choose final_answer.
-+{correction_section}
+Follow-up guidance:
+- If the user asks for a total of recent counts, use recent structured results when available.
+- If the user asks for more examples and the graph did not already handle it, use sample_examples with the previous row_ids and offset when available.
+- Do not reconstruct row IDs from compact previews.
+- Do not answer from general knowledge.
 """
 
     return [
-        SystemMessage(
-            content="/no_think\n"
-                    + DATA_AGENT_SYSTEM_PROMPT
-        ),
         SystemMessage(content=context),
         HumanMessage(content=user_query),
     ]
 
 
-def _safe_int_list(value: Any) -> list[int] | None:
-    """Convert a JSON-like row_ids value into list[int] or None."""
-    if value is None:
-        return None
+def _extract_langchain_tool_trace_and_results(
+    messages: list[BaseMessage],
+) -> tuple[list[ToolTraceItem], list[AnalysisResult]]:
+    """Extract visible tool steps and compact follow-up results from agent messages."""
+    trace: list[ToolTraceItem] = []
+    structured_results: list[AnalysisResult] = []
+    pending_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
 
-    if not isinstance(value, list):
-        return None
+    for message in messages:
+        tool_calls = getattr(message, "tool_calls", None) or []
+        for tool_call in tool_calls:
+            call_id = str(tool_call.get("id", ""))
+            tool_name = str(tool_call.get("name", "unknown_tool"))
+            tool_args = tool_call.get("args") or {}
+            if not isinstance(tool_args, dict):
+                tool_args = {"input": tool_args}
+            pending_tool_calls[call_id] = (tool_name, tool_args)
 
-    result: list[int] = []
-    for item in value:
-        try:
-            result.append(int(item))
-        except (TypeError, ValueError):
+        if getattr(message, "type", None) != "tool":
             continue
 
-    return result
-
-
-def _normalized_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
-    """Normalize tool input for repeated-call detection."""
-    normalized: dict[str, Any] = {}
-
-    for key, value in tool_input.items():
-        if value is None:
-            continue
-
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped:
-                normalized[key] = stripped
-            continue
-
-        normalized[key] = value
-
-    return normalized
-
-
-def _is_repeated_tool_call(
-    state: AgentState,
-    tool_name: ToolName,
-    tool_input: dict[str, Any],
-) -> bool:
-    """Return True when the exact same tool call already ran this turn."""
-    normalized_input = _normalized_tool_input(tool_input)
-
-    for trace_item in state["tool_trace"]:
-        if trace_item["tool_name"] != tool_name:
-            continue
-
-        if _normalized_tool_input(trace_item["tool_input"]) == normalized_input:
-            return True
-
-    return False
-
-
-def _answer_from_existing_trace(state: AgentState) -> str:
-    """Return a safe answer from existing observations after repeated-call recovery fails."""
-    if not state["tool_trace"]:
-        return (
-            "I could not complete the analysis because the agent attempted to "
-            "repeat a tool call before producing an answer."
+        tool_call_id = str(getattr(message, "tool_call_id", ""))
+        tool_name, tool_input = pending_tool_calls.get(
+            tool_call_id,
+            (str(getattr(message, "name", "unknown_tool")), {}),
         )
+        observation_text = _message_content_as_text(message)
 
-    latest_trace_item = state["tool_trace"][-1]
-    return (
-        "I already have the needed tool result, but the agent attempted to "
-        "repeat the same call. Latest observation: "
-        f"{latest_trace_item['observation']}"
-    )
-
-
-def _build_repeated_call_correction_message(
-    state: AgentState,
-    repeated_decision: AgentActionDecision,
-) -> str:
-    """Build a one-time correction prompt after a repeated tool call is detected."""
-    return (
-        "You attempted to repeat a tool call that already ran during this turn.\n\n"
-        f"Repeated tool: {repeated_decision.tool_name}\n"
-        f"Repeated input: {repeated_decision.tool_input}\n\n"
-        "Review the existing tool trace carefully. Do not call the same tool with "
-        "the same input again. If the existing observation already answers the "
-        "user's question, choose final_answer now. If another step is truly needed, "
-        "choose a different tool call with different parameters.\n\n"
-        "Important: prefer final_answer when the latest observation contains the "
-        "requested count, examples, grouped counts, summary, or profile text."
-    )
-
-
-def _invoke_revised_action_after_repeated_call(
-    state: AgentState,
-    repeated_decision: AgentActionDecision,
-):
-    """Ask the action model once to revise its decision after a repeated call."""
-    structured_llm = get_structured_action_llm()
-    correction_message = _build_repeated_call_correction_message(
-        state=state,
-        repeated_decision=repeated_decision,
-    )
-    revised_decision = structured_llm.invoke(
-        _build_action_messages(
-            state=state,
-            correction_message=correction_message,
-        )
-    )
-
-    if isinstance(revised_decision, AgentActionDecision):
-        return revised_decision
-
-    return AgentActionDecision.model_validate(revised_decision)
-
-
-def _execute_tool(
-    state: AgentState,
-    tool_name: ToolName,
-    tool_input: dict[str, Any],
-) -> str:
-    """Execute one selected tool and update trace/state."""
-    if tool_name == "get_dataset_schema":
-        result = get_dataset_schema_impl(
-            include_sample_values=bool(tool_input.get("include_sample_values", True))
-        )
-        observation = (
-            f"Dataset has {result.row_count} rows and columns: "
-            f"{', '.join(result.columns)}."
-        )
-        _append_trace(state, tool_name, tool_input, observation)
-        return observation
-
-    if tool_name == "filter_rows":
-        result = filter_rows_impl(
-            category=tool_input.get("category"),
-            intent=tool_input.get("intent"),
-            text_query=tool_input.get("text_query"),
-            limit=tool_input.get("limit"),
-        )
-        observation = (
-            f"Found {result.match_count} matching rows. "
-            f"match_count={result.match_count}. "
-            f"Returned row_ids for the matching subset: {summarize_row_ids(result.row_ids)}."
-
-        )
-
-        _append_trace(state, tool_name, tool_input, observation)
-        _append_structured_result(
-            state,
-            AnalysisResult(
-                label=str(result.applied_filters),
-                value=result.match_count,
-                query_type="filter",
-                row_ids=result.row_ids,
-            ),
-        )
-        return observation
-
-    if tool_name == "count_rows":
-        row_ids = _safe_int_list(tool_input.get("row_ids"))
-        result = count_rows_impl(row_ids=row_ids)
-        observation = f"Count = {result.count}."
-        _append_trace(
-            state,
-            tool_name,
-            {"row_ids": row_ids},
-            observation,
-        )
-        _append_structured_result(
-            state,
-            AnalysisResult(
-                label="count_rows",
-                value=result.count,
-                query_type="count",
-                row_ids=row_ids,
-            ),
-        )
-        return observation
-
-    if tool_name == "sample_examples":
-        row_ids = _safe_int_list(tool_input.get("row_ids"))
-        n = int(tool_input.get("n", 3))
-        offset = int(tool_input.get("offset", 0))
-        result = sample_examples_impl(row_ids=row_ids, n=n, offset=offset)
-
-        example_lines = [
-            (
-                f"row_id={example.row_id}\n"
-                f"category={example.category or ''}\n"
-                f"intent={example.intent or ''}\n"
-                f"customer_instruction={example.instruction}\n"
-                f"support_response={example.response or ''}"
+        trace.append(
+            ToolTraceItem(
+                tool_name=tool_name,
+                tool_input=tool_input,
+                observation=observation_text,
             )
-            for example in result.examples
-        ]
-
-        observation = (
-            f"Returned {len(result.examples)} examples. "
-            f"Next offset = {result.next_offset}. "
-            + ("\n\n" + "\n\n---\n\n".join(example_lines) if example_lines else "")
         )
 
-        _append_trace(
-            state,
-            tool_name,
-            {"row_ids": row_ids, "n": n, "offset": offset},
-            observation,
-        )
-        _append_structured_result(
-            state,
-            AnalysisResult(
-                label="sample_examples",
-                value=result.next_offset,
-                query_type="sample",
-                row_ids=row_ids,
-            ),
-        )
-        return observation
+        parsed_output = _safe_parse_tool_output(getattr(message, "content", ""))
 
-    if tool_name == "group_counts":
-        row_ids = _safe_int_list(tool_input.get("row_ids"))
-        group_by = str(tool_input.get("group_by", "category"))
-        top_k = int(tool_input.get("top_k", 20))
+        if tool_name == "filter_rows" and isinstance(parsed_output, dict):
+            row_ids = parsed_output.get("row_ids")
+            match_count = parsed_output.get("match_count")
+            if isinstance(row_ids, list) and isinstance(match_count, int):
+                structured_results.append(
+                    AnalysisResult(
+                        label=str(parsed_output.get("applied_filters", {})),
+                        value=match_count,
+                        query_type="filter",
+                        row_ids=row_ids,
+                    )
+                )
 
-        if group_by not in {"category", "intent"}:
-            group_by = "category"
+        if tool_name == "count_rows" and isinstance(parsed_output, dict):
+            count = parsed_output.get("count")
+            if isinstance(count, int):
+                row_ids = tool_input.get("row_ids")
+                structured_results.append(
+                    AnalysisResult(
+                        label="count_rows",
+                        value=count,
+                        query_type="count",
+                        row_ids=row_ids if isinstance(row_ids, list) else None,
+                    )
+                )
 
-        result = group_counts_impl(
-            group_by=group_by,  # type: ignore[arg-type]
-            row_ids=row_ids,
-            top_k=top_k,
-        )
-        observation = "; ".join(
-            f"{row.label}: {row.count}" for row in result.counts
-        )
-        _append_trace(
-            state,
-            tool_name,
-            {"group_by": group_by, "row_ids": row_ids, "top_k": top_k},
-            observation,
-        )
-        return observation
+        if tool_name == "sample_examples" and isinstance(parsed_output, dict):
+            next_offset = parsed_output.get("next_offset")
+            row_ids = tool_input.get("row_ids")
+            if isinstance(next_offset, int):
+                structured_results.append(
+                    AnalysisResult(
+                        label="sample_examples",
+                        value=next_offset,
+                        query_type="sample",
+                        row_ids=row_ids if isinstance(row_ids, list) else None,
+                    )
+                )
 
-    if tool_name == "summarize_rows":
-        row_ids = _safe_int_list(tool_input.get("row_ids")) or []
-        focus = str(tool_input.get("focus", "dataset summary"))
-        max_examples = int(tool_input.get("max_examples", 100))
-        result = summarize_rows_impl(
-            row_ids=row_ids,
-            focus=focus,
-            max_examples=max_examples,
-        )
-        observation = result.summary
-        _append_trace(
-            state,
-            tool_name,
-            {
-                "row_ids": row_ids,
-                "focus": focus,
-                "max_examples": max_examples,
-            },
-            observation,
-        )
-        return observation
+    return trace, structured_results
 
-    if tool_name == "read_user_profile":
-        user_id = str(tool_input.get("user_id") or state["user_id"])
-        result = read_user_profile_impl(user_id=user_id)
-        observation = result.profile
-        _append_trace(state, tool_name, {"user_id": user_id}, observation)
-        return observation
 
-    raise ValueError(f"Unsupported tool name: {tool_name}")
+def _extract_final_answer(messages: list[BaseMessage]) -> str:
+    """Extract the final AI answer from LangChain agent messages."""
+    for message in reversed(messages):
+        if not isinstance(message, AIMessage):
+            continue
+
+        if getattr(message, "tool_calls", None):
+            continue
+
+        content = _message_content_as_text(message).strip()
+        if content:
+            return content
+
+    return "I completed the analysis, but no final answer was provided."
 
 
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
@@ -726,96 +565,58 @@ def refusal_node(state: AgentState) -> dict[str, Any]:
     }
 
 
-def react_data_agent_node(state: AgentState) -> dict[str, Any]:
-    """Run a ReAct-style tool-use loop for dataset questions."""
-    more_examples_result = _handle_more_examples_follow_up(state)
-    if more_examples_result is not None:
-        return more_examples_result
+def langchain_data_agent_node(state: AgentState) -> dict[str, Any]:
+    """Run the standard LangChain agent runtime for dataset questions."""
+    deterministic_result = _handle_deterministic_follow_up(state)
+    if deterministic_result is not None:
+        return deterministic_result
 
-    structured_llm = get_structured_action_llm()
+    data_agent = get_langchain_data_agent()
 
-    while state["iteration_count"] < state["max_iterations"]:
-        state["iteration_count"] += 1
-
-        decision = structured_llm.invoke(_build_action_messages(state))
-        if not isinstance(decision, AgentActionDecision):
-            decision = AgentActionDecision.model_validate(decision)
-
-        if decision.tool_name == "final_answer":
-            final_answer = decision.final_answer or (
-                "I completed the analysis, but no final answer was provided."
-            )
-            state["final_answer"] = final_answer
-            return {
-                "tool_trace": state["tool_trace"],
-                "last_structured_results": state["last_structured_results"],
-                "iteration_count": state["iteration_count"],
-                "final_answer": final_answer,
-                "messages": [AIMessage(content=final_answer)],
-            }
-
-        if _is_repeated_tool_call(
-            state=state,
-            tool_name=decision.tool_name,
-            tool_input=decision.tool_input,
-        ):
-            revised_decision = _invoke_revised_action_after_repeated_call(
-                state=state,
-                repeated_decision=decision,
-            )
-
-            if revised_decision.tool_name == "final_answer":
-                final_answer = revised_decision.final_answer or (
-                    "I completed the analysis, but no final answer was provided."
-                )
-                state["final_answer"] = final_answer
-                return {
-                    "tool_trace": state["tool_trace"],
-                    "last_structured_results": state["last_structured_results"],
-                    "iteration_count": state["iteration_count"],
-                    "final_answer": final_answer,
-                    "messages": [AIMessage(content=final_answer)],
-                }
-
-            if _is_repeated_tool_call(
-                state=state,
-                tool_name=revised_decision.tool_name,
-                tool_input=revised_decision.tool_input,
-            ):
-                final_answer = _answer_from_existing_trace(state)
-                state["final_answer"] = final_answer
-                return {
-                    "tool_trace": state["tool_trace"],
-                    "last_structured_results": state["last_structured_results"],
-                    "iteration_count": state["iteration_count"],
-                    "final_answer": final_answer,
-                    "messages": [AIMessage(content=final_answer)],
-                }
-
-            _execute_tool(
-                state=state,
-                tool_name=revised_decision.tool_name,
-                tool_input=revised_decision.tool_input,
-            )
-            continue
-
-        _execute_tool(
-            state=state,
-            tool_name=decision.tool_name,
-            tool_input=decision.tool_input,
+    try:
+        result = data_agent.invoke(
+            {
+                "messages": _build_langchain_agent_messages(state),
+            },
+            config={
+                "recursion_limit": state["max_iterations"] + 5,
+            },
         )
+    except Exception:
+        fallback = (
+            "I could not complete the analysis within the allowed number of "
+            "reasoning steps. Please try asking a more specific dataset question."
+        )
+        state["final_answer"] = fallback
+        return {
+            "tool_trace": state["tool_trace"],
+            "last_structured_results": state["last_structured_results"],
+            "iteration_count": state["iteration_count"],
+            "final_answer": fallback,
+            "messages": [AIMessage(content=fallback)],
+        }
 
-    fallback = (
-        "I could not complete the analysis within the allowed number of "
-        "reasoning steps. Please try asking a more specific dataset question."
+    result_messages = result.get("messages", [])
+    if not isinstance(result_messages, list):
+        result_messages = []
+
+    tool_trace, new_structured_results = _extract_langchain_tool_trace_and_results(
+        result_messages
     )
-    state["final_answer"] = fallback
+
+    state["tool_trace"] = tool_trace
+    for structured_result in new_structured_results:
+        _append_structured_result(state, structured_result)
+
+    final_answer = _extract_final_answer(result_messages)
+    state["final_answer"] = final_answer
+
     return {
         "tool_trace": state["tool_trace"],
         "last_structured_results": state["last_structured_results"],
         "iteration_count": state["iteration_count"],
-        "final_answer": fallback,
-        "messages": [AIMessage(content=fallback)],
+        "final_answer": final_answer,
+        "messages": [AIMessage(content=final_answer)],
     }
 
 
@@ -857,7 +658,7 @@ def route_after_router(state: AgentState) -> str:
     if state["route"] == "out_of_scope":
         return "refusal_node"
 
-    return "react_data_agent_node"
+    return "langchain_data_agent_node"
 
 
 @lru_cache(maxsize=1)
@@ -888,7 +689,7 @@ def build_graph():
 
     graph_builder.add_node("load_user_profile_node", load_user_profile_node)
     graph_builder.add_node("router_node", router_node)
-    graph_builder.add_node("react_data_agent_node", react_data_agent_node)
+    graph_builder.add_node("langchain_data_agent_node", langchain_data_agent_node)
     graph_builder.add_node("refusal_node", refusal_node)
     graph_builder.add_node("profile_update_node", profile_update_node)
 
@@ -898,11 +699,11 @@ def build_graph():
         "router_node",
         route_after_router,
         {
-            "react_data_agent_node": "react_data_agent_node",
+            "langchain_data_agent_node": "langchain_data_agent_node",
             "refusal_node": "refusal_node",
         },
     )
-    graph_builder.add_edge("react_data_agent_node", "profile_update_node")
+    graph_builder.add_edge("langchain_data_agent_node", "profile_update_node")
     graph_builder.add_edge("refusal_node", "profile_update_node")
     graph_builder.add_edge("profile_update_node", END)
 

@@ -1,12 +1,12 @@
 # Bitext Customer Service Data Analyst Agent
 
-A LangGraph-based educational data analyst agent for the Bitext Customer Service dataset.
+A LangGraph-based data analyst agent for the Bitext Customer Service dataset.
 
 The agent can answer structured analytical questions and qualitative dataset questions, while staying scoped to the dataset and the saved user profile.
 
 ## Features
 
-- LangGraph ReAct-style agent loop
+- LangGraph workflow with LangChain's standard agent runtime for tool orchestration
 - LLM-based query router
 - SQLite-backed LangGraph checkpoint persistence for conversation state
 - Structured dataset tools
@@ -351,10 +351,10 @@ load_user_profile_node
   ↓
 router_node
   ↓
- ┌───────────────────────┬────────────────────────┐
- │ structured/unstructured│ out_of_scope            │
- ↓                       ↓
-react_data_agent_node     refusal_node
+ ┌────────────────────────────┬────────────────────────┐
+ │ structured/unstructured     │ out_of_scope            │
+ ↓                            ↓
+langchain_data_agent_node      refusal_node
   ↓                       ↓
 profile_update_node       profile_update_node
   ↓                       ↓
@@ -369,28 +369,40 @@ unstructured
 out_of_scope
 ```
 
-Both `structured` and `unstructured` dataset queries go to the same route-aware ReAct agent node.
+Both `structured` and `unstructured` dataset queries go to the same standard LangChain data-agent node.
 
-The ReAct agent receives route-specific instructions:
+The data-agent node receives compact graph context:
 
-- Structured route: prefer exact tools such as `filter_rows`, `count_rows`, `sample_examples`, and `group_counts`.
-- Unstructured route: identify relevant rows and then use `summarize_rows`.
-- Out-of-scope route: skip data tools and return a scoped refusal.
+- route
+- route reason
+- saved user profile
+- recent structured results used for follow-up questions
 
-### ReAct Implementation Note
+The standard LangChain agent is responsible for ordinary dataset tool orchestration:
 
-This project uses a custom educational ReAct-style loop inside the LangGraph
-`react_data_agent_node`.
+- `filter_rows`
+- `count_rows`
+- `sample_examples`
+- `group_counts`
+- `summarize_rows`
+- `get_dataset_schema`
+- `read_user_profile`
 
-It does not use LangGraph's prebuilt `create_react_agent` helper. This is an
-intentional design choice for assignment clarity: the code explicitly shows how
-the agent selects actions, calls tools, records observations, tracks recent
-structured results for follow-up questions, enforces the max-iteration limit,
-and returns a final answer.
+### Standard Agent Runtime Note
 
-The graph is still a LangGraph ReAct-style graph: routing happens before tool
-selection, dataset questions enter a tool-use loop, tool observations are fed
-back into the next action decision, and out-of-scope questions bypass tools.
+The project uses LangChain's standard `create_agent` runtime inside a LangGraph workflow.
+
+This avoids maintaining a custom manual ReAct loop in `graph.py`. LangChain handles normal tool-use orchestration, while custom LangGraph nodes keep the deterministic behavior that is valuable for this project:
+
+- query routing before the agent runs
+- scoped refusal for out-of-scope questions
+- user profile loading and update
+- checkpointed follow-up state
+- deterministic handling for high-risk follow-ups such as `Show me 3 more.`
+- deterministic handling for `What is the total count of the last two?`
+- visible reasoning trace extraction from LangChain tool calls and tool messages
+
+This hybrid design keeps the project smaller while preserving reliability for stateful follow-up cases.
 
 ## Tool Reference
 
@@ -468,7 +480,7 @@ LangGraph Studio can be used to inspect:
 - tool traces
 - final answers
 - checkpoint behavior
-- max-iteration fallback behavior
+- agent fallback behavior
 
 The current graph is built by:
 
@@ -494,7 +506,7 @@ The test suite covers:
 - tool filtering/counting/sampling/grouping/summarization
 - LLM router behavior with mocked model calls
 - persistent profile file behavior
-- graph routing, tool traces, refusal, profile updates, checkpoint config, and max-iteration fallback
+- graph routing, LangChain tool trace extraction, deterministic follow-ups, refusal, profile updates, checkpoint config, and fallback behavior
 
 ## Validation Checklist
 
@@ -512,8 +524,7 @@ Expected:
 
 - Route: `structured`
 - Uses `filter_rows`
-- Uses `count_rows`
-- Returns exact count
+- Returns exact count from `filter_rows.match_count`
 
 ### Structured Examples
 
@@ -543,6 +554,7 @@ Expected:
 - Uses previous row IDs
 - Uses previous offset
 - Shows the next examples
+- Does not pass thousands of row IDs through the LLM
 
 ### Follow-Up After Restart
 
@@ -602,7 +614,7 @@ Expected:
 
 ## Known Limitations
 
-- Follow-up behavior depends on the agent correctly using recent structured results from checkpointed graph state. The graph stores the relevant context, but the LLM still chooses how to apply it.
+- Some follow-up behavior still depends on the standard agent correctly using recent structured results. Known high-risk follow-ups such as "show me more examples" and "total count of the last two" are handled deterministically before the LLM agent runs.
 - SQLite checkpoint persistence requires `langgraph-checkpoint-sqlite` to be installed.
 - The router and agent rely on Nebius model support for structured output through LangChain.
 - The exact FastMCP transport URL should be verified from server startup logs.
