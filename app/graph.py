@@ -16,7 +16,7 @@ from app.langchain_tools import LANGCHAIN_TOOLS
 from app.logging_utils import summarize_row_ids
 from app.memory import read_user_profile_impl, update_user_profile_impl
 from app.prompts import (
-    LANGCHAIN_DATA_AGENT_SYSTEM_PROMPT,
+    DATA_AGENT_SYSTEM_PROMPT,
     OUT_OF_SCOPE_REFUSAL,
     PROFILE_UPDATE_SYSTEM_PROMPT,
 )
@@ -78,7 +78,7 @@ def get_langchain_data_agent():
     return create_agent(
         model=get_agent_llm(),
         tools=LANGCHAIN_TOOLS,
-        system_prompt="/no_think\n" + LANGCHAIN_DATA_AGENT_SYSTEM_PROMPT,
+        system_prompt="/no_think\n" + DATA_AGENT_SYSTEM_PROMPT,
     )
 
 
@@ -104,7 +104,6 @@ def create_initial_state(
         tool_trace=[],
         last_structured_results=[],
         user_profile="",
-        iteration_count=0,
         max_iterations=settings.normalize_max_iterations(max_iterations),
         final_answer=None,
     )
@@ -236,36 +235,6 @@ def _latest_sample_context(
     return None
 
 
-def _is_total_of_last_two_query(query: str) -> bool:
-    """Return True when the user asks to total the two latest count results."""
-    normalized = query.strip().lower()
-    return (
-        "total" in normalized
-        and "last two" in normalized
-        and ("count" in normalized or "counts" in normalized)
-    )
-
-
-def _latest_two_count_results(
-    results: list[AnalysisResult],
-) -> list[AnalysisResult]:
-    """Return the latest two stored count-like results."""
-    count_results: list[AnalysisResult] = []
-
-    for result in reversed(results):
-        if result.get("query_type") not in {"count", "filter"}:
-            continue
-
-        value = result.get("value")
-        if isinstance(value, int | float):
-            count_results.append(result)
-
-        if len(count_results) == 2:
-            break
-
-    return list(reversed(count_results))
-
-
 def _format_sample_examples_observation(
     row_ids: list[int] | None,
     n: int,
@@ -335,52 +304,9 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     return {
         "tool_trace": state["tool_trace"],
         "last_structured_results": state["last_structured_results"],
-        "iteration_count": state["iteration_count"],
         "final_answer": observation,
         "messages": [AIMessage(content=observation)],
     }
-
-
-def _handle_total_of_last_two_follow_up(state: AgentState) -> dict[str, Any] | None:
-    """Deterministically answer total-of-last-two count follow-ups."""
-    user_query = _latest_user_message(state["messages"])
-
-    if not _is_total_of_last_two_query(user_query):
-        return None
-
-    count_results = _latest_two_count_results(state["last_structured_results"])
-    if len(count_results) < 2:
-        return None
-
-    first, second = count_results
-    total = first["value"] + second["value"]
-    final_answer = (
-        "The total count of the last two results is "
-        f"{int(total):,}."
-    )
-
-    state["final_answer"] = final_answer
-
-    return {
-        "tool_trace": state["tool_trace"],
-        "last_structured_results": state["last_structured_results"],
-        "iteration_count": state["iteration_count"],
-        "final_answer": final_answer,
-        "messages": [AIMessage(content=final_answer)],
-    }
-
-
-def _handle_deterministic_follow_up(state: AgentState) -> dict[str, Any] | None:
-    """Handle known high-risk follow-ups before invoking the LLM agent."""
-    more_examples_result = _handle_more_examples_follow_up(state)
-    if more_examples_result is not None:
-        return more_examples_result
-
-    total_result = _handle_total_of_last_two_follow_up(state)
-    if total_result is not None:
-        return total_result
-
-    return None
 
 
 def _message_content_as_text(message: BaseMessage) -> str:
@@ -431,7 +357,7 @@ Recent structured results:
 
 Follow-up guidance:
 - If the user asks for a total of recent counts, use recent structured results when available.
-- If the user asks for more examples and the graph did not already handle it, use sample_examples with the previous row_ids and offset when available.
+- Example-pagination follow-ups are handled deterministically by the graph when previous sample context is available.
 - Do not reconstruct row IDs from compact previews.
 - Do not answer from general knowledge.
 """
@@ -567,7 +493,7 @@ def refusal_node(state: AgentState) -> dict[str, Any]:
 
 def langchain_data_agent_node(state: AgentState) -> dict[str, Any]:
     """Run the standard LangChain agent runtime for dataset questions."""
-    deterministic_result = _handle_deterministic_follow_up(state)
+    deterministic_result = _handle_more_examples_follow_up(state)
     if deterministic_result is not None:
         return deterministic_result
 
@@ -591,7 +517,6 @@ def langchain_data_agent_node(state: AgentState) -> dict[str, Any]:
         return {
             "tool_trace": state["tool_trace"],
             "last_structured_results": state["last_structured_results"],
-            "iteration_count": state["iteration_count"],
             "final_answer": fallback,
             "messages": [AIMessage(content=fallback)],
         }
@@ -614,7 +539,6 @@ def langchain_data_agent_node(state: AgentState) -> dict[str, Any]:
     return {
         "tool_trace": state["tool_trace"],
         "last_structured_results": state["last_structured_results"],
-        "iteration_count": state["iteration_count"],
         "final_answer": final_answer,
         "messages": [AIMessage(content=final_answer)],
     }
@@ -715,7 +639,7 @@ def _build_graph_config(
     user_id: str,
     max_iterations: int,
 ) -> dict[str, Any]:
-    """Build LangGraph invocation config for checkpointed sessions."""
+    """Build LangGraph config, mapping max_iterations to recursion_limit."""
     return {
         "configurable": {
             "thread_id": session_id,
@@ -766,7 +690,6 @@ def _create_invocation_state(
         "route": None,
         "route_reason": None,
         "tool_trace": [],
-        "iteration_count": 0,
         "max_iterations": max_iterations,
         "final_answer": None,
     }

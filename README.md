@@ -60,6 +60,7 @@ bitext_agent/
 │   ├── state.py
 │   ├── router.py
 │   ├── tools.py
+│   ├── langchain_tools.py
 │   ├── data_loader.py
 │   ├── memory.py
 │   ├── prompts.py
@@ -71,6 +72,7 @@ bitext_agent/
 │   ├── test_tools.py
 │   ├── test_router.py
 │   ├── test_memory.py
+│   ├── test_langchain_tools.py
 │   └── test_graph.py
 ├── .checkpoints/
 │   └── checkpoint.sqlite
@@ -146,17 +148,6 @@ You: How many refund requests did we get?
   "category": "REFUND"
 }
 [observation] Found 842 matching rows. Returned 842 row IDs [1, 4, 9, 12, 20...]
-
-[tool] count_rows
-[input]
-{
-  "row_ids": {
-    "type": "list",
-    "count": 842,
-    "preview": [1, 4, 9, 12, 20]
-  }
-}
-[observation] Count = 842.
 
 Agent: There are 842 refund-request rows in the dataset.
 ```
@@ -315,7 +306,6 @@ The graph state stores:
 - route reason
 - tool trace
 - recent structured results
-- iteration count
 - final answer
 
 LangGraph checkpoints are stored under:
@@ -399,7 +389,6 @@ This avoids maintaining a custom manual ReAct loop in `graph.py`. LangChain hand
 - user profile loading and update
 - checkpointed follow-up state
 - deterministic handling for high-risk follow-ups such as `Show me 3 more.`
-- deterministic handling for `What is the total count of the last two?`
 - visible reasoning trace extraction from LangChain tool calls and tool messages
 
 This hybrid design keeps the project smaller while preserving reliability for stateful follow-up cases.
@@ -505,6 +494,7 @@ The test suite covers:
 - stable row IDs
 - tool filtering/counting/sampling/grouping/summarization
 - LLM router behavior with mocked model calls
+- LangChain tool adapters
 - persistent profile file behavior
 - graph routing, LangChain tool trace extraction, deterministic follow-ups, refusal, profile updates, checkpoint config, and fallback behavior
 
@@ -614,7 +604,7 @@ Expected:
 
 ## Known Limitations
 
-- Some follow-up behavior still depends on the standard agent correctly using recent structured results. Known high-risk follow-ups such as "show me more examples" and "total count of the last two" are handled deterministically before the LLM agent runs.
+- Some follow-up behavior still depends on the standard agent correctly using recent structured results. Known high-risk example-pagination follow-ups such as "show me more examples" are handled deterministically before the LLM agent runs.
 - SQLite checkpoint persistence requires `langgraph-checkpoint-sqlite` to be installed.
 - The router and agent rely on Nebius model support for structured output through LangChain.
 - The exact FastMCP transport URL should be verified from server startup logs.

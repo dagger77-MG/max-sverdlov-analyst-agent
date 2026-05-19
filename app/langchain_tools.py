@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.tools import BaseTool, StructuredTool
 
@@ -70,16 +70,14 @@ def _sample_examples_tool_func(
 
 
 def _group_counts_tool_func(
-    group_by: str,
+    group_by: Literal["category", "intent"],
     row_ids: list[int] | None = None,
     top_k: int = 20,
 ) -> dict[str, Any]:
     """Group rows by category or intent and return counts."""
-    if group_by not in {"category", "intent"}:
-        raise ValueError("group_by must be either 'category' or 'intent'.")
 
     result = group_counts_impl(
-        group_by=group_by,  # type: ignore[arg-type]
+        group_by=group_by,
         row_ids=row_ids,
         top_k=top_k,
     )

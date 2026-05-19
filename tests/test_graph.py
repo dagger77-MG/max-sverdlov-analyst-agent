@@ -435,7 +435,6 @@ def test_create_invocation_state_returns_partial_update_for_existing_thread() ->
     assert result["session_id"] == "existing_session"
     assert result["user_id"] == "max"
     assert result["tool_trace"] == []
-    assert result["iteration_count"] == 0
     assert result["final_answer"] is None
     assert "last_structured_results" not in result
     assert isinstance(result["messages"][0], HumanMessage)
@@ -619,7 +618,9 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
     }
 
 
-def test_follow_up_total_count_of_last_two_uses_stored_structured_results() -> None:
+def test_total_of_last_two_follow_up_goes_to_standard_agent_with_context(
+    monkeypatch,
+) -> None:
     state = graph.create_initial_state(
         query="What is the total count of the last two?",
         session_id="test_session",
@@ -643,10 +644,22 @@ def test_follow_up_total_count_of_last_two_uses_stored_structured_results() -> N
         },
     ]
 
+    fake_agent = FakeLangChainAgent(
+        [
+            AIMessage(content="The total count of the last two results is 1,356."),
+        ]
+    )
+
+    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
     result = graph.langchain_data_agent_node(state)
 
+    context_message = fake_agent.received_input["messages"][0].content
+
+    assert "complaints" in context_message
+    assert "514" in context_message
+    assert "refunds" in context_message
+    assert "842" in context_message
     assert result["final_answer"] == "The total count of the last two results is 1,356."
-    assert result["tool_trace"] == []
 
 
 def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> None:
