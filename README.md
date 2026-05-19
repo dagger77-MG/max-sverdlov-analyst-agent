@@ -119,6 +119,19 @@ agent_model = Qwen/Qwen3-235B-A22B-Instruct-2507
 nebius_base_url = https://api.tokenfactory.nebius.com/v1/
 ```
 
+### Nebius Model Role Split
+
+All LLM calls use Nebius Token Factory through the OpenAI-compatible API. No non-Nebius model provider is used for routing, agent reasoning, profile-update decisions, or row summarization.
+
+- Router model: `Qwen/Qwen3-30B-A3B-Instruct-2507`
+  - Used for structured route classification into `structured`, `unstructured`, or `out_of_scope`.
+  - Chosen because routing is a short, low-temperature classification task that benefits from a smaller/faster model.
+- Main data-analysis agent model: `Qwen/Qwen3-235B-A22B-Instruct-2507`
+  - Used by the LangChain standard agent runtime for ReAct-style tool selection, multi-step dataset analysis, and final answer generation.
+  - Chosen because the main agent needs stronger instruction following and more reliable tool-use reasoning.
+- Summarizer model: `Qwen/Qwen3-235B-A22B-Instruct-2507`
+  - Used by `summarize_rows` when LLM summarization is available. The same larger model is used because qualitative summaries must stay grounded in selected dataset rows and follow the dataset-only scope rule.
+
 Configuration is centralized in `app/config.py`. The app loads `.env` before creating the global `settings` object, so `NEBIUS_API_KEY` is available consistently to the CLI, Streamlit app, router, graph agent, and summarizer.
 
 ## Running the CLI Agent
@@ -501,6 +514,135 @@ The test suite covers:
 ## Validation Checklist
 
 Before submission, manually validate these cases.
+
+### Test Questions
+
+#### Structured dataset questions
+
+Question:
+
+```text
+What categories exist in the dataset?
+```
+
+Expected:
+
+- Route: `structured`
+- Uses dataset tools, typically `group_counts` or `get_dataset_schema`
+- Returns dataset-grounded category values only
+
+Question:
+
+```text
+How many refund requests did we get?
+```
+
+Expected:
+
+- Route: `structured`
+- Uses `filter_rows`
+- Returns exact count from `filter_rows.match_count`
+
+Question:
+
+```text
+Show me 5 examples of the SHIPPING category.
+```
+
+Expected:
+
+- Route: `structured`
+- Uses `filter_rows`
+- Uses `sample_examples` with `n=5`
+- Shows actual dataset rows from the `SHIPPING` category
+
+Question:
+
+```text
+What is the distribution of intents in the ACCOUNT category?
+```
+
+Expected:
+
+- Route: `structured`
+- Uses `filter_rows` for the `ACCOUNT` category
+- Uses `group_counts` with `group_by="intent"` on the filtered row IDs
+- Returns intent counts grounded in the filtered dataset subset
+
+#### Unstructured dataset questions
+
+Question:
+
+```text
+Summarize the FEEDBACK category.
+```
+
+Expected:
+
+- Route: `unstructured`
+- Uses `filter_rows`
+- Uses `summarize_rows`
+- Produces a dataset-grounded summary only from selected rows
+
+Question:
+
+```text
+Summarize how agents respond to complaint intents.
+```
+
+Expected:
+
+- Route: `unstructured`
+- Selects complaint-related rows with tools
+- Uses `summarize_rows`
+- Summarizes support response patterns only from selected dataset rows
+
+Question:
+
+```text
+How do customer service representatives typically respond to cancellation requests?
+```
+
+Expected:
+
+- Route: `unstructured`
+- Selects cancellation-related rows with tools, using category, intent, or text search as appropriate
+- Uses `summarize_rows`
+- Does not add generic customer-service advice beyond the selected rows
+
+#### Natural-language alias / semantic matching question
+
+Question:
+
+```text
+Show me examples of people wanting their money back.
+```
+
+Expected:
+
+- Route: `structured`
+- Treats “money back” as a refund-related alias
+- Uses `filter_rows`
+- Uses `sample_examples`
+- Shows actual refund-related examples from the dataset
+
+#### Out-of-scope questions
+
+Questions:
+
+```text
+What's the best CRM software for handling complaints?
+Who is the president of France?
+Who won the 2024 Champions League?
+Write me a poem about customer service.
+```
+
+Expected:
+
+- Route: `out_of_scope`
+- Returns the scoped refusal message
+- Does not answer from general knowledge
+- Does not recommend software, answer political/sports facts, or generate creative writing
 
 ### Structured Count
 

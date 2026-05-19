@@ -1,28 +1,34 @@
 from __future__ import annotations
 
-import ast
 import json
 import re
 import sqlite3
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.langchain_tools import LANGCHAIN_TOOLS
 from app.logging_utils import summarize_row_ids
 from app.memory import read_user_profile_impl, update_user_profile_impl
 from app.prompts import (
-    DATA_AGENT_SYSTEM_PROMPT,
     OUT_OF_SCOPE_REFUSAL,
     PROFILE_UPDATE_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+    REVIEWER_SYSTEM_PROMPT,
 )
 from app.router import RouteDecision, route_query_with_reason
 from app.state import AgentState, AnalysisResult, ToolTraceItem
-from app.tools import sample_examples_impl
+from app.tools import (
+    count_rows_impl,
+    filter_rows_impl,
+    get_dataset_schema_impl,
+    group_counts_impl,
+    sample_examples_impl,
+    summarize_rows_impl,
+)
 
 
 class ProfileObservationDecision(BaseModel):
@@ -31,6 +37,55 @@ class ProfileObservationDecision(BaseModel):
     observation: str = Field(
         default="",
         description="Concise durable observation to save, or empty string.",
+    )
+
+
+class ToolPlanDecision(BaseModel):
+    """Planner decision for the next data-agent action."""
+
+    action: Literal["call_tool", "final_answer"] = Field(
+        description="Whether to call one tool or produce a final answer."
+    )
+    tool_name: str = Field(
+        default="",
+        description="Tool to call when action is 'call_tool'.",
+    )
+    tool_input: dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON-serializable input for the selected tool.",
+    )
+    final_answer: str = Field(
+        default="",
+        description="Final answer when no more tools are needed.",
+    )
+    reason: str = Field(
+        description="Brief explanation of the planning decision."
+    )
+
+
+class ObservationReviewDecision(BaseModel):
+    """Reviewer decision about whether observations answer the user."""
+
+    status: Literal["answered", "needs_more", "cannot_answer"] = Field(
+        description=(
+            "answered if the trace is sufficient, needs_more if another tool call "
+            "is required, or cannot_answer if the tools cannot answer the request."
+        )
+    )
+    reason: str = Field(
+        description="Brief explanation of what the observations prove or miss."
+    )
+    final_answer: str = Field(
+        default="",
+        description="Grounded final answer when status is answered or cannot_answer.",
+    )
+    suggested_tool_name: str = Field(
+        default="",
+        description="Recommended next tool when status is needs_more.",
+    )
+    suggested_tool_input: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Recommended next tool input when status is needs_more.",
     )
 
 
@@ -65,21 +120,15 @@ def get_agent_llm():
 
 
 @lru_cache(maxsize=1)
-def get_langchain_data_agent():
-    """Return the standard LangChain data agent runtime."""
-    try:
-        from langchain.agents import create_agent
-    except ImportError as exc:
-        raise RuntimeError(
-            "The standard LangChain agent requires 'langchain'. "
-            "Install project dependencies before running the agent."
-        ) from exc
+def get_structured_tool_planner_llm():
+    """Return a cached model configured for next-tool planning decisions."""
+    return get_agent_llm().with_structured_output(ToolPlanDecision)
 
-    return create_agent(
-        model=get_agent_llm(),
-        tools=LANGCHAIN_TOOLS,
-        system_prompt="/no_think\n" + DATA_AGENT_SYSTEM_PROMPT,
-    )
+
+@lru_cache(maxsize=1)
+def get_structured_observation_reviewer_llm():
+    """Return a cached model configured for observation-readiness decisions."""
+    return get_agent_llm().with_structured_output(ObservationReviewDecision)
 
 
 @lru_cache(maxsize=1)
@@ -309,41 +358,27 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     }
 
 
-def _message_content_as_text(message: BaseMessage) -> str:
-    """Return message content as display-safe text."""
-    content = getattr(message, "content", "")
+def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
+    """Format the current turn trace for planner/reviewer prompts."""
+    if not tool_trace:
+        return "No tool calls yet in this turn."
 
-    if isinstance(content, str):
-        return content
+    lines: list[str] = []
+    for index, item in enumerate(tool_trace, start=1):
+        lines.append(
+            f"{index}. tool={item['tool_name']}\n"
+            f"input={json.dumps(item['tool_input'], ensure_ascii=False, default=str)}\n"
+            f"observation={item['observation']}"
+        )
 
-    return str(content)
-
-
-def _safe_parse_tool_output(content: Any) -> Any:
-    """Best-effort parse of a LangChain tool message content."""
-    if isinstance(content, dict | list):
-        return content
-
-    if not isinstance(content, str):
-        return content
-
-    stripped = content.strip()
-    if not stripped:
-        return stripped
-
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        return ast.literal_eval(stripped)
-    except (SyntaxError, ValueError):
-        return stripped
+    return "\n\n".join(lines)
 
 
-def _build_langchain_agent_messages(state: AgentState) -> list[BaseMessage]:
-    """Build compact input messages for the standard LangChain agent."""
+def _build_planner_messages(
+        state: AgentState,
+        reviewer_feedback: str | None,
+) -> list[BaseMessage]:
+    """Build input messages for next-tool planning."""
     user_query = _latest_user_message(state["messages"])
 
     context = f"""Current route: {state["route"]}
@@ -355,113 +390,224 @@ User profile:
 Recent structured results:
 {_structured_results_for_prompt(state["last_structured_results"])}
 
-Follow-up guidance:
-- If the user asks for a total of recent counts, use recent structured results when available.
-- Example-pagination follow-ups are handled deterministically by the graph when previous sample context is available.
-- Do not reconstruct row IDs from compact previews.
-- Do not answer from general knowledge.
+Current turn tool trace:
+{_compact_tool_trace_for_prompt(state["tool_trace"])}
+
+Reviewer feedback:
+{reviewer_feedback or "No reviewer feedback yet."}
 """
 
     return [
+        SystemMessage(content=PLANNER_SYSTEM_PROMPT),
         SystemMessage(content=context),
         HumanMessage(content=user_query),
     ]
 
 
-def _extract_langchain_tool_trace_and_results(
-    messages: list[BaseMessage],
-) -> tuple[list[ToolTraceItem], list[AnalysisResult]]:
-    """Extract visible tool steps and compact follow-up results from agent messages."""
-    trace: list[ToolTraceItem] = []
-    structured_results: list[AnalysisResult] = []
-    pending_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+def _build_reviewer_messages(state: AgentState) -> list[BaseMessage]:
+    """Build input messages for observation review."""
+    user_query = _latest_user_message(state["messages"])
+    context = f"""Current route: {state["route"]}
+Route reason: {state["route_reason"]}
 
-    for message in messages:
-        tool_calls = getattr(message, "tool_calls", None) or []
-        for tool_call in tool_calls:
-            call_id = str(tool_call.get("id", ""))
-            tool_name = str(tool_call.get("name", "unknown_tool"))
-            tool_args = tool_call.get("args") or {}
-            if not isinstance(tool_args, dict):
-                tool_args = {"input": tool_args}
-            pending_tool_calls[call_id] = (tool_name, tool_args)
+Recent structured results:
+{_structured_results_for_prompt(state["last_structured_results"])}
 
-        if getattr(message, "type", None) != "tool":
-            continue
+Current turn tool trace:
+{_compact_tool_trace_for_prompt(state["tool_trace"])}
+"""
 
-        tool_call_id = str(getattr(message, "tool_call_id", ""))
-        tool_name, tool_input = pending_tool_calls.get(
-            tool_call_id,
-            (str(getattr(message, "name", "unknown_tool")), {}),
+    return [
+        SystemMessage(content=REVIEWER_SYSTEM_PROMPT),
+        SystemMessage(content=context),
+        HumanMessage(content=user_query),
+    ]
+
+
+def _normalize_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow JSON-like copy of planner-supplied tool input."""
+    return dict(tool_input or {})
+
+
+def _format_model_dict(data: dict[str, Any]) -> str:
+    """Format tool output as stable JSON for trace observations."""
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def _coerce_row_ids(value: Any) -> list[int] | None:
+    """Coerce planner-supplied row IDs into integers when possible."""
+    if value is None:
+        return None
+
+    if not isinstance(value, list):
+        return None
+
+    row_ids: list[int] = []
+    for item in value:
+        try:
+            row_ids.append(int(item))
+        except (TypeError, ValueError):
+            return None
+
+    return row_ids
+
+
+def _execute_selected_tool(
+    state: AgentState,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> None:
+    """Execute one selected tool and append trace/structured follow-up state."""
+    normalized_input = _normalize_tool_input(tool_input)
+
+    if tool_name == "get_dataset_schema":
+        result = get_dataset_schema_impl(
+            include_sample_values=bool(
+                normalized_input.get("include_sample_values", True)
+            ),
         )
-        observation_text = _message_content_as_text(message)
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        return
 
-        trace.append(
-            ToolTraceItem(
-                tool_name=tool_name,
-                tool_input=tool_input,
-                observation=observation_text,
+    if tool_name == "filter_rows":
+        result = filter_rows_impl(
+            category=normalized_input.get("category"),
+            intent=normalized_input.get("intent"),
+            text_query=normalized_input.get("text_query"),
+            limit=normalized_input.get("limit"),
+        )
+        result_dict = result.model_dump()
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result_dict),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label=str(result.applied_filters),
+                value=result.match_count,
+                query_type="filter",
+                row_ids=result.row_ids,
+            ),
+        )
+        return
+
+    if tool_name == "count_rows":
+        row_ids = _coerce_row_ids(normalized_input.get("row_ids"))
+        result = count_rows_impl(row_ids=row_ids)
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label="count_rows",
+                value=result.count,
+                query_type="count",
+                row_ids=row_ids,
+            ),
+        )
+        return
+
+    if tool_name == "sample_examples":
+        row_ids = _coerce_row_ids(normalized_input.get("row_ids"))
+        n = int(normalized_input.get("n", 3))
+        offset = int(normalized_input.get("offset", 0))
+        observation, next_offset = _format_sample_examples_observation(
+            row_ids=row_ids,
+            n=n,
+            offset=offset,
+        )
+        _append_trace(state, tool_name, normalized_input, observation)
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label="sample_examples",
+                value=next_offset,
+                query_type="sample",
+                row_ids=row_ids,
+            ),
+        )
+        return
+
+    if tool_name == "group_counts":
+        group_by = normalized_input.get("group_by")
+        if group_by not in {"category", "intent"}:
+            raise ValueError(
+                "group_counts requires group_by='category' or group_by='intent'."
             )
+        row_ids = _coerce_row_ids(normalized_input.get("row_ids"))
+        top_k = int(normalized_input.get("top_k", 20))
+        result = group_counts_impl(
+            group_by=group_by,
+            row_ids=row_ids,
+            top_k=top_k,
         )
+        result_dict = result.model_dump()
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result_dict),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label=f"group_counts:{group_by}",
+                value=len(result.counts),
+                query_type="group_counts",
+                row_ids=row_ids,
+            ),
+        )
+        return
 
-        parsed_output = _safe_parse_tool_output(getattr(message, "content", ""))
+    if tool_name == "summarize_rows":
+        row_ids = _coerce_row_ids(normalized_input.get("row_ids")) or []
+        result = summarize_rows_impl(
+            row_ids=row_ids,
+            focus=str(
+                normalized_input.get("focus", _latest_user_message(state["messages"]))
+            ),
+            max_examples=int(normalized_input.get("max_examples", 100)),
+        )
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        return
 
-        if tool_name == "filter_rows" and isinstance(parsed_output, dict):
-            row_ids = parsed_output.get("row_ids")
-            match_count = parsed_output.get("match_count")
-            if isinstance(row_ids, list) and isinstance(match_count, int):
-                structured_results.append(
-                    AnalysisResult(
-                        label=str(parsed_output.get("applied_filters", {})),
-                        value=match_count,
-                        query_type="filter",
-                        row_ids=row_ids,
-                    )
-                )
+    if tool_name == "read_user_profile":
+        profile_user_id = str(normalized_input.get("user_id") or state["user_id"])
+        result = read_user_profile_impl(user_id=profile_user_id)
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        return
 
-        if tool_name == "count_rows" and isinstance(parsed_output, dict):
-            count = parsed_output.get("count")
-            if isinstance(count, int):
-                row_ids = tool_input.get("row_ids")
-                structured_results.append(
-                    AnalysisResult(
-                        label="count_rows",
-                        value=count,
-                        query_type="count",
-                        row_ids=row_ids if isinstance(row_ids, list) else None,
-                    )
-                )
-
-        if tool_name == "sample_examples" and isinstance(parsed_output, dict):
-            next_offset = parsed_output.get("next_offset")
-            row_ids = tool_input.get("row_ids")
-            if isinstance(next_offset, int):
-                structured_results.append(
-                    AnalysisResult(
-                        label="sample_examples",
-                        value=next_offset,
-                        query_type="sample",
-                        row_ids=row_ids if isinstance(row_ids, list) else None,
-                    )
-                )
-
-    return trace, structured_results
+    raise ValueError(f"Unknown tool selected by planner: {tool_name}")
 
 
-def _extract_final_answer(messages: list[BaseMessage]) -> str:
-    """Extract the final AI answer from LangChain agent messages."""
-    for message in reversed(messages):
-        if not isinstance(message, AIMessage):
-            continue
-
-        if getattr(message, "tool_calls", None):
-            continue
-
-        content = _message_content_as_text(message).strip()
-        if content:
-            return content
-
-    return "I completed the analysis, but no final answer was provided."
+def _fallback_answer() -> str:
+    """Return a safe graph fallback for planner/reviewer/tool errors."""
+    return (
+        "I could not complete the analysis within the allowed number of "
+        "reasoning steps. Please try asking a more specific dataset question."
+    )
 
 
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
@@ -491,56 +637,87 @@ def refusal_node(state: AgentState) -> dict[str, Any]:
     }
 
 
-def langchain_data_agent_node(state: AgentState) -> dict[str, Any]:
-    """Run the standard LangChain agent runtime for dataset questions."""
+def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
+    """Run a graph-owned plan -> execute -> review loop for dataset questions."""
     deterministic_result = _handle_more_examples_follow_up(state)
     if deterministic_result is not None:
         return deterministic_result
 
-    data_agent = get_langchain_data_agent()
+    reviewer_feedback: str | None = None
 
-    try:
-        result = data_agent.invoke(
-            {
-                "messages": _build_langchain_agent_messages(state),
-            },
-            config={
-                "recursion_limit": state["max_iterations"] + 5,
-            },
-        )
-    except Exception:
-        fallback = (
-            "I could not complete the analysis within the allowed number of "
-            "reasoning steps. Please try asking a more specific dataset question."
-        )
-        state["final_answer"] = fallback
-        return {
-            "tool_trace": state["tool_trace"],
-            "last_structured_results": state["last_structured_results"],
-            "final_answer": fallback,
-            "messages": [AIMessage(content=fallback)],
-        }
+    for _ in range(state["max_iterations"]):
+        try:
+            planner_llm = get_structured_tool_planner_llm()
+            plan = planner_llm.invoke(
+                _build_planner_messages(state, reviewer_feedback)
+            )
+            if not isinstance(plan, ToolPlanDecision):
+                plan = ToolPlanDecision.model_validate(plan)
 
-    result_messages = result.get("messages", [])
-    if not isinstance(result_messages, list):
-        result_messages = []
+            if plan.action == "final_answer":
+                final_answer = plan.final_answer.strip()
+                if not final_answer:
+                    reviewer_feedback = (
+                        "Planner chose final_answer but returned empty text."
+                    )
+                    continue
+                state["final_answer"] = final_answer
+                return {
+                    "tool_trace": state["tool_trace"],
+                    "last_structured_results": state["last_structured_results"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
 
-    tool_trace, new_structured_results = _extract_langchain_tool_trace_and_results(
-        result_messages
-    )
+            _execute_selected_tool(
+                state=state,
+                tool_name=plan.tool_name,
+                tool_input=plan.tool_input,
+            )
 
-    state["tool_trace"] = tool_trace
-    for structured_result in new_structured_results:
-        _append_structured_result(state, structured_result)
+            reviewer_llm = get_structured_observation_reviewer_llm()
+            review = reviewer_llm.invoke(_build_reviewer_messages(state))
+            if not isinstance(review, ObservationReviewDecision):
+                review = ObservationReviewDecision.model_validate(review)
 
-    final_answer = _extract_final_answer(result_messages)
-    state["final_answer"] = final_answer
+            reviewer_feedback = review.reason
+
+            if review.status in {"answered", "cannot_answer"}:
+                final_answer = review.final_answer.strip() or review.reason.strip()
+                state["final_answer"] = final_answer
+                return {
+                    "tool_trace": state["tool_trace"],
+                    "last_structured_results": state["last_structured_results"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
+
+            if review.status == "needs_more" and review.suggested_tool_name:
+                reviewer_feedback = (
+                    f"{review.reason}\n"
+                    f"Suggested next tool: {review.suggested_tool_name}\n"
+                    f"Suggested next input: "
+                    f"{json.dumps(review.suggested_tool_input, ensure_ascii=False, default=str)}"
+                )
+
+        except Exception:
+            fallback = _fallback_answer()
+            state["final_answer"] = fallback
+            return {
+                "tool_trace": state["tool_trace"],
+                "last_structured_results": state["last_structured_results"],
+                "final_answer": fallback,
+                "messages": [AIMessage(content=fallback)],
+            }
+
+    fallback = _fallback_answer()
+    state["final_answer"] = fallback
 
     return {
         "tool_trace": state["tool_trace"],
         "last_structured_results": state["last_structured_results"],
-        "final_answer": final_answer,
-        "messages": [AIMessage(content=final_answer)],
+        "final_answer": fallback,
+        "messages": [AIMessage(content=fallback)],
     }
 
 
@@ -582,7 +759,7 @@ def route_after_router(state: AgentState) -> str:
     if state["route"] == "out_of_scope":
         return "refusal_node"
 
-    return "langchain_data_agent_node"
+    return "data_agent_loop_node"
 
 
 @lru_cache(maxsize=1)
@@ -613,7 +790,7 @@ def build_graph():
 
     graph_builder.add_node("load_user_profile_node", load_user_profile_node)
     graph_builder.add_node("router_node", router_node)
-    graph_builder.add_node("langchain_data_agent_node", langchain_data_agent_node)
+    graph_builder.add_node("data_agent_loop_node", data_agent_loop_node)
     graph_builder.add_node("refusal_node", refusal_node)
     graph_builder.add_node("profile_update_node", profile_update_node)
 
@@ -623,11 +800,11 @@ def build_graph():
         "router_node",
         route_after_router,
         {
-            "langchain_data_agent_node": "langchain_data_agent_node",
+            "data_agent_loop_node": "data_agent_loop_node",
             "refusal_node": "refusal_node",
         },
     )
-    graph_builder.add_edge("langchain_data_agent_node", "profile_update_node")
+    graph_builder.add_edge("data_agent_loop_node", "profile_update_node")
     graph_builder.add_edge("refusal_node", "profile_update_node")
     graph_builder.add_edge("profile_update_node", END)
 

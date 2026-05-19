@@ -10,13 +10,18 @@ from app import tools
 def sample_df() -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "row_id": [0, 1, 2, 3, 4],
+            "row_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
             "instruction": [
                 "I want a refund for my order",
                 "How can I contact customer service?",
                 "I want to give feedback about the product",
                 "My refund has not arrived",
                 "I have a billing complaint",
+                "Where is my package?",
+                "My shipment is late",
+                "I forgot my account password",
+                "I want to delete my account",
+                "I want to cancel my subscription",
             ],
             "response": [
                 "You can request a refund through your account.",
@@ -24,6 +29,11 @@ def sample_df() -> pd.DataFrame:
                 "Thank you for sharing your feedback.",
                 "Refunds usually take several business days.",
                 "Please share the billing issue details.",
+                "You can track your package from your account.",
+                "Please check the shipping status page for delivery updates.",
+                "You can recover your password from the account login page.",
+                "You can delete your account from account settings.",
+                "You can start the cancellation process from your subscription settings.",
             ],
             "category": [
                 "REFUND",
@@ -31,6 +41,11 @@ def sample_df() -> pd.DataFrame:
                 "FEEDBACK",
                 "REFUND",
                 "COMPLAINT",
+                "SHIPPING",
+                "SHIPPING",
+                "ACCOUNT",
+                "ACCOUNT",
+                "CANCELLATION",
             ],
             "intent": [
                 "get_refund",
@@ -38,6 +53,11 @@ def sample_df() -> pd.DataFrame:
                 "give_feedback",
                 "check_refund_status",
                 "billing_complaint",
+                "track_order",
+                "check_shipping_status",
+                "recover_password",
+                "delete_account",
+                "cancel_subscription",
             ],
         }
     )
@@ -69,16 +89,16 @@ def test_get_dataset_schema_returns_columns_and_row_count(
     result = tools.get_dataset_schema_impl(include_sample_values=True)
 
     assert result.columns == list(sample_df.columns)
-    assert result.row_count == 5
+    assert result.row_count == len(sample_df)
     assert result.sample_values == {
         "category": ["REFUND", "CONTACT", "FEEDBACK"],
     }
 
 
-def test_count_rows_counts_full_dataset() -> None:
+def test_count_rows_counts_full_dataset(sample_df: pd.DataFrame) -> None:
     result = tools.count_rows_impl()
 
-    assert result.count == 5
+    assert result.count == len(sample_df)
 
 
 def test_count_rows_counts_selected_row_ids() -> None:
@@ -96,7 +116,7 @@ def test_filter_rows_filters_by_category_case_insensitive() -> None:
 
 @pytest.mark.parametrize(
     "category_alias",
-   [
+    [
         "refunds",
         "refund requests",
         "reimbursement",
@@ -112,6 +132,14 @@ def test_filter_rows_normalizes_refund_category_aliases(
 
     assert result.match_count == 2
     assert result.row_ids == [0, 3]
+
+
+def test_assignment_money_back_alias_maps_to_refund_rows() -> None:
+    result = tools.filter_rows_impl(category="money back")
+
+    assert result.match_count == 2
+    assert result.row_ids == [0, 3]
+    assert result.applied_filters["category"] == "money back"
 
 
 @pytest.mark.parametrize(
@@ -149,6 +177,13 @@ def test_filter_rows_filters_by_text_query() -> None:
     assert result.row_ids == [4]
 
 
+def test_assignment_cancellation_text_query_finds_cancellation_rows() -> None:
+    result = tools.filter_rows_impl(text_query="cancellation")
+
+    assert result.match_count == 1
+    assert result.row_ids == [9]
+
+
 def test_filter_rows_applies_limit_but_keeps_total_match_count() -> None:
     result = tools.filter_rows_impl(category="REFUND", limit=1)
 
@@ -174,6 +209,22 @@ def test_sample_examples_respects_offset() -> None:
     assert result.next_offset == 4
 
 
+def test_assignment_shipping_examples_filter_then_sample() -> None:
+    filter_result = tools.filter_rows_impl(category="SHIPPING")
+    examples_result = tools.sample_examples_impl(
+        row_ids=filter_result.row_ids,
+        n=2,
+        offset=0,
+    )
+
+    assert filter_result.match_count == 2
+    assert filter_result.row_ids == [5, 6]
+    assert len(examples_result.examples) == 2
+    assert examples_result.examples[0].category == "SHIPPING"
+    assert examples_result.examples[1].category == "SHIPPING"
+    assert examples_result.next_offset == 2
+
+
 def test_group_counts_groups_by_category_sorted_descending() -> None:
     result = tools.group_counts_impl(group_by="category")
 
@@ -188,6 +239,23 @@ def test_group_counts_groups_selected_row_ids_only() -> None:
     assert len(result.counts) == 1
     assert result.counts[0].label == "REFUND"
     assert result.counts[0].count == 2
+
+
+def test_assignment_account_intent_distribution_groups_filtered_rows() -> None:
+    filter_result = tools.filter_rows_impl(category="ACCOUNT")
+    group_result = tools.group_counts_impl(
+        group_by="intent",
+        row_ids=filter_result.row_ids,
+        top_k=10,
+    )
+
+    assert filter_result.match_count == 2
+    assert filter_result.row_ids == [7, 8]
+    assert group_result.group_by == "intent"
+    assert group_result.counts == [
+        tools.GroupCountRow(label="recover_password", count=1),
+        tools.GroupCountRow(label="delete_account", count=1),
+    ]
 
 
 def test_rows_to_summary_context_formats_selected_rows(sample_df: pd.DataFrame) -> None:
@@ -221,7 +289,7 @@ def test_summarize_rows_falls_back_to_deterministic_summary(
 
 
 def test_summarize_rows_returns_non_empty_summary(
-        monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         tools,
@@ -274,12 +342,11 @@ def test_summarize_rows_uses_llm_summary_when_available(
 
 
 def test_schema_based_wrappers_call_implementations(
-        monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         tools,
         "get_summarizer_llm",
-
         lambda: (_ for _ in ()).throw(RuntimeError("No summarizer available.")),
     )
 
