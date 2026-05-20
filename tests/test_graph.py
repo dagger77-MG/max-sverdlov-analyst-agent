@@ -203,6 +203,100 @@ def test_structured_query_uses_planner_executor_reviewer_loop(
     assert isinstance(result["messages"][-1], AIMessage)
 
 
+def test_refund_count_resolves_filter_value_before_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for an exact refund count.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        graph,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "REFUND",
+                    "count": 2992,
+                    "score": 1.0,
+                    "reason": "Category alias resolves exactly to this dataset value.",
+                }
+            ],
+            recommended_filter={
+                "category": "REFUND",
+                "intent": None,
+            },
+            confidence="high",
+        ),
+    )
+
+    monkeypatch.setattr(
+        graph,
+        "filter_rows_impl",
+        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
+            row_ids=[5917, 5918, 5919],
+            match_count=2992,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "limit": limit,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "refund requests",
+                "columns": ["category", "intent"],
+                "top_k": 5,
+            },
+        ),
+        _plan_call("filter_rows", {"category": "REFUND"}),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="The resolver found the correct dataset filter; now filter rows.",
+            suggested_tool_name="filter_rows",
+            suggested_tool_input={"category": "REFUND"},
+        ),
+        _review_answer("There are 2,992 refund-request rows in the dataset."),
+    )
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="How many refund requests did we get?",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["final_answer"] == "There are 2,992 refund-request rows in the dataset."
+    assert [step["tool_name"] for step in result["tool_trace"]] == [
+        "resolve_filter_value",
+        "filter_rows",
+    ]
+    assert result["tool_trace"][0]["tool_input"] == {
+        "query": "refund requests",
+        "columns": ["category", "intent"],
+        "top_k": 5,
+    }
+    assert result["tool_trace"][1]["tool_input"] == {"category": "REFUND"}
+    assert result["last_structured_results"][-1]["value"] == 2992
+    assert result["last_structured_results"][-1]["query_type"] == "filter"
+
+
 def test_assignment_question_categories_exist_reviewer_rejects_schema_sample_then_uses_group_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -945,6 +1039,156 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
         "value": 6,
         "query_type": "sample",
         "row_ids": [10, 11, 12, 13, 14, 15],
+    }
+
+
+def test_filter_rows_limit_is_removed_for_example_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = graph.create_initial_state(
+        query="Show me 5 examples of the SHIPPING category.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    captured_inputs: list[dict] = []
+
+    def fake_filter_rows_impl(
+        category=None,
+        intent=None,
+        text_query=None,
+        limit=None,
+    ):
+        captured_inputs.append(
+            {
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "limit": limit,
+            }
+        )
+        return _model_result(
+            row_ids=[1995, 1996, 1997, 1998, 1999, 2000],
+            match_count=1970,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "limit": limit,
+            },
+        )
+
+    monkeypatch.setattr(graph, "filter_rows_impl", fake_filter_rows_impl)
+
+    graph._execute_selected_tool(
+        state=state,
+        tool_name="filter_rows",
+        tool_input={
+            "category": "SHIPPING",
+            "limit": 5,
+        },
+    )
+
+    assert captured_inputs == [
+        {
+            "category": "SHIPPING",
+            "intent": None,
+            "text_query": None,
+            "limit": None,
+        }
+    ]
+    assert state["tool_trace"][0]["tool_input"] == {
+        "category": "SHIPPING",
+        "limit": None,
+    }
+    assert state["last_structured_results"][-1] == {
+        "label": str(
+            {
+                "category": "SHIPPING",
+                "intent": None,
+                "text_query": None,
+                "limit": None,
+            }
+        ),
+        "value": 1970,
+        "query_type": "filter",
+        "row_ids": [1995, 1996, 1997, 1998, 1999, 2000],
+    }
+
+
+def test_sample_examples_returns_direct_final_answer_without_reviewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = graph.create_initial_state(
+        query="Show me 1 example from the SHIPPING category.",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for examples from a dataset category."
+    state["user_profile"] = "# User Profile\n"
+
+    monkeypatch.setattr(
+        graph,
+        "sample_examples_impl",
+        lambda row_ids=None, n=3, offset=0: type(
+            "SampleExamplesResult",
+            (),
+            {
+                "examples": [
+                    type(
+                        "ExampleRow",
+                        (),
+                        {
+                            "row_id": 1996,
+                            "category": "SHIPPING",
+                            "intent": "change_shipping_address",
+                            "instruction": "need to update my address",
+                            "response": (
+                                "I'll make it happen! I can assist you in modifying "
+                                "your shipping address. Please follow the steps below "
+                                "to update it."
+                            ),
+                        },
+                    )()
+                ],
+                "next_offset": 1,
+            },
+        )(),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "sample_examples",
+            {
+                "row_ids": [1996],
+                "n": 1,
+                "offset": 0,
+            },
+        )
+    )
+
+    def fail_if_reviewer_called():
+        raise AssertionError("Reviewer should not rewrite sample_examples output.")
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(
+        graph,
+        "get_structured_observation_reviewer_llm",
+        fail_if_reviewer_called,
+    )
+
+    result = graph.data_agent_loop_node(state)
+
+    assert result["final_answer"] == result["tool_trace"][-1]["observation"]
+    assert "row_id=1996" in result["final_answer"]
+    assert "customer_instruction=need to update my address" in result["final_answer"]
+    assert "support_response=I'll make it happen!" in result["final_answer"]
+    assert state["last_structured_results"][-1] == {
+        "label": "sample_examples",
+        "value": 1,
+        "query_type": "sample",
+        "row_ids": [1996],
     }
 
 

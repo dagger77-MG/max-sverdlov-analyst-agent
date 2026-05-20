@@ -26,9 +26,22 @@ from app.tools import (
     filter_rows_impl,
     get_dataset_schema_impl,
     group_counts_impl,
+    resolve_filter_value_impl,
     sample_examples_impl,
     summarize_rows_impl,
 )
+
+
+PlannerToolName = Literal[
+    "get_dataset_schema",
+    "resolve_filter_value",
+    "filter_rows",
+    "count_rows",
+    "sample_examples",
+    "group_counts",
+    "summarize_rows",
+    "read_user_profile",
+]
 
 
 class ProfileObservationDecision(BaseModel):
@@ -46,9 +59,12 @@ class ToolPlanDecision(BaseModel):
     action: Literal["call_tool", "final_answer"] = Field(
         description="Whether to call one tool or produce a final answer."
     )
-    tool_name: str = Field(
+    tool_name: PlannerToolName | Literal[""] = Field(
         default="",
-        description="Tool to call when action is 'call_tool'.",
+        description=(
+            "Tool to call when action is 'call_tool'. Must be empty when "
+            "action is 'final_answer'."
+        ),
     )
     tool_input: dict[str, Any] = Field(
         default_factory=dict,
@@ -244,6 +260,36 @@ def _is_more_examples_query(query: str) -> bool:
             r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
             normalized,
         )
+    )
+
+
+def _is_example_request(query: str) -> bool:
+    """Return True when the user asks to show dataset examples/samples/cases."""
+    normalized = query.strip().lower()
+
+    if not normalized:
+        return False
+
+    action_markers = (
+       "show",
+        "give",
+        "list",
+        "display",
+        "provide",
+    )
+    example_markers = (
+        "example",
+        "examples",
+        "sample",
+        "samples",
+        "case",
+        "cases",
+        "row",
+        "rows",
+    )
+
+    return any(marker in normalized for marker in action_markers) and any(
+        marker in normalized for marker in example_markers
     )
 
 
@@ -490,7 +536,39 @@ def _execute_selected_tool(
         )
         return
 
+    if tool_name == "resolve_filter_value":
+        result = resolve_filter_value_impl(
+            query=str(normalized_input.get("query", "")),
+            columns=normalized_input.get("columns") or ["category", "intent"],
+            top_k=int(normalized_input.get("top_k", 5)),
+        )
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label=f"resolve_filter_value:{result.query}",
+                value=result.confidence,
+                query_type="resolve_filter_value",
+                row_ids=None,
+            ),
+        )
+        return
+
     if tool_name == "filter_rows":
+        if (
+            normalized_input.get("limit") is not None
+            and _is_example_request(_latest_user_message(state["messages"]))
+        ):
+            normalized_input = {
+                **normalized_input,
+                "limit": None,
+            }
+
         result = filter_rows_impl(
             category=normalized_input.get("category"),
             intent=normalized_input.get("intent"),
@@ -689,6 +767,19 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 tool_name=plan.tool_name,
                 tool_input=plan.tool_input,
             )
+
+            if (
+                    plan.tool_name == "sample_examples"
+                    and _is_example_request(_latest_user_message(state["messages"]))
+            ):
+                final_answer = state["tool_trace"][-1]["observation"]
+                state["final_answer"] = final_answer
+                return {
+                    "tool_trace": state["tool_trace"],
+                    "last_structured_results": state["last_structured_results"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
 
             reviewer_llm = get_structured_observation_reviewer_llm()
             review = reviewer_llm.invoke(_build_reviewer_messages(state))

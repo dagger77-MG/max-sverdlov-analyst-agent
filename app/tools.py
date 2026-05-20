@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from functools import lru_cache
 from typing import Literal
+import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -64,6 +65,44 @@ class FilterRowsOutput(BaseModel):
     row_ids: list[int]
     match_count: int
     applied_filters: dict[str, str | int | None]
+
+
+class ResolveFilterValueInput(BaseModel):
+    query: str = Field(
+        description=(
+            "Natural-language value to resolve against actual dataset category "
+            "and/or intent values, for example 'refund requests' or 'shipping'."
+        ),
+    )
+    columns: list[Literal["category", "intent"]] = Field(
+        default_factory=lambda: ["category", "intent"],
+        description=(
+            "Dataset columns to search. Use ['intent'] when the user explicitly "
+            "asks for an intent, ['category'] when they explicitly ask for a "
+            "category, and both when the wording is broad or ambiguous."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum number of matching candidates to return.",
+    )
+
+
+class FilterValueCandidate(BaseModel):
+    column: Literal["category", "intent"]
+    value: str
+    count: int
+    score: float
+    reason: str
+
+
+class ResolveFilterValueOutput(BaseModel):
+    query: str
+    candidates: list[FilterValueCandidate]
+    recommended_filter: dict[str, str | None]
+    confidence: Literal["none", "low", "medium", "high"]
 
 
 class CountRowsInput(BaseModel):
@@ -209,6 +248,150 @@ def _normalize_category_filter(value: str | None) -> str | None:
         return None
 
     return _CATEGORY_ALIASES.get(normalized, normalized)
+
+
+def _tokenize_filter_text(value: str) -> set[str]:
+    """Tokenize text for lightweight matching against dataset labels."""
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", value.lower())
+        if token
+    }
+
+    expanded = set(tokens)
+    for token in tokens:
+        if len(token) > 3 and token.endswith("s"):
+            expanded.add(token[:-1])
+
+    return expanded
+
+
+def _score_filter_candidate(
+    query: str,
+    column: Literal["category", "intent"],
+    candidate_value: str,
+) -> tuple[float, str]:
+    """Score how well a user phrase matches one concrete dataset value."""
+    normalized_query = _normalize_filter_value(query) or ""
+    normalized_candidate = _normalize_filter_value(candidate_value) or ""
+
+    if not normalized_query or not normalized_candidate:
+        return 0.0, "Empty query or candidate."
+
+    if column == "category":
+        alias_value = _normalize_category_filter(normalized_query)
+        if alias_value == normalized_candidate:
+            return 1.0, "Category alias resolves exactly to this dataset value."
+
+    if normalized_query == normalized_candidate:
+        return 1.0, "Exact normalized value match."
+
+    query_tokens = _tokenize_filter_text(normalized_query)
+    candidate_phrase = normalized_candidate.replace("_", " ")
+    candidate_tokens = _tokenize_filter_text(candidate_phrase)
+
+    if column == "intent" and len(query_tokens) == 1:
+        return 0.0, (
+            "Single-token query is too broad to resolve to a longer intent value."
+        )
+
+    if candidate_phrase in normalized_query:
+        return 0.90, "Dataset value appears inside the user phrase."
+
+    if normalized_query in candidate_phrase:
+        return 0.85, "User phrase appears inside the dataset value."
+
+    if not query_tokens or not candidate_tokens:
+        return 0.0, "No comparable tokens."
+
+    overlap = query_tokens & candidate_tokens
+    if not overlap:
+        return 0.0, "No token overlap."
+
+    overlap_ratio = len(overlap) / max(len(query_tokens), len(candidate_tokens))
+    score = min(0.80, 0.30 + overlap_ratio)
+
+    return score, f"Token overlap: {', '.join(sorted(overlap))}."
+
+
+def _confidence_from_score(score: float) -> Literal["none", "low", "medium", "high"]:
+    if score >= 0.85:
+        return "high"
+    if score >= 0.60:
+        return "medium"
+    if score > 0:
+        return "low"
+    return "none"
+
+
+def resolve_filter_value_impl(
+    query: str,
+    columns: list[Literal["category", "intent"]] | None = None,
+    top_k: int = 5,
+) -> ResolveFilterValueOutput:
+    """Resolve a natural-language filter phrase to actual dataset values."""
+    df = get_dataset_df()
+    selected_columns = columns or ["category", "intent"]
+
+    candidates: list[FilterValueCandidate] = []
+
+    for column in selected_columns:
+        if column not in {"category", "intent"}:
+            continue
+
+        counts = Counter(
+            df[column]
+            .fillna("")
+            .astype(str)
+            .replace("", "UNKNOWN")
+            .tolist()
+        )
+
+        for value, count in counts.items():
+            score, reason = _score_filter_candidate(
+                query=query,
+                column=column,
+                candidate_value=value,
+            )
+            if score <= 0:
+                continue
+
+            candidates.append(
+                FilterValueCandidate(
+                    column=column,
+                    value=str(value),
+                    count=int(count),
+                    score=round(score, 4),
+                    reason=reason,
+                )
+            )
+
+    candidates = sorted(
+        candidates,
+        key=lambda candidate: (candidate.score, candidate.count),
+        reverse=True,
+    )[:top_k]
+
+    recommended_filter: dict[str, str | None] = {
+        "category": None,
+        "intent": None,
+    }
+
+    confidence: Literal["none", "low", "medium", "high"] = "none"
+
+    if candidates:
+        best = candidates[0]
+        confidence = _confidence_from_score(best.score)
+        if confidence in {"medium", "high"}:
+            recommended_filter[best.column] = best.value
+
+    return ResolveFilterValueOutput(
+        query=query,
+        candidates=candidates,
+        recommended_filter=recommended_filter,
+        confidence=confidence,
+    )
+
 
 def _subset_by_row_ids(row_ids: list[int] | None):
     df = get_dataset_df()
@@ -484,6 +667,16 @@ def filter_rows(input_data: FilterRowsInput) -> FilterRowsOutput:
         intent=input_data.intent,
         text_query=input_data.text_query,
         limit=input_data.limit,
+    )
+
+
+def resolve_filter_value(
+    input_data: ResolveFilterValueInput,
+) -> ResolveFilterValueOutput:
+    return resolve_filter_value_impl(
+        query=input_data.query,
+        columns=input_data.columns,
+        top_k=input_data.top_k,
     )
 
 

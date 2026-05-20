@@ -177,6 +177,54 @@ def test_filter_rows_filters_by_text_query() -> None:
     assert result.row_ids == [4]
 
 
+def test_resolve_filter_value_maps_refund_requests_to_refund_category() -> None:
+    result = tools.resolve_filter_value_impl(
+        query="refund requests",
+        columns=["category", "intent"],
+        top_k=5,
+    )
+
+    assert result.confidence == "high"
+    assert result.recommended_filter == {
+        "category": "REFUND",
+        "intent": None,
+    }
+    assert result.candidates[0].column == "category"
+    assert result.candidates[0].value == "REFUND"
+    assert result.candidates[0].count == 2
+
+
+def test_resolve_filter_value_does_not_switch_explicit_intent_to_category() -> None:
+    result = tools.resolve_filter_value_impl(
+        query="SHIPPING",
+        columns=["intent"],
+        top_k=5,
+    )
+
+    assert result.confidence == "none"
+    assert result.recommended_filter == {
+        "category": None,
+        "intent": None,
+    }
+    assert result.candidates == []
+
+
+def test_resolve_filter_value_maps_shipping_to_category_when_category_allowed() -> None:
+    result = tools.resolve_filter_value_impl(
+        query="SHIPPING",
+        columns=["category"],
+        top_k=5,
+    )
+
+    assert result.confidence == "high"
+    assert result.recommended_filter == {
+        "category": "SHIPPING",
+        "intent": None,
+    }
+    assert result.candidates[0].column == "category"
+    assert result.candidates[0].value == "SHIPPING"
+
+
 def test_assignment_cancellation_text_query_finds_cancellation_rows() -> None:
     result = tools.filter_rows_impl(text_query="cancellation")
 
