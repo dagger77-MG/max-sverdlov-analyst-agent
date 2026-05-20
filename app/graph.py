@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import os
 import sqlite3
 from functools import lru_cache
 from typing import Any, Literal
@@ -221,6 +220,26 @@ def _append_trace(
         )
     )
 
+def _append_tool_error(
+    state: AgentState,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    error: str,
+    required_next_step: str,
+) -> None:
+    """Record a non-fatal tool contract error as a visible observation."""
+    _append_trace(
+        state,
+        tool_name,
+        tool_input,
+        _format_model_dict(
+            {
+                "error": error,
+                "required_next_step": required_next_step,
+            }
+        ),
+    )
+
 
 def _append_structured_result(
     state: AgentState,
@@ -318,6 +337,57 @@ def _is_example_request(query: str) -> bool:
     return any(marker in normalized for marker in action_markers) and any(
         marker in normalized for marker in example_markers
     )
+
+
+def _is_distribution_query(query: str) -> bool:
+    """Return True when the user asks for a distribution or breakdown."""
+    normalized = query.strip().lower()
+
+    if not normalized:
+        return False
+
+    distribution_markers = (
+        "distribution",
+        "breakdown",
+        "group count",
+        "group counts",
+        "count by",
+        "counts by",
+        "by category",
+        "by intent",
+    )
+
+    return any(marker in normalized for marker in distribution_markers)
+
+
+def _has_explicit_top_k_request(query: str) -> bool:
+    """Return True when the user explicitly asks for a limited top-N result."""
+    normalized = query.strip().lower()
+
+    if not normalized:
+        return False
+
+    return bool(
+        re.search(r"\b(top|first|highest|lowest)\s+\d+\b", normalized)
+        or "most common" in normalized
+        or "least common" in normalized
+    )
+
+
+def _requires_grouped_filtered_scope(query: str, group_by: str) -> bool:
+    """Detect grouped questions that require a prior filtered subset."""
+    normalized = query.strip().lower()
+
+    if not _is_distribution_query(normalized):
+        return False
+
+    if group_by == "intent" and "category" in normalized:
+        return True
+
+    if group_by == "category" and "intent" in normalized:
+        return True
+
+    return False
 
 
 def _requested_example_count(query: str, default: int = 3) -> int:
@@ -480,6 +550,7 @@ Recent structured results:
 Current turn tool trace:
 {_compact_tool_trace_for_prompt(state["tool_trace"])}
 
+
 Reviewer feedback:
 {reviewer_feedback or "No reviewer feedback yet."}
 """
@@ -502,6 +573,7 @@ Recent structured results:
 
 Current turn tool trace:
 {_compact_tool_trace_for_prompt(state["tool_trace"])}
+
 """
 
     return [
@@ -553,21 +625,46 @@ def _format_filter_rows_observation(result) -> str:
 
 
 def _coerce_row_ids(value: Any) -> list[int] | None:
-    """Coerce planner-supplied row IDs into integers when possible."""
+    """Coerce planner-supplied row IDs into integers or reject invalid values."""
     if value is None:
         return None
 
     if not isinstance(value, list):
-        return None
+        raise ValueError(
+            "row_ids must be a list of integer row IDs or null; "
+            f"got {type(value).__name__}."
+        )
 
     row_ids: list[int] = []
     for item in value:
         try:
             row_ids.append(int(item))
-        except (TypeError, ValueError):
-            return None
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "row_ids must contain only integer-compatible values; "
+                f"got {item!r}."
+            ) from exc
 
     return row_ids
+
+
+def _resolve_row_ids_from_tool_input(
+    state: AgentState,
+    normalized_input: dict[str, Any],
+) -> list[int] | None:
+    """Resolve row_ids or the controlled latest-filter scope reference."""
+    scope = normalized_input.get("scope")
+    if scope in {"latest_filter", "latest_filtered_subset"}:
+        row_ids = _latest_filter_row_ids(state)
+        if row_ids is None:
+            raise ValueError(
+                "scope='latest_filter' was requested, but no filtered subset "
+                "exists in recent structured results."
+            )
+        normalized_input["row_ids"] = row_ids
+        return row_ids
+
+    return _coerce_row_ids(normalized_input.get("row_ids"))
 
 
 def _latest_filter_row_ids(state: AgentState) -> list[int] | None:
@@ -662,7 +759,21 @@ def _execute_selected_tool(
         return
 
     if tool_name == "count_rows":
-        row_ids = _coerce_row_ids(normalized_input.get("row_ids"))
+        try:
+            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+        except ValueError as exc:
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=str(exc),
+                required_next_step=(
+                    "Use actual row IDs from filter_rows, scope='latest_filter', "
+                    "or omit row_ids to count all rows."
+                ),
+            )
+            return
+
         result = count_rows_impl(row_ids=row_ids)
         _append_trace(
             state,
@@ -682,16 +793,44 @@ def _execute_selected_tool(
         return
 
     if tool_name == "sample_examples":
-        row_ids = _coerce_row_ids(normalized_input.get("row_ids"))
-        if (
-            row_ids is None
-            and normalized_input.get("row_ids") is not None
-            and _is_example_request(_latest_user_message(state["messages"]))
-        ):
-            latest_filter_row_ids = _latest_filter_row_ids(state)
-            if latest_filter_row_ids is not None:
-                row_ids = latest_filter_row_ids
-                normalized_input["row_ids"] = row_ids
+        try:
+            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+        except ValueError:
+            if (
+                normalized_input.get("row_ids") is not None
+                and _is_example_request(_latest_user_message(state["messages"]))
+            ):
+                latest_filter_row_ids = _latest_filter_row_ids(state)
+                if latest_filter_row_ids is not None:
+                    row_ids = latest_filter_row_ids
+                    normalized_input["row_ids"] = row_ids
+                else:
+                    _append_tool_error(
+                        state=state,
+                        tool_name=tool_name,
+                        tool_input=normalized_input,
+                        error=(
+                            "sample_examples received invalid row_ids and no "
+                            "filtered subset exists to repair them."
+                        ),
+                        required_next_step=(
+                            "Call filter_rows first, then sample_examples with "
+                            "scope='latest_filter' or actual row IDs."
+                        ),
+                    )
+                    return
+            else:
+                _append_tool_error(
+                    state=state,
+                    tool_name=tool_name,
+                    tool_input=normalized_input,
+                    error="sample_examples received invalid row_ids.",
+                    required_next_step=(
+                        "Use actual row IDs from filter_rows, scope='latest_filter', "
+                        "or omit row_ids for all rows."
+                    ),
+                )
+                return
 
         n = int(normalized_input.get("n", 3))
         offset = int(normalized_input.get("offset", 0))
@@ -718,19 +857,58 @@ def _execute_selected_tool(
             raise ValueError(
                 "group_counts requires group_by='category' or group_by='intent'."
             )
-        row_ids = _coerce_row_ids(normalized_input.get("row_ids"))
+
+        try:
+            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+        except ValueError as exc:
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=str(exc),
+                required_next_step=(
+                    "For filtered distributions, call filter_rows first and then "
+                    "call group_counts with scope='latest_filter' or actual row IDs."
+                ),
+            )
+            return
+
+        user_query = _latest_user_message(state["messages"])
+        if row_ids is None and _requires_grouped_filtered_scope(user_query, group_by):
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=(
+                    "group_counts would group all rows, but the user asked for a "
+                    "distribution inside a filtered category or intent."
+                ),
+                required_next_step=(
+                    "Resolve the requested value, call filter_rows, then call "
+                    "group_counts with scope='latest_filter' or actual row IDs."
+                ),
+            )
+            return
+
         top_k = int(normalized_input.get("top_k", 20))
+        if (
+            _is_distribution_query(user_query)
+            and not _has_explicit_top_k_request(user_query)
+            and top_k < 20
+        ):
+            top_k = 20
+            normalized_input["top_k"] = top_k
+
         result = group_counts_impl(
             group_by=group_by,
             row_ids=row_ids,
             top_k=top_k,
         )
-        result_dict = result.model_dump()
         _append_trace(
             state,
             tool_name,
             normalized_input,
-            _format_model_dict(result_dict),
+            _format_model_dict(result.model_dump()),
         )
         _append_structured_result(
             state,
@@ -744,7 +922,22 @@ def _execute_selected_tool(
         return
 
     if tool_name == "summarize_rows":
-        row_ids = _coerce_row_ids(normalized_input.get("row_ids")) or []
+        try:
+            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+        except ValueError as exc:
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=str(exc),
+                required_next_step=(
+                    "Call filter_rows first, then summarize_rows with "
+                    "scope='latest_filter' or actual row IDs."
+                ),
+            )
+            return
+
+        row_ids = row_ids or []
         result = summarize_rows_impl(
             row_ids=row_ids,
             focus=str(
@@ -772,6 +965,152 @@ def _execute_selected_tool(
         return
 
     raise ValueError(f"Unknown tool selected by planner: {tool_name}")
+
+
+def _trace_observation_is_error(observation: str) -> bool:
+    """Return True when an observation is a tool-contract error payload."""
+    try:
+        parsed = json.loads(observation)
+    except json.JSONDecodeError:
+        return False
+
+    return isinstance(parsed, dict) and "error" in parsed
+
+
+def _has_prior_filter_trace(
+    state: AgentState,
+    max_index: int,
+    required_filter_column: str,
+) -> bool:
+    """Return True when a filter_rows call for the required column precedes a tool."""
+    for item in state["tool_trace"][:max_index]:
+        if item["tool_name"] != "filter_rows":
+            continue
+        if item["tool_input"].get(required_filter_column):
+            return True
+    return False
+
+
+def _has_valid_scoped_group_counts_trace(
+    state: AgentState,
+    group_by: str,
+    required_filter_column: str,
+) -> bool:
+    """Validate scoped distribution evidence using the existing tool trace only."""
+    for index, item in enumerate(state["tool_trace"]):
+        if item["tool_name"] != "group_counts":
+            continue
+        if item["tool_input"].get("group_by") != group_by:
+            continue
+        if _trace_observation_is_error(item["observation"]):
+            continue
+
+        row_ids = item["tool_input"].get("row_ids")
+        if not isinstance(row_ids, list):
+            continue
+
+        if _has_prior_filter_trace(
+            state=state,
+            max_index=index,
+            required_filter_column=required_filter_column,
+        ):
+            return True
+
+    return False
+
+
+def _has_filter_trace_for_column(state: AgentState, column: str) -> bool:
+    """Return True when this turn already has a filter_rows call for column."""
+    return any(
+        item["tool_name"] == "filter_rows"
+        and bool(item["tool_input"].get(column))
+        and not _trace_observation_is_error(item["observation"])
+        for item in state["tool_trace"]
+    )
+
+
+def _has_resolver_trace_for_column(state: AgentState, column: str) -> bool:
+    """Return True when this turn has a resolver call that searched column."""
+    for item in state["tool_trace"]:
+        if item["tool_name"] != "resolve_filter_value":
+            continue
+        columns = item["tool_input"].get("columns") or []
+        if column in columns and not _trace_observation_is_error(item["observation"]):
+            return True
+    return False
+
+
+def _answer_contract_error(state: AgentState) -> str | None:
+    """Block final answers for scoped distributions until the scoped group exists."""
+    user_query = _latest_user_message(state["messages"])
+
+    if _requires_grouped_filtered_scope(user_query, group_by="intent"):
+        if _has_valid_scoped_group_counts_trace(
+            state=state,
+            group_by="intent",
+            required_filter_column="category",
+        ):
+            return None
+
+        if _has_filter_trace_for_column(state, "category"):
+            return (
+                "The user asked for an intent distribution inside a category. "
+                "filter_rows has created the category subset, but there is no "
+                "valid group_counts(group_by='intent') over that subset yet."
+            )
+
+        if _has_resolver_trace_for_column(state, "category"):
+            return (
+                "The user asked for an intent distribution inside a category. "
+                "The category has been resolved, but filter_rows has not created "
+                "the category subset yet."
+            )
+
+        return (
+            "The user asked for an intent distribution inside a category. "
+            "Valid evidence requires resolving the category, filtering rows to "
+            "that category, and grouping intents over that filtered subset."
+        )
+
+    if _requires_grouped_filtered_scope(user_query, group_by="category"):
+        if _has_valid_scoped_group_counts_trace(
+            state=state,
+            group_by="category",
+            required_filter_column="intent",
+        ):
+            return None
+
+        if _has_filter_trace_for_column(state, "intent"):
+            return (
+                "The user asked for a category distribution inside an intent. "
+                "filter_rows has created the intent subset, but there is no "
+                "valid group_counts(group_by='category') over that subset yet."
+            )
+
+        if _has_resolver_trace_for_column(state, "intent"):
+            return (
+                "The user asked for a category distribution inside an intent. "
+                "The intent has been resolved, but filter_rows has not created "
+                "the intent subset yet."
+            )
+
+        return (
+            "The user asked for a category distribution inside an intent. "
+            "Valid evidence requires resolving the intent, filtering rows to "
+            "that intent, and grouping categories over that filtered subset."
+        )
+
+    return None
+
+
+def _build_final_answer_block_feedback(contract_error: str) -> str:
+    """Convert deterministic contract validation into planner feedback."""
+    return (
+        f"Final answer blocked by deterministic validation: {contract_error} "
+        "Do not answer from the current observations. Call the missing tool. "
+        "For scoped grouping, use actual row IDs from filter_rows or "
+        "scope='latest_filter'."
+    )
 
 
 def _fallback_answer() -> str:
@@ -881,6 +1220,18 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                         "planner returned empty final_answer"
                     )
                     continue
+                contract_error = _answer_contract_error(state)
+                if contract_error:
+                    reviewer_requires_tool = True
+                    reviewer_feedback = _build_final_answer_block_feedback(
+                        contract_error
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "blocked planner final_answer by evidence contract"
+                    )
+                    continue
+
                 state["final_answer"] = final_answer
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
@@ -888,7 +1239,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 )
                 return {
                     "tool_trace": state["tool_trace"],
-                    "last_structured_results": state["last_structured_results"],
+                                "last_structured_results": state["last_structured_results"],
                     "final_answer": final_answer,
                     "messages": [AIMessage(content=final_answer)],
                 }
@@ -936,7 +1287,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 )
                 return {
                     "tool_trace": state["tool_trace"],
-                    "last_structured_results": state["last_structured_results"],
+                                "last_structured_results": state["last_structured_results"],
                     "final_answer": final_answer,
                     "messages": [AIMessage(content=final_answer)],
                 }
@@ -944,10 +1295,28 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 f"iteration {iteration_number}/{state['max_iterations']}: "
                 "reviewer start"
             )
-            reviewer_llm = get_structured_observation_reviewer_llm()
-            review = reviewer_llm.invoke(_build_reviewer_messages(state))
-            if not isinstance(review, ObservationReviewDecision):
-                review = ObservationReviewDecision.model_validate(review)
+            try:
+                reviewer_llm = get_structured_observation_reviewer_llm()
+                review = reviewer_llm.invoke(_build_reviewer_messages(state))
+                if not isinstance(review, ObservationReviewDecision):
+                    review = ObservationReviewDecision.model_validate(review)
+            except Exception as exc:
+                reviewer_requires_tool = False
+                reviewer_feedback = (
+                    "The reviewer failed to return a valid structured decision "
+                    f"after the latest tool call. Error: {type(exc).__name__}: {exc}. "
+                    "Continue agentically from the current tool trace. Do not repeat "
+                    "the same failed or already-observed tool call. If the current "
+                    "observations fully answer the exact user request, produce a "
+                    "grounded final answer. Otherwise, choose exactly one next useful "
+                    "tool based on the current observations."
+                )
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"reviewer exception={type(exc).__name__}: {exc}; "
+                    "continuing with planner feedback"
+                )
+                continue
 
             reviewer_feedback = review.reason
             _debug_trace(
@@ -958,6 +1327,19 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             )
 
             if review.status in {"answered", "cannot_answer"}:
+                if review.status == "answered":
+                    contract_error = _answer_contract_error(state)
+                    if contract_error:
+                        reviewer_requires_tool = True
+                        reviewer_feedback = _build_final_answer_block_feedback(
+                            contract_error
+                        )
+                        _debug_trace(
+                            f"iteration {iteration_number}/{state['max_iterations']}: "
+                            "blocked reviewer answered by evidence contract"
+                        )
+                        continue
+
                 reviewer_requires_tool = False
                 final_answer = review.final_answer.strip() or review.reason.strip()
                 state["final_answer"] = final_answer
@@ -967,7 +1349,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 )
                 return {
                     "tool_trace": state["tool_trace"],
-                    "last_structured_results": state["last_structured_results"],
+                                "last_structured_results": state["last_structured_results"],
                     "final_answer": final_answer,
                     "messages": [AIMessage(content=final_answer)],
                 }
@@ -1037,11 +1419,6 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
 
         except Exception as exc:
             fallback = _fallback_answer()
-            if _debug_trace_enabled():
-                fallback = (
-                    f"{fallback}\n\n"
-                    f"Debug error: {type(exc).__name__}: {exc}"
-                )
             state["final_answer"] = fallback
             _debug_trace(
                 f"iteration {iteration_number}/{state['max_iterations']}: "
@@ -1049,7 +1426,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             )
             return {
                 "tool_trace": state["tool_trace"],
-                "last_structured_results": state["last_structured_results"],
+                        "last_structured_results": state["last_structured_results"],
                 "final_answer": fallback,
                 "messages": [AIMessage(content=fallback)],
             }

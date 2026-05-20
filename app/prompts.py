@@ -39,7 +39,7 @@ AVAILABLE_TOOL_GUIDE = """Available tools:
 - filter_rows(category: str | None = None, intent: str | None = None, text_query: str | None = None, limit: int | None = None): returns row_ids and exact match_count for a subset. Category/intent inputs should be actual dataset values. It does not return actual examples.
 - count_rows(row_ids: list[int] | None = None): counts all rows or a complete row_id subset.
 - sample_examples(row_ids: list[int] | None = None, n: int = 3, offset: int = 0): returns actual example rows.
-- group_counts(group_by: "category" | "intent", row_ids: list[int] | None = None, top_k: int = 20): returns distinct category/intent labels with counts.
+- group_counts(group_by: "category" | "intent", row_ids: list[int] | None = None, top_k: int = 20): returns distinct category/intent labels with counts. If grouping a filtered subset, use the row_ids from filter_rows or scope="latest_filter"; without row_ids/scope it groups the whole dataset.
 - summarize_rows(row_ids: list[int], focus: str, max_examples: int = 100): summarizes selected rows.
 - read_user_profile(user_id: str): reads saved user profile.
 """
@@ -57,6 +57,11 @@ Evidence rules:
 - For all distinct categories or intents, use group_counts, not get_dataset_schema sample values.
 - get_dataset_schema sample_values are examples only; they are never proof of the complete value set.
 - For filtered counts, filter_rows.match_count is the exact count.
+- row_ids must be a real list of integer row IDs returned by filter_rows.
+  Never pass symbolic strings such as "resolve_filter_value", "filter_rows",
+  or "previous_result" as row_ids.
+- For tools that need to operate on the most recent filtered subset, prefer
+  scope="latest_filter" instead of copying or inventing row_ids.
 
 Filter resolution rules:
 - Before calling filter_rows with any user-provided category or intent value,
@@ -94,6 +99,16 @@ Task patterns:
 - filter_rows row_ids are not examples. They are only identifiers for the matching subset.
 - If filter_rows returns match_count=0, explain that no rows match the requested filter. Do not call sample_examples with an empty row_ids list.
 - For summaries/themes/tone/pain points, get row_ids with filter_rows, then summarize_rows.
+- For full distribution/breakdown questions, do not limit to top_k=5 unless
+  the user explicitly asks for top 5. Use top_k=20 or higher.
+- For "distribution of intents in X category": resolve X against
+  columns=["category"], call filter_rows(category=X), then call
+  group_counts(group_by="intent", scope="latest_filter", top_k=20).
+- For "distribution of categories in X intent": resolve X against
+  columns=["intent"], call filter_rows(intent=X), then call
+  group_counts(group_by="category", scope="latest_filter", top_k=20).
+- group_counts without row_ids or scope groups the entire dataset, so it is
+  invalid evidence for a distribution inside a category or intent.
 - For profile questions, use read_user_profile.
 
 {AVAILABLE_TOOL_GUIDE}
@@ -120,6 +135,8 @@ Hard rules:
    require group_counts.
 4. Do not use group_counts to validate one exact user-provided category or
    intent value. Use resolve_filter_value for exact value validation.
+5. A tool observation that reports an error or required_next_step is not
+   answering evidence; follow the required next step instead.
 
 Filter rules:
 1. A filter_rows call with category or intent is valid only if the same trace has
@@ -139,6 +156,23 @@ Filter rules:
    final answer saying no matching category exists. Do not broaden to intent.
 6. If resolve_filter_value recommends a filter, the next tool is normally
    filter_rows with that recommended_filter.
+   
+Scoped distribution rules:
+1. For "distribution of intents in X category", valid evidence requires a
+   filter_rows result for category X followed by group_counts(group_by="intent")
+   over that filtered subset.
+2. For "distribution of categories in X intent", valid evidence requires a
+   filter_rows result for intent X followed by group_counts(group_by="category")
+  over that filtered subset.
+3. A group_counts result with row_ids=null, missing row_ids, or no filtered
+   scope is a global distribution. It does not answer a question about a
+   distribution inside a category or intent.
+4. A later resolve_filter_value call does not retroactively validate or repair
+   an earlier unscoped group_counts result. If the grouping happened before
+   the needed filter_rows call, require a new group_counts call over the
+   filtered subset.
+5. For full distributions, top_k=5 is usually incomplete unless the user asked
+   for top 5. Prefer top_k=20 or higher.
 
 Count rules:
 1. For filtered count questions, filter_rows.match_count is sufficient.
