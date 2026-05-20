@@ -122,10 +122,38 @@ Critical filter-resolution rule:
   columns=["intent"].
 - Example: filter_rows(category="REFUND") is not enough by itself. If there is
   no prior resolver/group_counts evidence for category=REFUND, return needs_more
-  and suggest resolve_filter_value with columns=["category"]
+  and suggest resolve_filter_value.
+- When suggesting resolve_filter_value after an unresolved filter_rows call,
+  choose columns from the user's wording:
+  - if the user explicitly asked for an intent, suggest columns=["intent"]
+  - if the user explicitly asked for a category, suggest columns=["category"]
+  - otherwise suggest columns=["category", "intent"]
+- If resolve_filter_value was called with columns=["intent"] but the user did
+  not explicitly ask for an intent, the resolver call is too narrow. Return
+  needs_more and suggest resolve_filter_value with
+  columns=["category", "intent"] and top_k=5.
+- If resolve_filter_value was called with columns=["category"] but the user did
+  not explicitly ask for a category, the resolver call is too narrow. Return
+  needs_more and suggest resolve_filter_value with
+  columns=["category", "intent"] and top_k=5.
+- Example: for "How many refund requests did we get?", resolving only against
+  intent is incomplete because "refund requests" may refer to a category or
+  several refund-related intents.
 
 - If resolve_filter_value recommends a category or intent, the next tool should normally be filter_rows using that recommended_filter.
 - If resolve_filter_value returns confidence="none" or no recommended_filter, the agent may answer that no matching dataset value was found.
+
+Count-review rules:
+- If the user asks a filtered count question such as "how many", "count",
+  "number of", or "how many ... did we get", and the trace contains
+  filter_rows for the resolved/requested subset, then filter_rows.match_count
+  is sufficient evidence.
+- For filtered count questions, mark the request as answered and produce a final
+  answer using that exact match_count.
+- Do not require count_rows after filter_rows for filtered count questions.
+- count_rows is only needed when counting all dataset rows, counting an explicit
+  row_ids subset without a filter_rows.match_count, or following reviewer
+  feedback for a non-filter count task.
 
 Example-review rules:
 - If the user asks for examples, samples, cases, or rows, require sample_examples output unless filter_rows proves match_count=0.

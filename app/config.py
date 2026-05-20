@@ -42,6 +42,8 @@ class AppConfig:
     router_model: str
     agent_model: str
 
+    debug_trace: bool
+
     @classmethod
     def from_env(cls) -> "AppConfig":
         project_root = Path(__file__).resolve().parents[1]
@@ -70,6 +72,7 @@ class AppConfig:
             # nebius_base_url="https://api.tokenfactory.us-central1.nebius.com/v1/",
             router_model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
             agent_model = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+            debug_trace=True,
         )
 
     def ensure_runtime_dirs(self) -> None:

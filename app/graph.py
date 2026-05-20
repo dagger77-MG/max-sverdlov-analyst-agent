@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import os
 import sqlite3
 from functools import lru_cache
 from typing import Any, Literal
@@ -703,6 +704,23 @@ def _fallback_answer() -> str:
     )
 
 
+def _debug_trace_enabled() -> bool:
+    """Return True when local live graph-loop debug output is enabled."""
+    value = settings.debug_trace
+    return value
+
+
+def _debug_trace(message: str) -> None:
+    """Print live graph-loop debug events for local development.
+
+    This is intentionally separate from the user-facing tool_trace. It helps
+    debug planner/reviewer loops and swallowed exceptions while the agent is
+    still running.
+    """
+    if _debug_trace_enabled():
+        print(f"[debug] {message}", flush=True)
+
+
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
     """Load persistent profile memory into graph state."""
     profile = read_user_profile_impl(state["user_id"])
@@ -738,8 +756,13 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
 
     reviewer_feedback: str | None = None
 
-    for _ in range(state["max_iterations"]):
+    for iteration_index in range(state["max_iterations"]):
+        iteration_number = iteration_index + 1
         try:
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                "planner start"
+            )
             planner_llm = get_structured_tool_planner_llm()
             plan = planner_llm.invoke(
                 _build_planner_messages(state, reviewer_feedback)
@@ -747,14 +770,29 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             if not isinstance(plan, ToolPlanDecision):
                 plan = ToolPlanDecision.model_validate(plan)
 
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"planner action={plan.action}; "
+                f"tool={plan.tool_name or '-'}; "
+                f"reason={plan.reason}"
+            )
+
             if plan.action == "final_answer":
                 final_answer = plan.final_answer.strip()
                 if not final_answer:
                     reviewer_feedback = (
                         "Planner chose final_answer but returned empty text."
                     )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "planner returned empty final_answer"
+                    )
                     continue
                 state["final_answer"] = final_answer
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    "returning planner final_answer"
+                )
                 return {
                     "tool_trace": state["tool_trace"],
                     "last_structured_results": state["last_structured_results"],
@@ -767,6 +805,11 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 tool_name=plan.tool_name,
                 tool_input=plan.tool_input,
             )
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"executed tool={plan.tool_name}; "
+                f"trace_steps={len(state['tool_trace'])}"
+            )
 
             if (
                     plan.tool_name == "sample_examples"
@@ -774,23 +817,40 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             ):
                 final_answer = state["tool_trace"][-1]["observation"]
                 state["final_answer"] = final_answer
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    "returning deterministic sample_examples answer"
+                )
                 return {
                     "tool_trace": state["tool_trace"],
                     "last_structured_results": state["last_structured_results"],
                     "final_answer": final_answer,
                     "messages": [AIMessage(content=final_answer)],
                 }
-
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                "reviewer start"
+            )
             reviewer_llm = get_structured_observation_reviewer_llm()
             review = reviewer_llm.invoke(_build_reviewer_messages(state))
             if not isinstance(review, ObservationReviewDecision):
                 review = ObservationReviewDecision.model_validate(review)
 
             reviewer_feedback = review.reason
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"reviewer status={review.status}; "
+                f"suggested_tool={review.suggested_tool_name or '-'}; "
+                f"reason={review.reason}"
+            )
 
             if review.status in {"answered", "cannot_answer"}:
                 final_answer = review.final_answer.strip() or review.reason.strip()
                 state["final_answer"] = final_answer
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"returning reviewer status={review.status}"
+                )
                 return {
                     "tool_trace": state["tool_trace"],
                     "last_structured_results": state["last_structured_results"],
@@ -805,10 +865,18 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     f"Suggested next input: "
                     f"{json.dumps(review.suggested_tool_input, ensure_ascii=False, default=str)}"
                 )
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"reviewer requested next tool={review.suggested_tool_name}"
+                )
 
-        except Exception:
+        except Exception as exc:
             fallback = _fallback_answer()
             state["final_answer"] = fallback
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"exception={type(exc).__name__}: {exc}"
+            )
             return {
                 "tool_trace": state["tool_trace"],
                 "last_structured_results": state["last_structured_results"],
@@ -818,6 +886,10 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
 
     fallback = _fallback_answer()
     state["final_answer"] = fallback
+    _debug_trace(
+        f"max_iterations_exhausted={state['max_iterations']}; "
+        f"trace_steps={len(state['tool_trace'])}"
+    )
 
     return {
         "tool_trace": state["tool_trace"],
