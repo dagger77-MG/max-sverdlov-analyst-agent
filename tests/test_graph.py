@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app import graph
 
@@ -14,8 +14,11 @@ def patch_checkpointer(monkeypatch: pytest.MonkeyPatch):
     if hasattr(graph.get_checkpointer, "cache_clear"):
         graph.get_checkpointer.cache_clear()
 
-    if hasattr(graph.get_langchain_data_agent, "cache_clear"):
-        graph.get_langchain_data_agent.cache_clear()
+    if hasattr(graph.get_structured_tool_planner_llm, "cache_clear"):
+        graph.get_structured_tool_planner_llm.cache_clear()
+
+    if hasattr(graph.get_structured_observation_reviewer_llm, "cache_clear"):
+        graph.get_structured_observation_reviewer_llm.cache_clear()
 
     if hasattr(graph.get_structured_profile_llm, "cache_clear"):
         graph.get_structured_profile_llm.cache_clear()
@@ -35,23 +38,33 @@ class FakeProfileLLM:
         return graph.ProfileObservationDecision(observation=self.observation)
 
 
-class FakeLangChainAgent:
-    def __init__(self, result_messages):
-        self.result_messages = result_messages
-        self.received_input = None
-        self.received_config = None
+class FakePlannerLLM:
+    def __init__(self, *decisions: graph.ToolPlanDecision) -> None:
+        self.decisions = list(decisions)
+        self.received_messages = []
 
-    def invoke(self, input_data, config=None):
-        self.received_input = input_data
-        self.received_config = config
-        return {
-            "messages": self.result_messages,
-        }
+    def invoke(self, messages):
+        self.received_messages.append(messages)
+        if not self.decisions:
+            raise AssertionError("Planner received more calls than expected.")
+        return self.decisions.pop(0)
 
 
-class FailingLangChainAgent:
-    def invoke(self, input_data, config=None):
-        raise RuntimeError("Simulated agent failure.")
+class FakeReviewerLLM:
+    def __init__(self, *decisions: graph.ObservationReviewDecision) -> None:
+        self.decisions = list(decisions)
+        self.received_messages = []
+
+    def invoke(self, messages):
+        self.received_messages.append(messages)
+        if not self.decisions:
+            raise AssertionError("Reviewer received more calls than expected.")
+        return self.decisions.pop(0)
+
+
+class FailingPlannerLLM:
+    def invoke(self, messages):
+        raise RuntimeError("Simulated planner failure.")
 
 
 def _profile_result(user_id: str, profile: str = "# User Profile\n"):
@@ -65,17 +78,56 @@ def _profile_result(user_id: str, profile: str = "# User Profile\n"):
     )()
 
 
-def test_structured_query_uses_standard_langchain_agent_and_returns_trace(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        graph,
-        "route_query_with_reason",
-        lambda query: graph.RouteDecision(
-            route="structured",
-            reason="The user asks for an exact refund count.",
-        ),
+def _model_result(**values):
+    return type(
+        "ModelResult",
+        (),
+        {
+            **values,
+            "model_dump": lambda self: values,
+        },
+    )()
+
+
+def _plan_call(tool_name: str, tool_input: dict) -> graph.ToolPlanDecision:
+    return graph.ToolPlanDecision(
+        action="call_tool",
+        tool_name=tool_name,
+        tool_input=tool_input,
+        reason=f"Call {tool_name}.",
     )
+
+
+def _plan_final(answer: str) -> graph.ToolPlanDecision:
+    return graph.ToolPlanDecision(
+        action="final_answer",
+        final_answer=answer,
+        reason="The available context is sufficient.",
+    )
+
+
+def _review_answer(answer: str) -> graph.ObservationReviewDecision:
+    return graph.ObservationReviewDecision(
+        status="answered",
+        reason="The observations are sufficient.",
+        final_answer=answer,
+    )
+
+
+def _review_needs_more(
+    reason: str,
+    suggested_tool_name: str,
+    suggested_tool_input: dict,
+) -> graph.ObservationReviewDecision:
+    return graph.ObservationReviewDecision(
+        status="needs_more",
+        reason=reason,
+        suggested_tool_name=suggested_tool_name,
+        suggested_tool_input=suggested_tool_input,
+    )
+
+
+def _patch_common_graph_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
@@ -90,38 +142,40 @@ def test_structured_query_uses_standard_langchain_agent_and_returns_trace(
         lambda: FakeProfileLLM(),
     )
 
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_filter",
-                        "name": "filter_rows",
-                        "args": {"category": "REFUND"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "row_ids": [1, 2, 3],
-                        "match_count": 3,
-                        "applied_filters": {
-                            "category": "REFUND",
-                            "intent": None,
-                            "text_query": None,
-                            "limit": None,
-                        },
-                    }
-                ),
-                name="filter_rows",
-                tool_call_id="call_filter",
-            ),
-            AIMessage(content="There are 3 refund rows in the dataset."),
-        ]
+
+def test_structured_query_uses_planner_executor_reviewer_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for an exact refund count.",
+        ),
     )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        graph,
+        "filter_rows_impl",
+        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
+            row_ids=[1, 2, 3],
+            match_count=3,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "limit": limit,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(_plan_call("filter_rows", {"category": "REFUND"}))
+    reviewer = FakeReviewerLLM(_review_answer("There are 3 refund rows in the dataset."))
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="How many refund requests did we get?",
@@ -147,11 +201,10 @@ def test_structured_query_uses_standard_langchain_agent_and_returns_trace(
         "row_ids": [1, 2, 3],
     }
     assert isinstance(result["messages"][-1], AIMessage)
-    assert fake_agent.received_config == {"recursion_limit": result["max_iterations"] + 5}
 
 
-def test_assignment_question_categories_exist_uses_group_counts(
-    monkeypatch,
+def test_assignment_question_categories_exist_reviewer_rejects_schema_sample_then_uses_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         graph,
@@ -161,47 +214,51 @@ def test_assignment_question_categories_exist_uses_group_counts(
             reason="The user asks which categories exist in the dataset.",
         ),
     )
+    _patch_common_graph_dependencies(monkeypatch)
+
     monkeypatch.setattr(
         graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
+        "get_dataset_schema_impl",
+        lambda include_sample_values=True: _model_result(
+            columns=["row_id", "instruction", "category", "intent", "response"],
+            row_count=26872,
+            sample_values={
+                "category": ["ORDER", "SHIPPING", "CANCEL", "INVOICE", "PAYMENT"],
+            },
+        ),
     )
     monkeypatch.setattr(
         graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
+        "group_counts_impl",
+        lambda group_by, row_ids=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "ORDER", "count": 5000},
+                {"label": "SHIPPING", "count": 4200},
+                {"label": "ACCOUNT", "count": 3000},
+                {"label": "DELIVERY", "count": 2500},
+                {"label": "SUBSCRIPTION", "count": 2000},
+            ],
+        ),
     )
 
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_group",
-                        "name": "group_counts",
-                        "args": {"group_by": "category", "top_k": 100},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "group_by": "category",
-                        "counts": [
-                            {"label": "REFUND", "count": 842},
-                            {"label": "SHIPPING", "count": 420},
-                            {"label": "ACCOUNT", "count": 300},
-                        ],
-                    }
-                ),
-                name="group_counts",
-                tool_call_id="call_group",
-            ),
-            AIMessage(content="The dataset categories include REFUND, SHIPPING, and ACCOUNT."),
-        ]
+    planner = FakePlannerLLM(
+        _plan_call("get_dataset_schema", {"include_sample_values": True}),
+        _plan_call("group_counts", {"group_by": "category", "top_k": 100}),
     )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="Schema sample_values are not the complete distinct category set.",
+            suggested_tool_name="group_counts",
+            suggested_tool_input={"group_by": "category", "top_k": 100},
+        ),
+        _review_answer(
+            "The dataset categories are ORDER, SHIPPING, ACCOUNT, DELIVERY, and SUBSCRIPTION."
+        ),
+    )
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="What categories exist in the dataset?",
@@ -211,17 +268,20 @@ def test_assignment_question_categories_exist_uses_group_counts(
 
     assert result["route"] == "structured"
     assert result["final_answer"] == (
-        "The dataset categories include REFUND, SHIPPING, and ACCOUNT."
+        "The dataset categories are ORDER, SHIPPING, ACCOUNT, DELIVERY, and SUBSCRIPTION."
     )
-    assert [step["tool_name"] for step in result["tool_trace"]] == ["group_counts"]
-    assert result["tool_trace"][0]["tool_input"] == {
+    assert [step["tool_name"] for step in result["tool_trace"]] == [
+        "get_dataset_schema",
+        "group_counts",
+    ]
+    assert result["tool_trace"][1]["tool_input"] == {
         "group_by": "category",
         "top_k": 100,
     }
 
 
-def test_assignment_question_shipping_examples_uses_filter_then_sample(
-    monkeypatch,
+def test_assignment_question_shipping_examples_filters_then_samples(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         graph,
@@ -231,81 +291,70 @@ def test_assignment_question_shipping_examples_uses_filter_then_sample(
             reason="The user asks for examples from a dataset category.",
         ),
     )
+    _patch_common_graph_dependencies(monkeypatch)
+
     monkeypatch.setattr(
         graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
+        "filter_rows_impl",
+        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
+            row_ids=[20, 21, 22, 23, 24, 25],
+            match_count=6,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "limit": limit,
+            },
+        ),
     )
 
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_filter",
-                        "name": "filter_rows",
-                        "args": {"category": "SHIPPING"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "row_ids": [20, 21, 22, 23, 24, 25],
-                        "match_count": 6,
-                        "applied_filters": {
+    monkeypatch.setattr(
+        graph,
+        "sample_examples_impl",
+        lambda row_ids=None, n=3, offset=0: type(
+            "SampleExamplesResult",
+            (),
+            {
+                "examples": [
+                    type(
+                        "ExampleRow",
+                        (),
+                        {
+                            "row_id": 20,
+                            "instruction": "Where is my package?",
+                            "response": "You can track it from your account.",
                             "category": "SHIPPING",
-                            "intent": None,
-                            "text_query": None,
-                            "limit": None,
+                            "intent": "track_order",
                         },
-                    }
-                ),
-                name="filter_rows",
-                tool_call_id="call_filter",
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_sample",
-                        "name": "sample_examples",
-                        "args": {
-                            "row_ids": [20, 21, 22, 23, 24, 25],
-                            "n": 5,
-                            "offset": 0,
-                        },
-                    }
+                    )()
                 ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "examples": [
-                            {
-                                "row_id": 20,
-                                "instruction": "Where is my package?",
-                                "response": "You can track it from your account.",
-                                "category": "SHIPPING",
-                                "intent": "track_order",
-                            }
-                        ],
-                        "next_offset": 5,
-                    }
-                ),
-                name="sample_examples",
-                tool_call_id="call_sample",
-            ),
-            AIMessage(content="Here are 5 SHIPPING examples from the dataset."),
-        ]
+                "next_offset": 5,
+            },
+        )(),
     )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
+
+    planner = FakePlannerLLM(
+        _plan_call("filter_rows", {"category": "SHIPPING"}),
+        _plan_call(
+            "sample_examples",
+            {"row_ids": [20, 21, 22, 23, 24, 25], "n": 5, "offset": 0},
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="Examples require sample_examples output.",
+            suggested_tool_name="sample_examples",
+            suggested_tool_input={
+                "row_ids": [20, 21, 22, 23, 24, 25],
+                "n": 5,
+                "offset": 0,
+            },
+        ),
+        _review_answer("Here are 5 SHIPPING examples from the dataset."),
+    )
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="Show me 5 examples of the SHIPPING category.",
@@ -333,7 +382,7 @@ def test_assignment_question_shipping_examples_uses_filter_then_sample(
 
 
 def test_assignment_question_account_intent_distribution_filters_then_groups(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         graph,
@@ -343,76 +392,62 @@ def test_assignment_question_account_intent_distribution_filters_then_groups(
             reason="The user asks for intent distribution within a category.",
         ),
     )
+    _patch_common_graph_dependencies(monkeypatch)
+
     monkeypatch.setattr(
         graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
+        "filter_rows_impl",
+        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
+            row_ids=[30, 31, 32],
+            match_count=3,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "limit": limit,
+            },
+        ),
     )
     monkeypatch.setattr(
         graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
+        "group_counts_impl",
+        lambda group_by, row_ids=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "recover_password", "count": 2},
+                {"label": "delete_account", "count": 1},
+            ],
+        ),
     )
 
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_filter",
-                        "name": "filter_rows",
-                        "args": {"category": "ACCOUNT"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "row_ids": [30, 31, 32],
-                        "match_count": 3,
-                        "applied_filters": {
-                            "category": "ACCOUNT",
-                            "intent": None,
-                            "text_query": None,
-                            "limit": None,
-                        },
-                    }
-                ),
-                name="filter_rows",
-                tool_call_id="call_filter",
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_group",
-                        "name": "group_counts",
-                        "args": {
-                            "group_by": "intent",
-                            "row_ids": [30, 31, 32],
-                            "top_k": 20,
-                        },
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "group_by": "intent",
-                        "counts": [
-                            {"label": "recover_password", "count": 2},
-                            {"label": "delete_account", "count": 1},
-                        ],
-                    }
-                ),
-                name="group_counts",
-                tool_call_id="call_group",
-            ),
-            AIMessage(content="In ACCOUNT, recover_password appears 2 times and delete_account appears once."),
-        ]
+    planner = FakePlannerLLM(
+        _plan_call("filter_rows", {"category": "ACCOUNT"}),
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "intent",
+                "row_ids": [30, 31, 32],
+                "top_k": 20,
+            },
+        ),
     )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="Intent distribution requires grouping filtered ACCOUNT rows.",
+            suggested_tool_name="group_counts",
+            suggested_tool_input={
+                "group_by": "intent",
+                "row_ids": [30, 31, 32],
+                "top_k": 20,
+            },
+        ),
+        _review_answer(
+            "In ACCOUNT, recover_password appears 2 times and delete_account appears once."
+        ),
+    )
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="What is the distribution of intents in the ACCOUNT category?",
@@ -433,113 +468,9 @@ def test_assignment_question_account_intent_distribution_filters_then_groups(
     }
 
 
-def test_assignment_question_money_back_alias_uses_refund_filter_then_sample(
-    monkeypatch,
+def test_unstructured_query_filters_then_summarizes(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        graph,
-        "route_query_with_reason",
-        lambda query: graph.RouteDecision(
-            route="structured",
-            reason="The user asks for refund-related examples using a natural-language alias.",
-        ),
-    )
-    monkeypatch.setattr(
-        graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
-    )
-
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_filter",
-                        "name": "filter_rows",
-                        "args": {"category": "money back"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "row_ids": [40, 41, 42],
-                        "match_count": 3,
-                        "applied_filters": {
-                            "category": "money back",
-                            "intent": None,
-                            "text_query": None,
-                            "limit": None,
-                        },
-                    }
-                ),
-                name="filter_rows",
-                tool_call_id="call_filter",
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_sample",
-                        "name": "sample_examples",
-                        "args": {
-                            "row_ids": [40, 41, 42],
-                            "n": 3,
-                            "offset": 0,
-                        },
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "examples": [
-                            {
-                                "row_id": 40,
-                                "instruction": "I want my money back.",
-                                "response": "You can request a refund through your account.",
-                                "category": "REFUND",
-                                "intent": "get_refund",
-                            }
-                        ],
-                        "next_offset": 3,
-                    }
-                ),
-                name="sample_examples",
-                tool_call_id="call_sample",
-            ),
-            AIMessage(content="Here are refund-related examples for people wanting their money back."),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
-
-    result = graph.invoke_agent(
-        query="Show me examples of people wanting their money back.",
-        session_id="test_session",
-        user_id="max",
-    )
-
-    assert result["route"] == "structured"
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
-        "sample_examples",
-    ]
-    assert result["tool_trace"][0]["tool_input"] == {"category": "money back"}
-    assert result["tool_trace"][1]["tool_input"] == {
-        "row_ids": [40, 41, 42],
-        "n": 3,
-        "offset": 0,
-    }
-
-
-def test_unstructured_query_uses_standard_langchain_agent_trace(monkeypatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -548,69 +479,58 @@ def test_unstructured_query_uses_standard_langchain_agent_trace(monkeypatch) -> 
             reason="The user asks for a qualitative category summary.",
         ),
     )
+    _patch_common_graph_dependencies(monkeypatch)
+
     monkeypatch.setattr(
         graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
+        "filter_rows_impl",
+        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
+            row_ids=[10, 11],
+            match_count=2,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "limit": limit,
+            },
+        ),
     )
     monkeypatch.setattr(
         graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
+        "summarize_rows_impl",
+        lambda row_ids, focus, max_examples=100: _model_result(
+            summary="Customers mainly provide product feedback.",
+            row_count_used=2,
+            focus=focus,
+        ),
     )
 
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_filter",
-                        "name": "filter_rows",
-                        "args": {"category": "FEEDBACK"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "row_ids": [10, 11],
-                        "match_count": 2,
-                        "applied_filters": {"category": "FEEDBACK"},
-                    }
-                ),
-                name="filter_rows",
-                tool_call_id="call_filter",
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_summary",
-                        "name": "summarize_rows",
-                        "args": {
-                            "row_ids": [10, 11],
-                            "focus": "Summarize the FEEDBACK category.",
-                            "max_examples": 100,
-                        },
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "summary": "Customers mainly provide product feedback.",
-                        "row_count_used": 2,
-                        "focus": "Summarize the FEEDBACK category.",
-                    }
-                ),
-                name="summarize_rows",
-                tool_call_id="call_summary",
-            ),
-            AIMessage(content="Customers mainly provide product feedback."),
-        ]
+    planner = FakePlannerLLM(
+        _plan_call("filter_rows", {"category": "FEEDBACK"}),
+        _plan_call(
+            "summarize_rows",
+            {
+                "row_ids": [10, 11],
+                "focus": "Summarize the FEEDBACK category.",
+                "max_examples": 100,
+            },
+        ),
     )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="A qualitative summary requires summarize_rows output.",
+            suggested_tool_name="summarize_rows",
+            suggested_tool_input={
+                "row_ids": [10, 11],
+                "focus": "Summarize the FEEDBACK category.",
+                "max_examples": 100,
+            },
+        ),
+        _review_answer("Customers mainly provide product feedback."),
+    )
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="Summarize the FEEDBACK category.",
@@ -628,219 +548,7 @@ def test_unstructured_query_uses_standard_langchain_agent_trace(monkeypatch) -> 
     assert result["last_structured_results"][-1]["value"] == 2
 
 
-def test_assignment_question_cancellation_response_summary_uses_selected_rows(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        graph,
-        "route_query_with_reason",
-        lambda query: graph.RouteDecision(
-            route="unstructured",
-            reason="The user asks for qualitative analysis of cancellation requests.",
-        ),
-    )
-    monkeypatch.setattr(
-        graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
-    )
-
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_filter",
-                        "name": "filter_rows",
-                        "args": {"text_query": "cancellation"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "row_ids": [50, 51],
-                        "match_count": 2,
-                        "applied_filters": {
-                            "category": None,
-                            "intent": None,
-                            "text_query": "cancellation",
-                            "limit": None,
-                        },
-                    }
-                ),
-                name="filter_rows",
-                tool_call_id="call_filter",
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_summary",
-                        "name": "summarize_rows",
-                        "args": {
-                            "row_ids": [50, 51],
-                            "focus": (
-                                "How do customer service representatives typically "
-                                "respond to cancellation requests?"
-                            ),
-                            "max_examples": 100,
-                        },
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "summary": "Agents usually acknowledge the cancellation request and explain the required account steps.",
-                        "row_count_used": 2,
-                        "focus": "cancellation response patterns",
-                    }
-                ),
-                name="summarize_rows",
-                tool_call_id="call_summary",
-            ),
-            AIMessage(
-                content=(
-                    "Agents usually acknowledge the cancellation request and explain "
-                    "the required account steps."
-                )
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
-
-    result = graph.invoke_agent(
-        query="How do customer service representatives typically respond to cancellation requests?",
-        session_id="test_session",
-        user_id="max",
-    )
-
-    assert result["route"] == "unstructured"
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
-        "summarize_rows",
-    ]
-    assert result["tool_trace"][0]["tool_input"] == {"text_query": "cancellation"}
-    assert result["tool_trace"][1]["tool_input"]["row_ids"] == [50, 51]
-    assert "cancellation request" in result["final_answer"]
-
-
-def test_assignment_question_complaint_intent_response_summary_uses_selected_rows(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        graph,
-        "route_query_with_reason",
-        lambda query: graph.RouteDecision(
-            route="unstructured",
-            reason="The user asks for qualitative analysis of complaint response patterns.",
-        ),
-    )
-    monkeypatch.setattr(
-        graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
-    )
-
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_filter",
-                        "name": "filter_rows",
-                        "args": {"category": "complaint"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "row_ids": [60, 61],
-                        "match_count": 2,
-                        "applied_filters": {
-                            "category": "complaint",
-                            "intent": None,
-                            "text_query": None,
-                            "limit": None,
-                        },
-                    }
-                ),
-                name="filter_rows",
-                tool_call_id="call_filter",
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call_summary",
-                        "name": "summarize_rows",
-                        "args": {
-                            "row_ids": [60, 61],
-                            "focus": "Summarize how agents respond to complaint intents.",
-                            "max_examples": 100,
-                        },
-                    }
-                ],
-            ),
-            ToolMessage(
-                content=str(
-                    {
-                        "summary": (
-                            "Agents acknowledge the complaint, ask for issue details, "
-                            "and guide the customer toward the next support step."
-                        ),
-                        "row_count_used": 2,
-                        "focus": "complaint response patterns",
-                    }
-                ),
-                name="summarize_rows",
-                tool_call_id="call_summary",
-            ),
-            AIMessage(
-                content=(
-                    "Agents acknowledge the complaint, ask for issue details, "
-                    "and guide the customer toward the next support step."
-                )
-            ),
-        ]
-    )
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
-
-    result = graph.invoke_agent(
-        query="Summarize how agents respond to complaint intents.",
-        session_id="test_session",
-        user_id="max",
-    )
-
-    assert result["route"] == "unstructured"
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
-        "summarize_rows",
-    ]
-    assert result["tool_trace"][0]["tool_input"] == {"category": "complaint"}
-    assert result["tool_trace"][1]["tool_input"] == {
-        "row_ids": [60, 61],
-        "focus": "Summarize how agents respond to complaint intents.",
-        "max_examples": 100,
-    }
-    assert "acknowledge the complaint" in result["final_answer"]
-
-
-def test_out_of_scope_query_refuses_without_data_agent(monkeypatch) -> None:
+def test_out_of_scope_query_refuses_without_planner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -849,21 +557,12 @@ def test_out_of_scope_query_refuses_without_data_agent(monkeypatch) -> None:
             reason="The user asks about external facts.",
         ),
     )
-    monkeypatch.setattr(
-        graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
-    )
+    _patch_common_graph_dependencies(monkeypatch)
 
-    def fail_if_data_agent_called():
-        raise AssertionError("Data agent should not be called for out-of-scope queries.")
+    def fail_if_planner_called():
+        raise AssertionError("Planner should not be called for out-of-scope queries.")
 
-    monkeypatch.setattr(graph, "get_langchain_data_agent", fail_if_data_agent_called)
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", fail_if_planner_called)
 
     result = graph.invoke_agent(
         query="Who won the World Cup?",
@@ -885,8 +584,8 @@ def test_out_of_scope_query_refuses_without_data_agent(monkeypatch) -> None:
         "Write me a poem about customer service.",
     ],
 )
-def test_assignment_out_of_scope_questions_refuse_without_data_agent(
-    monkeypatch,
+def test_assignment_out_of_scope_questions_refuse_without_planner(
+    monkeypatch: pytest.MonkeyPatch,
     query: str,
 ) -> None:
     monkeypatch.setattr(
@@ -897,21 +596,12 @@ def test_assignment_out_of_scope_questions_refuse_without_data_agent(
             reason="The user asks an out-of-scope question.",
         ),
     )
-    monkeypatch.setattr(
-        graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
-    )
+    _patch_common_graph_dependencies(monkeypatch)
 
-    def fail_if_data_agent_called():
-        raise AssertionError("Data agent should not be called for out-of-scope queries.")
+    def fail_if_planner_called():
+        raise AssertionError("Planner should not be called for out-of-scope queries.")
 
-    monkeypatch.setattr(graph, "get_langchain_data_agent", fail_if_data_agent_called)
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", fail_if_planner_called)
 
     result = graph.invoke_agent(
         query=query,
@@ -924,7 +614,7 @@ def test_assignment_out_of_scope_questions_refuse_without_data_agent(
     assert result["tool_trace"] == []
 
 
-def test_standard_agent_failure_returns_graceful_fallback(monkeypatch) -> None:
+def test_planner_failure_returns_graceful_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -933,20 +623,11 @@ def test_standard_agent_failure_returns_graceful_fallback(monkeypatch) -> None:
             reason="The user asks a dataset question.",
         ),
     )
+    _patch_common_graph_dependencies(monkeypatch)
     monkeypatch.setattr(
         graph,
-        "read_user_profile_impl",
-        lambda user_id: _profile_result(user_id),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_structured_profile_llm",
-        lambda: FakeProfileLLM(),
-    )
-    monkeypatch.setattr(
-        graph,
-        "get_langchain_data_agent",
-        lambda: FailingLangChainAgent(),
+        "get_structured_tool_planner_llm",
+        lambda: FailingPlannerLLM(),
     )
 
     result = graph.invoke_agent(
@@ -962,7 +643,7 @@ def test_standard_agent_failure_returns_graceful_fallback(monkeypatch) -> None:
     assert result["tool_trace"] == []
 
 
-def test_profile_update_node_saves_durable_observation(monkeypatch) -> None:
+def test_profile_update_node_saves_durable_observation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -1090,7 +771,7 @@ def test_create_invocation_state_returns_partial_update_for_existing_thread() ->
     assert result["messages"][0].content == "Show me 3 more."
 
 
-def test_load_user_profile_node_returns_partial_state_update(monkeypatch) -> None:
+def test_load_user_profile_node_returns_partial_state_update(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
         "read_user_profile_impl",
@@ -1113,7 +794,7 @@ def test_load_user_profile_node_returns_partial_state_update(monkeypatch) -> Non
     }
 
 
-def test_router_node_returns_partial_state_update(monkeypatch) -> None:
+def test_router_node_returns_partial_state_update(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
         "route_query_with_reason",
@@ -1137,7 +818,7 @@ def test_router_node_returns_partial_state_update(monkeypatch) -> None:
     }
 
 
-def test_route_after_router_sends_dataset_queries_to_langchain_agent() -> None:
+def test_route_after_router_sends_dataset_queries_to_data_agent_loop() -> None:
     state = graph.create_initial_state(
         query="How many refund requests?",
         session_id="test_session",
@@ -1145,11 +826,11 @@ def test_route_after_router_sends_dataset_queries_to_langchain_agent() -> None:
     )
     state["route"] = "structured"
 
-    assert graph.route_after_router(state) == "langchain_data_agent_node"
+    assert graph.route_after_router(state) == "data_agent_loop_node"
 
     state["route"] = "unstructured"
 
-    assert graph.route_after_router(state) == "langchain_data_agent_node"
+    assert graph.route_after_router(state) == "data_agent_loop_node"
 
 
 def test_route_after_router_sends_out_of_scope_to_refusal_node() -> None:
@@ -1164,7 +845,7 @@ def test_route_after_router_sends_out_of_scope_to_refusal_node() -> None:
 
 
 def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = graph.create_initial_state(
         query="Show me 3 more.",
@@ -1241,12 +922,12 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
         ),
     )
 
-    def fail_if_agent_called():
-        raise AssertionError("The standard agent should not be called for deterministic follow-up examples.")
+    def fail_if_planner_called():
+        raise AssertionError("Planner should not be called for deterministic follow-up examples.")
 
-    monkeypatch.setattr(graph, "get_langchain_data_agent", fail_if_agent_called)
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", fail_if_planner_called)
 
-    result = graph.langchain_data_agent_node(state)
+    result = graph.data_agent_loop_node(state)
 
     assert captured_inputs == [
         {
@@ -1267,8 +948,8 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
     }
 
 
-def test_total_of_last_two_follow_up_goes_to_standard_agent_with_context(
-    monkeypatch,
+def test_total_of_last_two_follow_up_goes_to_planner_with_context(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = graph.create_initial_state(
         query="What is the total count of the last two?",
@@ -1293,16 +974,15 @@ def test_total_of_last_two_follow_up_goes_to_standard_agent_with_context(
         },
     ]
 
-    fake_agent = FakeLangChainAgent(
-        [
-            AIMessage(content="The total count of the last two results is 1,356."),
-        ]
+    planner = FakePlannerLLM(
+        _plan_final("The total count of the last two results is 1,356.")
     )
 
-    monkeypatch.setattr(graph, "get_langchain_data_agent", lambda: fake_agent)
-    result = graph.langchain_data_agent_node(state)
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
 
-    context_message = fake_agent.received_input["messages"][0].content
+    result = graph.data_agent_loop_node(state)
+
+    context_message = planner.received_messages[0][1].content
 
     assert "complaints" in context_message
     assert "514" in context_message
@@ -1311,7 +991,7 @@ def test_total_of_last_two_follow_up_goes_to_standard_agent_with_context(
     assert result["final_answer"] == "The total count of the last two results is 1,356."
 
 
-def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> None:
+def test_sample_examples_trace_includes_full_example_details(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
         "sample_examples_impl",
@@ -1349,118 +1029,6 @@ def test_sample_examples_trace_includes_full_example_details(monkeypatch) -> Non
     assert "intent=check_refund_status" in observation
     assert "customer_instruction=Where is my refund?" in observation
     assert "support_response=You can check your refund status in your account." in observation
-
-
-def test_extract_langchain_tool_trace_and_results_for_count_rows() -> None:
-    messages = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "id": "call_count",
-                    "name": "count_rows",
-                    "args": {"row_ids": [1, 2, 3]},
-                }
-            ],
-        ),
-        ToolMessage(
-            content=str({"count": 3}),
-            name="count_rows",
-            tool_call_id="call_count",
-        ),
-        AIMessage(content="There are 3 rows."),
-    ]
-
-    trace, structured_results = graph._extract_langchain_tool_trace_and_results(messages)
-
-    assert trace == [
-        {
-            "tool_name": "count_rows",
-            "tool_input": {"row_ids": [1, 2, 3]},
-            "observation": "{'count': 3}",
-        }
-    ]
-    assert structured_results == [
-        {
-            "label": "count_rows",
-            "value": 3,
-            "query_type": "count",
-            "row_ids": [1, 2, 3],
-        }
-    ]
-
-
-def test_extract_langchain_tool_trace_and_results_for_sample_examples() -> None:
-    messages = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "id": "call_sample",
-                    "name": "sample_examples",
-                    "args": {
-                        "row_ids": [10, 11, 12],
-                        "n": 2,
-                        "offset": 0,
-                    },
-                }
-            ],
-        ),
-        ToolMessage(
-            content=str(
-                {
-                    "examples": [
-                        {
-                            "row_id": 10,
-                            "instruction": "Example 1",
-                            "response": "Response 1",
-                            "category": "REFUND",
-                            "intent": "get_refund",
-                        }
-                    ],
-                    "next_offset": 1,
-                }
-            ),
-            name="sample_examples",
-            tool_call_id="call_sample",
-        ),
-        AIMessage(content="Here is one example."),
-    ]
-
-    trace, structured_results = graph._extract_langchain_tool_trace_and_results(messages)
-
-    assert trace[0]["tool_name"] == "sample_examples"
-    assert structured_results == [
-        {
-            "label": "sample_examples",
-            "value": 1,
-            "query_type": "sample",
-            "row_ids": [10, 11, 12],
-        }
-    ]
-
-
-def test_extract_final_answer_skips_ai_messages_with_tool_calls() -> None:
-    messages = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "id": "call_filter",
-                    "name": "filter_rows",
-                    "args": {"category": "REFUND"},
-                }
-            ],
-        ),
-        ToolMessage(
-            content=str({"row_ids": [1], "match_count": 1}),
-            name="filter_rows",
-            tool_call_id="call_filter",
-        ),
-        AIMessage(content="There is 1 refund row."),
-    ]
-
-    assert graph._extract_final_answer(messages) == "There is 1 refund row."
 
 
 def test_create_invocation_state_falls_back_to_initial_state_when_checkpoint_read_fails() -> None:

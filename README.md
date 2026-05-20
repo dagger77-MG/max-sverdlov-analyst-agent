@@ -6,7 +6,7 @@ The agent can answer structured analytical questions and qualitative dataset que
 
 ## Features
 
-- LangGraph workflow with LangChain's standard agent runtime for tool orchestration
+- LangGraph workflow with a graph-owned planner → tool executor → observation reviewer loop
 - LLM-based query router
 - SQLite-backed LangGraph checkpoint persistence for conversation state
 - Structured dataset tools
@@ -127,8 +127,8 @@ All LLM calls use Nebius Token Factory through the OpenAI-compatible API. No non
   - Used for structured route classification into `structured`, `unstructured`, or `out_of_scope`.
   - Chosen because routing is a short, low-temperature classification task that benefits from a smaller/faster model.
 - Main data-analysis agent model: `Qwen/Qwen3-235B-A22B-Instruct-2507`
-  - Used by the LangChain standard agent runtime for ReAct-style tool selection, multi-step dataset analysis, and final answer generation.
-  - Chosen because the main agent needs stronger instruction following and more reliable tool-use reasoning.
+  - Used by the graph-owned planner and observation reviewer nodes for tool selection, answer-readiness checks, and grounded final answer generation.
+  - Chosen because the main agent needs stronger instruction following, reliable tool-use planning, and careful observation review.
 - Summarizer model: `Qwen/Qwen3-235B-A22B-Instruct-2507`
   - Used by `summarize_rows` when LLM summarization is available. The same larger model is used because qualitative summaries must stay grounded in selected dataset rows and follow the dataset-only scope rule.
 
@@ -357,7 +357,7 @@ router_node
  ┌────────────────────────────┬────────────────────────┐
  │ structured/unstructured     │ out_of_scope            │
  ↓                            ↓
-langchain_data_agent_node      refusal_node
+data_agent_loop_node           refusal_node
   ↓                       ↓
 profile_update_node       profile_update_node
   ↓                       ↓
@@ -372,7 +372,7 @@ unstructured
 out_of_scope
 ```
 
-Both `structured` and `unstructured` dataset queries go to the same standard LangChain data-agent node.
+Both `structured` and `unstructured` dataset queries go to the same graph-owned data-agent loop node.
 
 The data-agent node receives compact graph context:
 
@@ -380,8 +380,24 @@ The data-agent node receives compact graph context:
 - route reason
 - saved user profile
 - recent structured results used for follow-up questions
+- current-turn tool trace
+- reviewer feedback from the previous loop step, when available 
 
-The standard LangChain agent is responsible for ordinary dataset tool orchestration:
+The graph-owned loop runs this cycle:
+
+```text
+planner LLM
+  ↓
+tool executor
+  ↓
+observation reviewer LLM
+  ├── answered/cannot_answer → final answer
+  └── needs_more → planner LLM
+```
+
+The planner chooses the next tool or decides that existing context is already enough for a final answer. The executor safely calls exactly one selected tool. The reviewer checks whether the latest observations fully answer the user's exact question before the graph allows a final answer.
+
+The data-agent loop can execute:
 
 - `filter_rows`
 - `count_rows`
@@ -391,20 +407,22 @@ The standard LangChain agent is responsible for ordinary dataset tool orchestrat
 - `get_dataset_schema`
 - `read_user_profile`
 
-### Standard Agent Runtime Note
+### Graph-Owned Agent Loop Note
 
-The project uses LangChain's standard `create_agent` runtime inside a LangGraph workflow.
+The project uses a custom LangGraph loop instead of delegating the full ReAct cycle to LangChain's standard `create_agent` runtime.
 
-This avoids maintaining a custom manual ReAct loop in `graph.py`. LangChain handles normal tool-use orchestration, while custom LangGraph nodes keep the deterministic behavior that is valuable for this project:
+The goal is to keep the system agentic while making the evidence check explicit. The LLM still chooses tools and reviews observations, but the graph controls the loop boundaries:
 
-- query routing before the agent runs
-- scoped refusal for out-of-scope questions
-- user profile loading and update
-- checkpointed follow-up state
-- deterministic handling for high-risk follow-ups such as `Show me 3 more.`
-- visible reasoning trace extraction from LangChain tool calls and tool messages
+- route before any dataset tool use
+- execute one planned tool at a time
+- review each observation for answer readiness
+- continue when the observation is incomplete
+- produce final answers only from reviewed observations
+- preserve checkpointed follow-up state
+- keep deterministic handling for high-risk example-pagination follow-ups such as `Show me 3 more.`
+- build visible reasoning traces directly while the graph runs
 
-This hybrid design keeps the project smaller while preserving reliability for stateful follow-up cases.
+This design prevents weak first observations, such as schema sample values, from being treated as complete evidence for questions that require full grouped values.
 
 ## Tool Reference
 
@@ -509,7 +527,7 @@ The test suite covers:
 - LLM router behavior with mocked model calls
 - LangChain tool adapters
 - persistent profile file behavior
-- graph routing, LangChain tool trace extraction, deterministic follow-ups, refusal, profile updates, checkpoint config, and fallback behavior
+- graph routing, planner/reviewer loop behavior, deterministic follow-ups, refusal, profile updates, checkpoint config, and fallback behavior
 
 ## Validation Checklist
 
@@ -528,7 +546,8 @@ What categories exist in the dataset?
 Expected:
 
 - Route: `structured`
-- Uses dataset tools, typically `group_counts` or `get_dataset_schema`
+- Uses `group_counts` with `group_by="category"`
+- Does not treat `get_dataset_schema.sample_values` as the full category list
 - Returns dataset-grounded category values only
 
 Question:
@@ -746,7 +765,7 @@ Expected:
 
 ## Known Limitations
 
-- Some follow-up behavior still depends on the standard agent correctly using recent structured results. Known high-risk example-pagination follow-ups such as "show me more examples" are handled deterministically before the LLM agent runs.
+- Some follow-up behavior still depends on the planner correctly using recent structured results. Known high-risk example-pagination follow-ups such as "show me more examples" are handled deterministically before the planner runs.
 - SQLite checkpoint persistence requires `langgraph-checkpoint-sqlite` to be installed.
-- The router and agent rely on Nebius model support for structured output through LangChain.
+- The router, planner, observation reviewer, profile updater, and summarizer rely on Nebius model support for structured output through LangChain.
 - The exact FastMCP transport URL should be verified from server startup logs.

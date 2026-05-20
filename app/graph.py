@@ -112,10 +112,10 @@ def get_agent_llm():
         base_url=settings.nebius_base_url,
         temperature=0,
         max_tokens=2056,
-        extra_body={
-            "enable_thinking": False,
-            "thinking_budget": 0,
-        },
+        # extra_body={
+        #     "enable_thinking": False,
+        #     "thinking_budget": 0,
+        # },
     )
 
 
@@ -434,6 +434,22 @@ def _format_model_dict(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
+def _format_filter_rows_observation(result) -> str:
+    """Format filter_rows output without dumping every matching row_id.
+
+    Full row IDs are preserved in last_structured_results for follow-up logic.
+    The observation only needs the exact match count, compact row-id summary,
+    and applied filters.
+    """
+    return _format_model_dict(
+        {
+            "match_count": result.match_count,
+            "row_ids": summarize_row_ids(result.row_ids),
+            "applied_filters": result.applied_filters,
+        }
+    )
+
+
 def _coerce_row_ids(value: Any) -> list[int] | None:
     """Coerce planner-supplied row IDs into integers when possible."""
     if value is None:
@@ -481,12 +497,11 @@ def _execute_selected_tool(
             text_query=normalized_input.get("text_query"),
             limit=normalized_input.get("limit"),
         )
-        result_dict = result.model_dump()
         _append_trace(
             state,
             tool_name,
             normalized_input,
-            _format_model_dict(result_dict),
+            _format_filter_rows_observation(result),
         )
         _append_structured_result(
             state,
