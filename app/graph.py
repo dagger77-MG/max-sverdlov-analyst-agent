@@ -44,6 +44,17 @@ PlannerToolName = Literal[
     "read_user_profile",
 ]
 
+VALID_PLANNER_TOOL_NAMES = {
+    "get_dataset_schema",
+    "resolve_filter_value",
+    "filter_rows",
+    "count_rows",
+    "sample_examples",
+    "group_counts",
+    "summarize_rows",
+    "read_user_profile",
+}
+
 
 class ProfileObservationDecision(BaseModel):
     """Decision about whether a durable profile observation should be saved."""
@@ -85,24 +96,35 @@ class ObservationReviewDecision(BaseModel):
 
     status: Literal["answered", "needs_more", "cannot_answer"] = Field(
         description=(
-            "answered if the trace is sufficient, needs_more if another tool call "
-            "is required, or cannot_answer if the tools cannot answer the request."
+            "answered if the trace is sufficient. "
+            "needs_more only if one specific new tool call can add missing evidence. "
+            "cannot_answer if the requested value/subset does not exist or no tool "
+            "can add useful evidence."
         )
     )
     reason: str = Field(
-        description="Brief explanation of what the observations prove or miss."
+        description=(
+            "One short sentence explaining what the observations prove or miss. "
+            "Do not include step-by-step reasoning."
+        )
     )
     final_answer: str = Field(
         default="",
-        description="Grounded final answer when status is answered or cannot_answer.",
+        description=(
+            "Concise grounded final answer when status is answered or cannot_answer. "
+            "Leave empty when status is needs_more."
+        ),
     )
     suggested_tool_name: str = Field(
         default="",
-        description="Recommended next tool when status is needs_more.",
+        description=(
+            "Required only when status is needs_more. Must be a new useful tool call, "
+            "not a repeat of an already observed call. Empty otherwise."
+        )
     )
     suggested_tool_input: dict[str, Any] = Field(
         default_factory=dict,
-        description="Recommended next tool input when status is needs_more.",
+        description="Minimal next tool input when status is needs_more; otherwise empty.",
     )
 
 
@@ -259,6 +281,10 @@ def _is_more_examples_query(query: str) -> bool:
     return bool(
         re.search(
             r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:show|give|list|display)?\s*(?:me\s+)?(?:another|next|additional)\s+\d+\b",
             normalized,
         )
     )
@@ -421,6 +447,20 @@ def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
     return "\n\n".join(lines)
 
 
+def _profile_context_for_planner(state: AgentState) -> str:
+    """Return profile context only when the user explicitly asks about memory.
+
+    The dataset planner should not see the full durable user profile by default:
+    task-specific profile pollution can bias tool planning. Profile content is
+    still available through read_user_profile when the user asks profile/memory
+    questions.
+    """
+    user_query = _latest_user_message(state["messages"]).lower()
+    if "remember" in user_query or "profile" in user_query:
+        return state["user_profile"]
+    return "Profile hidden for dataset tool planning. Use read_user_profile only for explicit profile/memory questions."
+
+
 def _build_planner_messages(
         state: AgentState,
         reviewer_feedback: str | None,
@@ -432,7 +472,7 @@ def _build_planner_messages(
 Route reason: {state["route_reason"]}
 
 User profile:
-{state["user_profile"]}
+{_profile_context_for_planner(state)}
 
 Recent structured results:
 {_structured_results_for_prompt(state["last_structured_results"])}
@@ -476,6 +516,21 @@ def _normalize_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return dict(tool_input or {})
 
 
+def _tool_call_already_exists(
+    state: AgentState,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> bool:
+    """Return True when the same tool call already exists in this turn trace."""
+    normalized_input = _normalize_tool_input(tool_input)
+
+    return any(
+        item["tool_name"] == tool_name
+        and _normalize_tool_input(item["tool_input"]) == normalized_input
+        for item in state["tool_trace"]
+    )
+
+
 def _format_model_dict(data: dict[str, Any]) -> str:
     """Format tool output as stable JSON for trace observations."""
     return json.dumps(data, ensure_ascii=False, default=str)
@@ -513,6 +568,19 @@ def _coerce_row_ids(value: Any) -> list[int] | None:
             return None
 
     return row_ids
+
+
+def _latest_filter_row_ids(state: AgentState) -> list[int] | None:
+    """Return the latest full row_id subset produced by filter_rows."""
+    for result in reversed(state["last_structured_results"]):
+        if result.get("query_type") != "filter":
+            continue
+
+        row_ids = result.get("row_ids")
+        if isinstance(row_ids, list):
+            return row_ids
+
+    return None
 
 
 def _execute_selected_tool(
@@ -615,6 +683,16 @@ def _execute_selected_tool(
 
     if tool_name == "sample_examples":
         row_ids = _coerce_row_ids(normalized_input.get("row_ids"))
+        if (
+            row_ids is None
+            and normalized_input.get("row_ids") is not None
+            and _is_example_request(_latest_user_message(state["messages"]))
+        ):
+            latest_filter_row_ids = _latest_filter_row_ids(state)
+            if latest_filter_row_ids is not None:
+                row_ids = latest_filter_row_ids
+                normalized_input["row_ids"] = row_ids
+
         n = int(normalized_input.get("n", 3))
         offset = int(normalized_input.get("offset", 0))
         observation, next_offset = _format_sample_examples_observation(
@@ -755,6 +833,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
         return deterministic_result
 
     reviewer_feedback: str | None = None
+    reviewer_requires_tool = False
 
     for iteration_index in range(state["max_iterations"]):
         iteration_number = iteration_index + 1
@@ -778,6 +857,20 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             )
 
             if plan.action == "final_answer":
+                if reviewer_requires_tool:
+                    reviewer_feedback = (
+                        "The previous reviewer decision was needs_more, so the "
+                        "current observations are not sufficient for a final answer. "
+                        "Call exactly one valid next tool. If the user-provided "
+                        "category or intent value was not resolved yet, call "
+                        "resolve_filter_value with the columns implied by the user's wording."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "blocked planner final_answer after reviewer needs_more"
+                    )
+                    continue
+
                 final_answer = plan.final_answer.strip()
                 if not final_answer:
                     reviewer_feedback = (
@@ -799,6 +892,26 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     "final_answer": final_answer,
                     "messages": [AIMessage(content=final_answer)],
                 }
+
+            if (
+                plan.action == "call_tool"
+                and _tool_call_already_exists(
+                    state=state,
+                    tool_name=plan.tool_name,
+                    tool_input=plan.tool_input,
+                )
+            ):
+                reviewer_requires_tool = False
+                reviewer_feedback = (
+                    "This exact tool call already exists in the current turn trace. "
+                    "Do not repeat it. Use the existing observation to produce a "
+                    "final answer or a cannot-answer style final answer."
+                )
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"blocked duplicate planner tool call={plan.tool_name}"
+                )
+                continue
 
             _execute_selected_tool(
                 state=state,
@@ -845,6 +958,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             )
 
             if review.status in {"answered", "cannot_answer"}:
+                reviewer_requires_tool = False
                 final_answer = review.final_answer.strip() or review.reason.strip()
                 state["final_answer"] = final_answer
                 _debug_trace(
@@ -858,7 +972,58 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     "messages": [AIMessage(content=final_answer)],
                 }
 
-            if review.status == "needs_more" and review.suggested_tool_name:
+            if review.status == "needs_more":
+                reviewer_requires_tool = True
+
+                if not review.suggested_tool_name:
+                    reviewer_feedback = (
+                        f"{review.reason}\n"
+                        "Reviewer returned needs_more but did not provide a suggested tool. "
+                        "Choose exactly one valid next tool yourself. For unresolved "
+                        "category/intent filters, use resolve_filter_value first."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "reviewer returned needs_more without suggested tool"
+                    )
+                    continue
+
+                if review.suggested_tool_name not in VALID_PLANNER_TOOL_NAMES:
+                    reviewer_requires_tool = False
+                    reviewer_feedback = (
+                        f"{review.reason}\n"
+                        f"Reviewer returned needs_more with invalid suggested_tool_name="
+                        f"{review.suggested_tool_name!r}. This is not a callable tool. "
+                        "Do not call another tool only because of this malformed reviewer "
+                        "decision. If the existing observations are enough, produce a "
+                        "final answer. If the requested subset/value does not exist, "
+                        "produce a cannot-answer style final answer."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        f"reviewer suggested invalid tool={review.suggested_tool_name!r}"
+                    )
+                    continue
+
+                if _tool_call_already_exists(
+                    state=state,
+                    tool_name=review.suggested_tool_name,
+                    tool_input=review.suggested_tool_input,
+                ):
+                    reviewer_requires_tool = False
+                    reviewer_feedback = (
+                        f"{review.reason}\n"
+                        "The reviewer suggested a tool call that already exists in "
+                        "the current turn trace. Do not repeat the same tool call. "
+                        "Use the existing observation to produce a final answer or "
+                        "a cannot-answer style final answer."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "reviewer suggested duplicate tool call"
+                    )
+                    continue
+
                 reviewer_feedback = (
                     f"{review.reason}\n"
                     f"Suggested next tool: {review.suggested_tool_name}\n"
@@ -872,6 +1037,11 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
 
         except Exception as exc:
             fallback = _fallback_answer()
+            if _debug_trace_enabled():
+                fallback = (
+                    f"{fallback}\n\n"
+                    f"Debug error: {type(exc).__name__}: {exc}"
+                )
             state["final_answer"] = fallback
             _debug_trace(
                 f"iteration {iteration_number}/{state['max_iterations']}: "
