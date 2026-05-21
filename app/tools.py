@@ -629,7 +629,10 @@ def _deterministic_rows_summary(
     )
 
 
-def _rows_to_summary_context(df) -> str:
+def _rows_to_summary_context(
+    df,
+    target_field: Literal["instruction", "response", "both"] = "both",
+) -> str:
     """Format selected rows as compact text for grounded LLM summarization."""
     lines: list[str] = []
 
@@ -640,13 +643,28 @@ def _rows_to_summary_context(df) -> str:
         instruction = "" if row["instruction"] is None else str(row["instruction"])
         response = "" if row["response"] is None else str(row["response"])
 
-        lines.append(
+        base_context = (
             f"row_id={row_id}\n"
             f"category={category}\n"
-            f"intent={intent}\n"
-            f"customer_instruction={instruction}\n"
-            f"support_response={response}"
+            f"intent={intent}"
         )
+
+        if target_field == "instruction":
+            lines.append(
+                f"{base_context}\n"
+                f"customer_instruction={instruction}"
+            )
+        elif target_field == "response":
+            lines.append(
+                f"{base_context}\n"
+                f"support_response={response}"
+            )
+        else:
+            lines.append(
+                f"{base_context}\n"
+                f"customer_instruction={instruction}\n"
+                f"support_response={response}"
+            )
 
     return "\n\n---\n\n".join(lines)
 

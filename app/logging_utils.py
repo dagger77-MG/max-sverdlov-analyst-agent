@@ -6,11 +6,14 @@ from typing import Any
 from app.state import ToolTraceItem
 
 
-def compact_tool_input(tool_input: dict[str, Any], max_list_items: int = 10) -> dict[str, Any]:
+def compact_tool_input(
+    tool_input: dict[str, Any],
+    max_list_items: int = 10,
+) -> dict[str, Any]:
     """Return a display-friendly copy of a tool input dictionary.
 
-    Large row_id lists can make CLI and Streamlit traces unreadable, so this
-    function summarizes long lists while keeping the trace useful.
+    Long lists can make CLI and Streamlit traces unreadable, so this function
+    summarizes them while keeping the trace useful.
     """
     compacted: dict[str, Any] = {}
 
@@ -68,17 +71,3 @@ def format_reasoning_trace(
         lines.append(format_trace_item(trace_item))
 
     return "\n\n".join(lines)
-
-
-def summarize_row_ids(row_ids: list[int] | None) -> str:
-    """Return a compact textual summary of row IDs for observations."""
-    if row_ids is None:
-        return "all rows"
-
-    if not row_ids:
-        return "0 row IDs"
-
-    preview = ", ".join(str(row_id) for row_id in row_ids[:5])
-    suffix = "..." if len(row_ids) > 10 else ""
-
-    return f"{len(row_ids)} row IDs [{preview}{suffix}]"
