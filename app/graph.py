@@ -11,7 +11,6 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.logging_utils import summarize_row_ids
 from app.memory import read_user_profile_impl, update_user_profile_impl
 from app.prompts import (
     OUT_OF_SCOPE_REFUSAL,
@@ -23,7 +22,6 @@ from app.router import RouteDecision, route_query_with_reason
 from app.state import AgentState, AnalysisResult, ToolTraceItem
 from app.tools import (
     count_rows_impl,
-    filter_rows_impl,
     get_dataset_schema_impl,
     group_counts_impl,
     resolve_filter_value_impl,
@@ -35,7 +33,6 @@ from app.tools import (
 PlannerToolName = Literal[
     "get_dataset_schema",
     "resolve_filter_value",
-    "filter_rows",
     "count_rows",
     "sample_examples",
     "group_counts",
@@ -46,7 +43,6 @@ PlannerToolName = Literal[
 VALID_PLANNER_TOOL_NAMES = {
     "get_dataset_schema",
     "resolve_filter_value",
-    "filter_rows",
     "count_rows",
     "sample_examples",
     "group_counts",
@@ -258,12 +254,12 @@ def _structured_results_for_prompt(results: list[AnalysisResult]) -> str:
 
     lines: list[str] = []
     for index, result in enumerate(results[-5:], start=1):
-        row_ids = result.get("row_ids")
+        filters = result.get("filters") or {}
         lines.append(
             f"{index}. label={result['label']}; "
             f"value={result['value']}; "
             f"query_type={result['query_type']}; "
-            f"row_ids={summarize_row_ids(row_ids)}"
+            f"filters={json.dumps(filters, ensure_ascii=False, default=str)}"
         )
 
     return "\n".join(lines)
@@ -412,28 +408,34 @@ def _requested_example_count(query: str, default: int = 3) -> int:
 
 def _latest_sample_context(
     results: list[AnalysisResult],
-) -> tuple[list[int], int] | None:
-    """Return previous sample row IDs and next offset for 'show more' follow-ups."""
+) -> tuple[dict[str, str | None], int] | None:
+    """Return previous sample filters and next offset for 'show more' follow-ups."""
     for result in reversed(results):
         if result.get("query_type") != "sample":
             continue
 
-        row_ids = result.get("row_ids")
+        filters = result.get("filters")
         offset = result.get("value")
 
-        if isinstance(row_ids, list) and isinstance(offset, int):
-            return row_ids, offset
+        if isinstance(filters, dict) and isinstance(offset, int):
+            return filters, offset
 
     return None
 
 
 def _format_sample_examples_observation(
-    row_ids: list[int] | None,
+    filters: dict[str, str | None],
     n: int,
     offset: int,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     """Call sample_examples and format the observation text."""
-    result = sample_examples_impl(row_ids=row_ids, n=n, offset=offset)
+    result = sample_examples_impl(
+        category=filters.get("category"),
+        intent=filters.get("intent"),
+        text_query=filters.get("text_query"),
+        n=n,
+        offset=offset,
+    )
 
     example_lines = [
         (
@@ -447,12 +449,13 @@ def _format_sample_examples_observation(
     ]
 
     observation = (
-        f"Returned {len(result.examples)} examples. "
+        f"Returned {len(result.examples)} examples from "
+        f"{result.match_count} matching rows. "
         f"Next offset = {result.next_offset}. "
         + ("\n\n" + "\n\n---\n\n".join(example_lines) if example_lines else "")
     )
 
-    return observation, result.next_offset
+    return observation, result.next_offset, result.match_count
 
 
 def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
@@ -466,17 +469,17 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     if sample_context is None:
         return None
 
-    row_ids, offset = sample_context
+    filters, offset = sample_context
     n = _requested_example_count(user_query)
 
-    observation, next_offset = _format_sample_examples_observation(
-        row_ids=row_ids,
+    observation, next_offset, match_count = _format_sample_examples_observation(
+        filters=filters,
         n=n,
         offset=offset,
     )
 
     tool_input = {
-        "row_ids": row_ids,
+        **filters,
         "n": n,
         "offset": offset,
     }
@@ -487,7 +490,8 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
             label="sample_examples",
             value=next_offset,
             query_type="sample",
-            row_ids=row_ids,
+            filters=filters,
+            match_count=match_count,
         ),
     )
 
@@ -502,19 +506,8 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
 
 
 def _compact_tool_input_for_prompt(tool_input: dict[str, Any]) -> dict[str, Any]:
-    """Return tool input without exposing long row_id lists to the LLM."""
-    compacted = dict(tool_input)
-    row_ids = compacted.get("row_ids")
-
-    if isinstance(row_ids, list):
-        compacted["row_ids_summary"] = summarize_row_ids(row_ids)
-        compacted["row_ids_access_note"] = (
-            "Do not copy preview IDs. Use scope='latest_filter' when operating "
-            "on the latest filtered subset."
-        )
-        del compacted["row_ids"]
-
-    return compacted
+    """Return a prompt-safe copy of a tool input dictionary."""
+    return dict(tool_input)
 
 
 def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
@@ -610,32 +603,13 @@ def _tool_call_already_exists(
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> bool:
-    """Return True when the same tool call already exists in this turn trace.
-    A call with scope='latest_filter' is only a duplicate if it happened after
-    the latest current-turn filter_rows call. The same raw scope can point to a
-    different subset after a new filter_rows call.
-    """
+    """Return True when the same tool call already exists in this turn trace."""
     normalized_input = _normalize_tool_input(tool_input)
-    latest_filter_index = _latest_current_turn_filter_index(state)
-    uses_latest_filter_scope = normalized_input.get("scope") in {
-        "latest_filter",
-        "latest_filtered_subset",
-    }
-
-    for index, item in enumerate(state["tool_trace"]):
-        if item["tool_name"] != tool_name:
-            continue
-        if _normalize_tool_input(item["tool_input"]) != normalized_input:
-            continue
-        if (
-            uses_latest_filter_scope
-            and latest_filter_index is not None
-            and index < latest_filter_index
-        ):
-            continue
-        return True
-
-    return False
+    return any(
+        item["tool_name"] == tool_name
+        and _normalize_tool_input(item["tool_input"]) == normalized_input
+        for item in state["tool_trace"]
+    )
 
 
 def _format_model_dict(data: dict[str, Any]) -> str:
@@ -643,134 +617,13 @@ def _format_model_dict(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-def _format_filter_rows_observation(result) -> str:
-    """Format filter_rows output without dumping every matching row_id.
-
-    Full row IDs are preserved in last_structured_results for follow-up logic.
-    The observation only needs the exact match count, compact row-id summary,
-    and applied filters.
-    """
-    return _format_model_dict(
-        {
-            "match_count": result.match_count,
-            "row_ids_summary": summarize_row_ids(result.row_ids),
-            "row_ids_access_note": (
-                "Full row IDs are stored in graph state. Use "
-                "scope='latest_filter' for the latest filtered subset."
-            ),
-            "applied_filters": result.applied_filters,
-        }
-    )
-
-
-def _coerce_row_ids(value: Any) -> list[int] | None:
-    """Coerce planner-supplied row IDs into integers or reject invalid values."""
-    if value is None:
-        return None
-
-    if not isinstance(value, list):
-        raise ValueError(
-            "row_ids must be a list of integer row IDs or null; "
-            f"got {type(value).__name__}."
-        )
-
-    row_ids: list[int] = []
-    for item in value:
-        try:
-            row_ids.append(int(item))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "row_ids must contain only integer-compatible values; "
-                f"got {item!r}."
-            ) from exc
-
-    return row_ids
-
-
-def _resolve_row_ids_from_tool_input(
-    state: AgentState,
-    normalized_input: dict[str, Any],
-) -> list[int] | None:
-    """Resolve row_ids or the controlled latest-filter scope reference."""
-    scope = normalized_input.get("scope")
-    if scope in {"latest_filter", "latest_filtered_subset"}:
-        row_ids = _latest_filter_row_ids(state)
-        if row_ids is None:
-            raise ValueError(
-                "scope='latest_filter' was requested, but no filtered subset "
-                "exists in recent structured results."
-            )
-        normalized_input["row_ids"] = row_ids
-        return row_ids
-
-    return _coerce_row_ids(normalized_input.get("row_ids"))
-
-
-def _latest_filter_row_ids(state: AgentState) -> list[int] | None:
-    """Return the latest full row_id subset produced by filter_rows."""
-    for result in reversed(state["last_structured_results"]):
-        if result.get("query_type") != "filter":
-            continue
-
-        row_ids = result.get("row_ids")
-        if isinstance(row_ids, list):
-            return row_ids
-
-    return None
-
-
-def _latest_current_turn_filter_index(state: AgentState) -> int | None:
-    """Return the latest non-error filter_rows index in the current turn trace."""
-    for index in range(len(state["tool_trace"]) - 1, -1, -1):
-        item = state["tool_trace"][index]
-        if item["tool_name"] != "filter_rows":
-            continue
-        if _trace_observation_is_error(item["observation"]):
-            continue
-        return index
-
-    return None
-
-
-def _latest_current_turn_filter_row_ids(state: AgentState) -> list[int] | None:
-    """Return latest-filter row IDs only after filter_rows ran this turn."""
-    if _latest_current_turn_filter_index(state) is None:
-        return None
-
-    return _latest_filter_row_ids(state)
-
-
-def _resolve_scoped_group_count_row_ids(
-    state: AgentState,
-    normalized_input: dict[str, Any],
-    group_by: str,
-) -> list[int] | None:
-    """Resolve row IDs for group_counts while preventing stale latest_filter use."""
-    user_query = _latest_user_message(state["messages"])
-    needs_filtered_scope = _requires_grouped_filtered_scope(user_query, group_by)
-    scope = normalized_input.get("scope")
-
-    if scope in {"latest_filter", "latest_filtered_subset"}:
-        if needs_filtered_scope:
-            row_ids = _latest_current_turn_filter_row_ids(state)
-            if row_ids is None:
-                raise ValueError(
-                    "scope='latest_filter' was requested for a scoped distribution, "
-                    "but filter_rows has not created a filtered subset in the "
-                    "current turn."
-                )
-        else:
-            row_ids = _latest_filter_row_ids(state)
-            if row_ids is None:
-                raise ValueError(
-                    "scope='latest_filter' was requested, but no filtered subset "
-                    "exists in recent structured results."
-                )
-
-        normalized_input["row_ids"] = row_ids
-        return row_ids
-
-    return _coerce_row_ids(normalized_input.get("row_ids"))
+def _tool_filters(normalized_input: dict[str, Any]) -> dict[str, str | None]:
+    """Extract dataset filters from a planner-supplied tool input."""
+    return {
+        "category": normalized_input.get("category"),
+        "intent": normalized_input.get("intent"),
+        "text_query": normalized_input.get("text_query"),
+    }
 
 
 def _execute_selected_tool(
@@ -813,65 +666,15 @@ def _execute_selected_tool(
                 label=f"resolve_filter_value:{result.query}",
                 value=result.confidence,
                 query_type="resolve_filter_value",
-                row_ids=None,
-            ),
-        )
-        return
-
-    if tool_name == "filter_rows":
-        if (
-            normalized_input.get("limit") is not None
-            and _is_example_request(_latest_user_message(state["messages"]))
-        ):
-            normalized_input = {
-                **normalized_input,
-                "limit": None,
-            }
-
-        result = filter_rows_impl(
-            category=normalized_input.get("category"),
-            intent=normalized_input.get("intent"),
-            text_query=normalized_input.get("text_query"),
-            limit=normalized_input.get("limit"),
-        )
-        _append_trace(
-            state,
-            tool_name,
-            normalized_input,
-            _format_filter_rows_observation(result),
-        )
-        _append_structured_result(
-            state,
-            AnalysisResult(
-                label=str(result.applied_filters),
-                value=result.match_count,
-                query_type="filter",
-                row_ids=result.row_ids,
+                filters=result.recommended_filter,
+                match_count=None,
             ),
         )
         return
 
     if tool_name == "count_rows":
-        try:
-            row_ids = _resolve_scoped_group_count_row_ids(
-                state=state,
-                normalized_input=normalized_input,
-                group_by=group_by,
-            )
-        except ValueError as exc:
-            _append_tool_error(
-                state=state,
-                tool_name=tool_name,
-                tool_input=normalized_input,
-                error=str(exc),
-                required_next_step=(
-                    "Use actual row IDs from filter_rows, scope='latest_filter', "
-                    "or omit row_ids to count all rows."
-                ),
-            )
-            return
-
-        result = count_rows_impl(row_ids=row_ids)
+        filters = _tool_filters(normalized_input)
+        result = count_rows_impl(**filters)
         _append_trace(
             state,
             tool_name,
@@ -884,66 +687,35 @@ def _execute_selected_tool(
                 label="count_rows",
                 value=result.count,
                 query_type="count",
-                row_ids=row_ids,
+                filters=result.applied_filters,
+                match_count=result.count,
             ),
         )
         return
 
     if tool_name == "sample_examples":
-        try:
-            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
-        except ValueError:
-            if (
-                normalized_input.get("row_ids") is not None
-                and _is_example_request(_latest_user_message(state["messages"]))
-            ):
-                latest_filter_row_ids = _latest_filter_row_ids(state)
-                if latest_filter_row_ids is not None:
-                    row_ids = latest_filter_row_ids
-                    normalized_input["row_ids"] = row_ids
-                else:
-                    _append_tool_error(
-                        state=state,
-                        tool_name=tool_name,
-                        tool_input=normalized_input,
-                        error=(
-                            "sample_examples received invalid row_ids and no "
-                            "filtered subset exists to repair them."
-                        ),
-                        required_next_step=(
-                            "Call filter_rows first, then sample_examples with "
-                            "scope='latest_filter' or actual row IDs."
-                        ),
-                    )
-                    return
-            else:
-                _append_tool_error(
-                    state=state,
-                    tool_name=tool_name,
-                    tool_input=normalized_input,
-                    error="sample_examples received invalid row_ids.",
-                    required_next_step=(
-                        "Use actual row IDs from filter_rows, scope='latest_filter', "
-                        "or omit row_ids for all rows."
-                    ),
-                )
-                return
-
+        filters = _tool_filters(normalized_input)
         n = int(normalized_input.get("n", 3))
         offset = int(normalized_input.get("offset", 0))
-        observation, next_offset = _format_sample_examples_observation(
-            row_ids=row_ids,
+        observation, next_offset, match_count = _format_sample_examples_observation(
+            filters=filters,
             n=n,
             offset=offset,
         )
-        _append_trace(state, tool_name, normalized_input, observation)
+        _append_trace(
+            state,
+            tool_name,
+            {**filters, "n": n, "offset": offset},
+            observation,
+        )
         _append_structured_result(
             state,
             AnalysisResult(
                 label="sample_examples",
                 value=next_offset,
                 query_type="sample",
-                row_ids=row_ids,
+                filters=filters,
+                match_count=match_count,
             ),
         )
         return
@@ -955,35 +727,43 @@ def _execute_selected_tool(
                 "group_counts requires group_by='category' or group_by='intent'."
             )
 
-        try:
-            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
-        except ValueError as exc:
-            _append_tool_error(
-                state=state,
-                tool_name=tool_name,
-                tool_input=normalized_input,
-                error=str(exc),
-                required_next_step=(
-                    "For filtered distributions, call filter_rows first in the "
-                    "current turn and then call group_counts with "
-                    "scope='latest_filter'."
-                ),
-            )
-            return
-
         user_query = _latest_user_message(state["messages"])
-        if row_ids is None and _requires_grouped_filtered_scope(user_query, group_by):
+        if (
+            _requires_grouped_filtered_scope(user_query, group_by)
+            and group_by == "intent"
+            and not normalized_input.get("category")
+        ):
             _append_tool_error(
                 state=state,
                 tool_name=tool_name,
                 tool_input=normalized_input,
                 error=(
-                    "group_counts would group all rows, but the user asked for a "
-                    "distribution inside a filtered category or intent."
+                    "group_counts needs a category filter for an intent "
+                    "distribution inside a category."
                 ),
                 required_next_step=(
-                    "Resolve the requested value, call filter_rows, then call "
-                    "group_counts with scope='latest_filter' or actual row IDs."
+                    "Resolve the category value, then call group_counts with "
+                    "group_by='intent' and category=<resolved_category>."
+                ),
+            )
+            return
+
+        if (
+            _requires_grouped_filtered_scope(user_query, group_by)
+            and group_by == "category"
+            and not normalized_input.get("intent")
+        ):
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=(
+                    "group_counts needs an intent filter for a category "
+                    "distribution inside an intent."
+                ),
+                required_next_step=(
+                    "Resolve the intent value, then call group_counts with "
+                    "group_by='category' and intent=<resolved_intent>."
                 ),
             )
             return
@@ -997,10 +777,39 @@ def _execute_selected_tool(
             top_k = 20
             normalized_input["top_k"] = top_k
 
+        filters = _tool_filters(normalized_input)
         result = group_counts_impl(
             group_by=group_by,
-            row_ids=row_ids,
+            **filters,
             top_k=top_k,
+        )
+        _append_trace(
+            state,
+            tool_name,
+            {"group_by": group_by, **filters, "top_k": top_k},
+            _format_model_dict(result.model_dump()),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label=f"group_counts:{group_by}",
+                value=len(result.counts),
+                query_type="group_counts",
+                filters=result.applied_filters,
+                match_count=result.match_count,
+            ),
+        )
+        return
+
+    if tool_name == "summarize_rows":
+        filters = _tool_filters(normalized_input)
+        result = summarize_rows_impl(
+            **filters,
+            focus=str(
+                normalized_input.get("focus", _latest_user_message(state["messages"]))
+            ),
+            target_field=normalized_input.get("target_field", "both"),
+            max_examples=int(normalized_input.get("max_examples", 100)),
         )
         _append_trace(
             state,
@@ -1011,43 +820,12 @@ def _execute_selected_tool(
         _append_structured_result(
             state,
             AnalysisResult(
-                label=f"group_counts:{group_by}",
-                value=len(result.counts),
-                query_type="group_counts",
-                row_ids=row_ids,
+                label="summarize_rows",
+                value=result.row_count_used,
+                query_type="summary",
+                filters=result.applied_filters,
+                match_count=result.match_count,
             ),
-        )
-        return
-
-    if tool_name == "summarize_rows":
-        try:
-            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
-        except ValueError as exc:
-            _append_tool_error(
-                state=state,
-                tool_name=tool_name,
-                tool_input=normalized_input,
-                error=str(exc),
-                required_next_step=(
-                    "Call filter_rows first, then summarize_rows with "
-                    "scope='latest_filter' or actual row IDs."
-                ),
-            )
-            return
-
-        row_ids = row_ids or []
-        result = summarize_rows_impl(
-            row_ids=row_ids,
-            focus=str(
-                normalized_input.get("focus", _latest_user_message(state["messages"]))
-            ),
-            max_examples=int(normalized_input.get("max_examples", 100)),
-        )
-        _append_trace(
-            state,
-            tool_name,
-            normalized_input,
-            _format_model_dict(result.model_dump()),
         )
         return
 
@@ -1075,56 +853,23 @@ def _trace_observation_is_error(observation: str) -> bool:
     return isinstance(parsed, dict) and "error" in parsed
 
 
-def _has_prior_filter_trace(
-    state: AgentState,
-    max_index: int,
-    required_filter_column: str,
-) -> bool:
-    """Return True when a filter_rows call for the required column precedes a tool."""
-    for item in state["tool_trace"][:max_index]:
-        if item["tool_name"] != "filter_rows":
-            continue
-        if item["tool_input"].get(required_filter_column):
-            return True
-    return False
-
-
-def _has_valid_scoped_group_counts_trace(
+def _has_filtered_group_counts_trace(
     state: AgentState,
     group_by: str,
     required_filter_column: str,
 ) -> bool:
-    """Validate scoped distribution evidence using the existing tool trace only."""
-    for index, item in enumerate(state["tool_trace"]):
+    """Return True when group_counts ran with the required semantic filter."""
+    for item in state["tool_trace"]:
         if item["tool_name"] != "group_counts":
             continue
         if item["tool_input"].get("group_by") != group_by:
             continue
+        if not item["tool_input"].get(required_filter_column):
+            continue
         if _trace_observation_is_error(item["observation"]):
             continue
-
-        row_ids = item["tool_input"].get("row_ids")
-        if not isinstance(row_ids, list):
-            continue
-
-        if _has_prior_filter_trace(
-            state=state,
-            max_index=index,
-            required_filter_column=required_filter_column,
-        ):
-            return True
-
+        return True
     return False
-
-
-def _has_filter_trace_for_column(state: AgentState, column: str) -> bool:
-    """Return True when this turn already has a filter_rows call for column."""
-    return any(
-        item["tool_name"] == "filter_rows"
-        and bool(item["tool_input"].get(column))
-        and not _trace_observation_is_error(item["observation"])
-        for item in state["tool_trace"]
-    )
 
 
 def _has_resolver_trace_for_column(state: AgentState, column: str) -> bool:
@@ -1139,63 +884,47 @@ def _has_resolver_trace_for_column(state: AgentState, column: str) -> bool:
 
 
 def _answer_contract_error(state: AgentState) -> str | None:
-    """Block final answers for scoped distributions until the scoped group exists."""
+    """Block final answers for scoped distributions until scoped grouping exists."""
     user_query = _latest_user_message(state["messages"])
 
     if _requires_grouped_filtered_scope(user_query, group_by="intent"):
-        if _has_valid_scoped_group_counts_trace(
+        if _has_filtered_group_counts_trace(
             state=state,
             group_by="intent",
             required_filter_column="category",
         ):
             return None
 
-        if _has_filter_trace_for_column(state, "category"):
-            return (
-                "The user asked for an intent distribution inside a category. "
-                "filter_rows has created the category subset, but there is no "
-                "valid group_counts(group_by='intent') over that subset yet."
-            )
-
         if _has_resolver_trace_for_column(state, "category"):
             return (
-                "The user asked for an intent distribution inside a category. "
-                "The category has been resolved, but filter_rows has not created "
-                "the category subset yet."
+                "The category has been resolved, but group_counts has not been "
+                "called with group_by='intent' and that category filter yet."
             )
 
         return (
             "The user asked for an intent distribution inside a category. "
-            "Valid evidence requires resolving the category, filtering rows to "
-            "that category, and grouping intents over that filtered subset."
+            "Valid evidence requires resolving the category and calling "
+            "group_counts with group_by='intent' and category=<resolved_category>."
         )
 
     if _requires_grouped_filtered_scope(user_query, group_by="category"):
-        if _has_valid_scoped_group_counts_trace(
+        if _has_filtered_group_counts_trace(
             state=state,
             group_by="category",
             required_filter_column="intent",
         ):
             return None
 
-        if _has_filter_trace_for_column(state, "intent"):
-            return (
-                "The user asked for a category distribution inside an intent. "
-                "filter_rows has created the intent subset, but there is no "
-                "valid group_counts(group_by='category') over that subset yet."
-            )
-
         if _has_resolver_trace_for_column(state, "intent"):
             return (
-                "The user asked for a category distribution inside an intent. "
-                "The intent has been resolved, but filter_rows has not created "
-                "the intent subset yet."
+                "The intent has been resolved, but group_counts has not been "
+                "called with group_by='category' and that intent filter yet."
             )
 
         return (
             "The user asked for a category distribution inside an intent. "
-            "Valid evidence requires resolving the intent, filtering rows to "
-            "that intent, and grouping categories over that filtered subset."
+            "Valid evidence requires resolving the intent and calling "
+            "group_counts with group_by='category' and intent=<resolved_intent>."
         )
 
     return None
@@ -1205,9 +934,8 @@ def _build_final_answer_block_feedback(contract_error: str) -> str:
     """Convert deterministic contract validation into planner feedback."""
     return (
         f"Final answer blocked by deterministic validation: {contract_error} "
-        "Do not answer from the current observations. Call the missing tool. "
-        "For scoped grouping, use actual row IDs from filter_rows or "
-        "scope='latest_filter'."
+        "Do not answer from the current observations. Call the missing tool "
+        "with explicit semantic filters."
     )
 
 
@@ -1508,7 +1236,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     f"{review.reason}\n"
                     f"Suggested next tool: {review.suggested_tool_name}\n"
                     f"Suggested next input: "
-                    f"{json.dumps(review.suggested_tool_input, ensure_ascii=False, default=str)}"
+                    f"{json.dumps(_compact_tool_input_for_prompt(review.suggested_tool_input), ensure_ascii=False, default=str)}"
                 )
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
