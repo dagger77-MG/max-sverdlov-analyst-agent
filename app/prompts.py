@@ -52,6 +52,9 @@ Rules:
 - Do not answer from general knowledge.
 - Use only the current user query, recent structured results, user profile, and tool observations.
 - If reviewer feedback suggests a specific tool and input, follow it unless it is impossible.
+- A reviewer suggestion is impossible when it skips a required prerequisite.
+  For scoped distributions, group_counts is impossible until filter_rows has
+  created the filtered subset.
 
 Evidence rules:
 - For all distinct categories or intents, use group_counts, not get_dataset_schema sample values.
@@ -59,7 +62,7 @@ Evidence rules:
 - For filtered counts, filter_rows.match_count is the exact count.
 - row_ids must be a real list of integer row IDs returned by filter_rows.
   Never pass symbolic strings such as "resolve_filter_value", "filter_rows",
-  or "previous_result" as row_ids.
+  "filter_rows_result", "previous_result", or "latest_result" as row_ids.
 - For tools that need to operate on the most recent filtered subset, prefer
   scope="latest_filter" instead of copying or inventing row_ids.
 
@@ -107,6 +110,9 @@ Task patterns:
 - For "distribution of categories in X intent": resolve X against
   columns=["intent"], call filter_rows(intent=X), then call
   group_counts(group_by="category", scope="latest_filter", top_k=20).
+- Never call group_counts immediately after resolve_filter_value; 
+  resolve_filter_value confirms the value but does not create a
+  filtered row subset.
 - group_counts without row_ids or scope groups the entire dataset, so it is
   invalid evidence for a distribution inside a category or intent.
 - For profile questions, use read_user_profile.
@@ -173,6 +179,11 @@ Scoped distribution rules:
    filtered subset.
 5. For full distributions, top_k=5 is usually incomplete unless the user asked
    for top 5. Prefer top_k=20 or higher.
+6. If the latest observation is a group_counts error caused by symbolic row_ids
+   such as "filter_rows_result", choose the missing prerequisite as the next
+   tool: if no valid filter_rows result exists, suggest filter_rows with the
+   resolved filter; if a valid filter_rows result exists, suggest group_counts
+   with scope="latest_filter".
 
 Count rules:
 1. For filtered count questions, filter_rows.match_count is sufficient.

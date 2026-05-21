@@ -149,7 +149,7 @@ def get_agent_llm():
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         temperature=0,
-        max_tokens=2056,
+        max_tokens=settings.max_tokens,
         # extra_body={
         #     "enable_thinking": False,
         #     "thinking_budget": 0,
@@ -501,6 +501,22 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     }
 
 
+def _compact_tool_input_for_prompt(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return tool input without exposing long row_id lists to the LLM."""
+    compacted = dict(tool_input)
+    row_ids = compacted.get("row_ids")
+
+    if isinstance(row_ids, list):
+        compacted["row_ids_summary"] = summarize_row_ids(row_ids)
+        compacted["row_ids_access_note"] = (
+            "Do not copy preview IDs. Use scope='latest_filter' when operating "
+            "on the latest filtered subset."
+        )
+        del compacted["row_ids"]
+
+    return compacted
+
+
 def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
     """Format the current turn trace for planner/reviewer prompts."""
     if not tool_trace:
@@ -508,9 +524,10 @@ def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
 
     lines: list[str] = []
     for index, item in enumerate(tool_trace, start=1):
+        tool_input = _compact_tool_input_for_prompt(item["tool_input"])
         lines.append(
             f"{index}. tool={item['tool_name']}\n"
-            f"input={json.dumps(item['tool_input'], ensure_ascii=False, default=str)}\n"
+             f"input={json.dumps(tool_input, ensure_ascii=False, default=str)}\n"
             f"observation={item['observation']}"
         )
 
@@ -593,14 +610,32 @@ def _tool_call_already_exists(
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> bool:
-    """Return True when the same tool call already exists in this turn trace."""
+    """Return True when the same tool call already exists in this turn trace.
+    A call with scope='latest_filter' is only a duplicate if it happened after
+    the latest current-turn filter_rows call. The same raw scope can point to a
+    different subset after a new filter_rows call.
+    """
     normalized_input = _normalize_tool_input(tool_input)
+    latest_filter_index = _latest_current_turn_filter_index(state)
+    uses_latest_filter_scope = normalized_input.get("scope") in {
+        "latest_filter",
+        "latest_filtered_subset",
+    }
 
-    return any(
-        item["tool_name"] == tool_name
-        and _normalize_tool_input(item["tool_input"]) == normalized_input
-        for item in state["tool_trace"]
-    )
+    for index, item in enumerate(state["tool_trace"]):
+        if item["tool_name"] != tool_name:
+            continue
+        if _normalize_tool_input(item["tool_input"]) != normalized_input:
+            continue
+        if (
+            uses_latest_filter_scope
+            and latest_filter_index is not None
+            and index < latest_filter_index
+        ):
+            continue
+        return True
+
+    return False
 
 
 def _format_model_dict(data: dict[str, Any]) -> str:
@@ -618,7 +653,11 @@ def _format_filter_rows_observation(result) -> str:
     return _format_model_dict(
         {
             "match_count": result.match_count,
-            "row_ids": summarize_row_ids(result.row_ids),
+            "row_ids_summary": summarize_row_ids(result.row_ids),
+            "row_ids_access_note": (
+                "Full row IDs are stored in graph state. Use "
+                "scope='latest_filter' for the latest filtered subset."
+            ),
             "applied_filters": result.applied_filters,
         }
     )
@@ -678,6 +717,60 @@ def _latest_filter_row_ids(state: AgentState) -> list[int] | None:
             return row_ids
 
     return None
+
+
+def _latest_current_turn_filter_index(state: AgentState) -> int | None:
+    """Return the latest non-error filter_rows index in the current turn trace."""
+    for index in range(len(state["tool_trace"]) - 1, -1, -1):
+        item = state["tool_trace"][index]
+        if item["tool_name"] != "filter_rows":
+            continue
+        if _trace_observation_is_error(item["observation"]):
+            continue
+        return index
+
+    return None
+
+
+def _latest_current_turn_filter_row_ids(state: AgentState) -> list[int] | None:
+    """Return latest-filter row IDs only after filter_rows ran this turn."""
+    if _latest_current_turn_filter_index(state) is None:
+        return None
+
+    return _latest_filter_row_ids(state)
+
+
+def _resolve_scoped_group_count_row_ids(
+    state: AgentState,
+    normalized_input: dict[str, Any],
+    group_by: str,
+) -> list[int] | None:
+    """Resolve row IDs for group_counts while preventing stale latest_filter use."""
+    user_query = _latest_user_message(state["messages"])
+    needs_filtered_scope = _requires_grouped_filtered_scope(user_query, group_by)
+    scope = normalized_input.get("scope")
+
+    if scope in {"latest_filter", "latest_filtered_subset"}:
+        if needs_filtered_scope:
+            row_ids = _latest_current_turn_filter_row_ids(state)
+            if row_ids is None:
+                raise ValueError(
+                    "scope='latest_filter' was requested for a scoped distribution, "
+                    "but filter_rows has not created a filtered subset in the "
+                    "current turn."
+                )
+        else:
+            row_ids = _latest_filter_row_ids(state)
+            if row_ids is None:
+                raise ValueError(
+                    "scope='latest_filter' was requested, but no filtered subset "
+                    "exists in recent structured results."
+                )
+
+        normalized_input["row_ids"] = row_ids
+        return row_ids
+
+    return _coerce_row_ids(normalized_input.get("row_ids"))
 
 
 def _execute_selected_tool(
@@ -760,7 +853,11 @@ def _execute_selected_tool(
 
     if tool_name == "count_rows":
         try:
-            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+            row_ids = _resolve_scoped_group_count_row_ids(
+                state=state,
+                normalized_input=normalized_input,
+                group_by=group_by,
+            )
         except ValueError as exc:
             _append_tool_error(
                 state=state,
@@ -867,8 +964,9 @@ def _execute_selected_tool(
                 tool_input=normalized_input,
                 error=str(exc),
                 required_next_step=(
-                    "For filtered distributions, call filter_rows first and then "
-                    "call group_counts with scope='latest_filter' or actual row IDs."
+                    "For filtered distributions, call filter_rows first in the "
+                    "current turn and then call group_counts with "
+                    "scope='latest_filter'."
                 ),
             )
             return

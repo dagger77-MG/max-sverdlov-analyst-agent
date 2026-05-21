@@ -44,6 +44,8 @@ class AppConfig:
 
     debug_trace: bool
 
+    max_tokens: int
+
     @classmethod
     def from_env(cls) -> "AppConfig":
         project_root = Path(__file__).resolve().parents[1]
@@ -73,6 +75,7 @@ class AppConfig:
             router_model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
             agent_model = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
             debug_trace=True,
+            max_tokens=3084,
         )
 
     def ensure_runtime_dirs(self) -> None:
