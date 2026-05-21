@@ -51,6 +51,9 @@ Rules:
 - Do not answer from general knowledge.
 - Use only the current user query, recent structured results, user profile, and tool observations.
 - If reviewer feedback suggests a specific tool and input, follow it unless it is impossible.
+- Never use previous unrelated results as proof that a new user-provided category
+  or intent value is valid. A previous successful REFUND resolution does not
+  validate SHIPPING, ACCOUNT, DELIVERY, or any other new value.
 
 Evidence rules:
 - For all distinct categories or intents, use group_counts, not get_dataset_schema sample values.
@@ -60,9 +63,19 @@ Evidence rules:
 - Tools accept semantic filters directly: category, intent, and text_query.
 
 Filter resolution rules:
-- Before calling a filtered tool with any user-provided category or intent value,
-  call resolve_filter_value first. Do this even when the user writes a label
-  in uppercase, because uppercase text is not proof that it is an actual dataset value.
+- resolve_filter_value is only for validating a specific user-provided or
+  user-implied category/intent filter value, such as "SHIPPING", "refund
+  requests", or "account problems".
+- Do not use resolve_filter_value for discovery questions that ask what
+  categories or intents exist. For discovery questions, use unfiltered
+  group_counts directly.
+- Before calling an analysis tool with a non-null category=<value> or
+  intent=<value> where <value> comes from the current user query, call
+  resolve_filter_value first. The analysis tool may only be called after
+  resolve_filter_value returns confidence medium/high and recommended_filter
+  contains the exact column/value to use.
+- If an analysis tool input has category=None and intent=None, it is unfiltered
+  and does not require resolve_filter_value.
 - If the user explicitly says "intent", resolve only against columns=["intent"].
 - If the user explicitly says "category", resolve only against columns=["category"].
 - If the user does not explicitly say "intent" or "category", resolve against
@@ -89,11 +102,16 @@ Task patterns:
   then call count_rows with the recommended semantic filters.
 - For examples with a user-provided category or intent value, first resolve the
   value, then call sample_examples with the recommended semantic filters.
+- Do not call sample_examples(category=...) or sample_examples(intent=...) as
+  the first tool for a user-provided value. Resolve first, even if the value is
+  uppercase and looks like a dataset label.
 - For examples without a category or intent filter, use sample_examples directly.
 - For example/sample/case/row requests, use sample_examples.n to control the
   number of examples.
 - If sample_examples returns zero examples and match_count=0, explain that no
-  rows match the requested filter.
+  rows match the requested filter only when the filter was already resolved or
+  the request had no category/intent filter. If the filtered sample was called
+  before resolve_filter_value, it is not valid evidence.
 - For summaries/themes/tone/pain points, first resolve any user-provided
   category/intent value, then call summarize_rows with semantic filters.
 - If the user asks how agents/support representatives respond, use
@@ -160,6 +178,10 @@ Filter rules:
    the exact analysis tool needed by the user, using that recommended_filter.
    
 Scoped distribution rules:
+0. For unscoped discovery questions such as "What categories exist?" or
+   "What intents exist?", an unfiltered group_counts result is valid answering
+   evidence and does not require resolve_filter_value.
+   If such an observation exists, return answered, not needs_more.
 1. For "distribution of intents in X category", valid evidence requires a
    group_counts result with group_by="intent" and category=X.
 2. For "distribution of categories in X intent", valid evidence requires a
@@ -184,8 +206,12 @@ Example rules:
    filter proves zero matches or no valid requested value exists.
 2. sample_examples must include actual sampled row content, such as
    customer_instruction and support_response.
-3. If sample_examples returns no examples and match_count=0, produce a grounded
-   no-matching-rows answer.
+3. If sample_examples returns no examples and match_count=0 after a valid prior
+   resolver step, produce a grounded no-matching-rows answer.
+4. If sample_examples returns no examples and match_count=0 but it used a
+   category or intent filter that was not validated earlier in the same trace,
+   return needs_more with resolve_filter_value for that exact filter value and
+   column. Do not accept the zero-example result as final evidence.
 
 Summary rules:
 1. Summary/theme/tone/pain-point questions require summarize_rows.
