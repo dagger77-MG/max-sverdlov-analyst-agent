@@ -399,7 +399,7 @@ def test_schema_based_wrappers_call_implementations(
     )
 
     filter_result = tools.filter_rows(
-        tools.FilterRowsInput(category="REFUND"),
+        tools.DatasetFilterInput(category="REFUND"),
     )
     count_result = tools.count_rows(
         tools.CountRowsInput(row_ids=filter_result.row_ids),
