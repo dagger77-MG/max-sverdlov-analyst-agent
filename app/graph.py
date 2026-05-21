@@ -678,7 +678,7 @@ def _execute_selected_tool(
         _append_trace(
             state,
             tool_name,
-            normalized_input,
+            filters,
             _format_model_dict(result.model_dump()),
         )
         _append_structured_result(

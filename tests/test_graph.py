@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -90,6 +91,26 @@ def _model_result(**values):
     )()
 
 
+def _example_row(
+    row_id: int,
+    instruction: str,
+    response: str,
+    category: str,
+    intent: str,
+):
+    return type(
+        "ExampleRow",
+        (),
+        {
+            "row_id": row_id,
+            "instruction": instruction,
+            "response": response,
+            "category": category,
+            "intent": intent,
+        },
+    )()
+
+
 def _plan_call(tool_name: str, tool_input: dict) -> graph.ToolPlanDecision:
     return graph.ToolPlanDecision(
         action="call_tool",
@@ -144,67 +165,15 @@ def _patch_common_graph_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_structured_query_uses_planner_executor_reviewer_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        graph,
-        "route_query_with_reason",
-        lambda query: graph.RouteDecision(
-            route="structured",
-            reason="The user asks for an exact refund count.",
-        ),
-    )
-    _patch_common_graph_dependencies(monkeypatch)
-
-    monkeypatch.setattr(
-        graph,
-        "filter_rows_impl",
-        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
-            row_ids=[1, 2, 3],
-            match_count=3,
-            applied_filters={
-                "category": category,
-                "intent": intent,
-                "text_query": text_query,
-                "limit": limit,
-            },
-        ),
-    )
-
-    planner = FakePlannerLLM(_plan_call("filter_rows", {"category": "REFUND"}))
-    reviewer = FakeReviewerLLM(_review_answer("There are 3 refund rows in the dataset."))
-
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
-
-    result = graph.invoke_agent(
-        query="How many refund requests did we get?",
-        session_id="test_session",
-        user_id="max",
-    )
-
-    assert result["route"] == "structured"
-    assert result["final_answer"] == "There are 3 refund rows in the dataset."
-    assert [step["tool_name"] for step in result["tool_trace"]] == ["filter_rows"]
-    assert result["tool_trace"][0]["tool_input"] == {"category": "REFUND"}
-    assert result["last_structured_results"][-1] == {
-        "label": str(
-            {
-                "category": "REFUND",
-                "intent": None,
-                "text_query": None,
-                "limit": None,
-            }
-        ),
-        "value": 3,
-        "query_type": "filter",
-        "row_ids": [1, 2, 3],
-    }
-    assert isinstance(result["messages"][-1], AIMessage)
+def test_planner_tool_set_does_not_expose_filter_rows_or_row_id_workflow() -> None:
+    assert "filter_rows" not in graph.VALID_PLANNER_TOOL_NAMES
+    assert "count_rows" in graph.VALID_PLANNER_TOOL_NAMES
+    assert "sample_examples" in graph.VALID_PLANNER_TOOL_NAMES
+    assert "group_counts" in graph.VALID_PLANNER_TOOL_NAMES
+    assert "summarize_rows" in graph.VALID_PLANNER_TOOL_NAMES
 
 
-def test_refund_count_resolves_filter_value_before_filtering(
+def test_structured_query_resolves_filter_then_counts_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -238,18 +207,15 @@ def test_refund_count_resolves_filter_value_before_filtering(
             confidence="high",
         ),
     )
-
     monkeypatch.setattr(
         graph,
-        "filter_rows_impl",
-        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
-            row_ids=[5917, 5918, 5919],
-            match_count=2992,
+        "count_rows_impl",
+        lambda category=None, intent=None, text_query=None: _model_result(
+            count=2992,
             applied_filters={
                 "category": category,
                 "intent": intent,
                 "text_query": text_query,
-                "limit": limit,
             },
         ),
     )
@@ -263,12 +229,12 @@ def test_refund_count_resolves_filter_value_before_filtering(
                 "top_k": 5,
             },
         ),
-        _plan_call("filter_rows", {"category": "REFUND"}),
+        _plan_call("count_rows", {"category": "REFUND"}),
     )
     reviewer = FakeReviewerLLM(
         _review_needs_more(
-            reason="The resolver found the correct dataset filter; now filter rows.",
-            suggested_tool_name="filter_rows",
+            reason="The resolver found the correct dataset filter; now count rows.",
+            suggested_tool_name="count_rows",
             suggested_tool_input={"category": "REFUND"},
         ),
         _review_answer("There are 2,992 refund-request rows in the dataset."),
@@ -283,22 +249,32 @@ def test_refund_count_resolves_filter_value_before_filtering(
         user_id="max",
     )
 
+    assert result["route"] == "structured"
     assert result["final_answer"] == "There are 2,992 refund-request rows in the dataset."
     assert [step["tool_name"] for step in result["tool_trace"]] == [
         "resolve_filter_value",
-        "filter_rows",
+        "count_rows",
     ]
-    assert result["tool_trace"][0]["tool_input"] == {
-        "query": "refund requests",
-        "columns": ["category", "intent"],
-        "top_k": 5,
+    assert result["tool_trace"][1]["tool_input"] == {
+        "category": "REFUND",
+        "intent": None,
+        "text_query": None,
     }
-    assert result["tool_trace"][1]["tool_input"] == {"category": "REFUND"}
-    assert result["last_structured_results"][-1]["value"] == 2992
-    assert result["last_structured_results"][-1]["query_type"] == "filter"
+    assert result["last_structured_results"][-1] == {
+        "label": "count_rows",
+        "value": 2992,
+        "query_type": "count",
+        "filters": {
+            "category": "REFUND",
+            "intent": None,
+            "text_query": None,
+        },
+        "match_count": 2992,
+    }
+    assert isinstance(result["messages"][-1], AIMessage)
 
 
-def test_assignment_question_categories_exist_reviewer_rejects_schema_sample_then_uses_group_counts(
+def test_assignment_question_categories_exist_uses_group_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -325,7 +301,7 @@ def test_assignment_question_categories_exist_reviewer_rejects_schema_sample_the
     monkeypatch.setattr(
         graph,
         "group_counts_impl",
-        lambda group_by, row_ids=None, top_k=20: _model_result(
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
             group_by=group_by,
             counts=[
                 {"label": "ORDER", "count": 5000},
@@ -334,6 +310,12 @@ def test_assignment_question_categories_exist_reviewer_rejects_schema_sample_the
                 {"label": "DELIVERY", "count": 2500},
                 {"label": "SUBSCRIPTION", "count": 2000},
             ],
+            match_count=26872,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
         ),
     )
 
@@ -361,7 +343,6 @@ def test_assignment_question_categories_exist_reviewer_rejects_schema_sample_the
         user_id="max",
     )
 
-    assert result["route"] == "structured"
     assert result["final_answer"] == (
         "The dataset categories are ORDER, SHIPPING, ACCOUNT, DELIVERY, and SUBSCRIPTION."
     )
@@ -371,11 +352,14 @@ def test_assignment_question_categories_exist_reviewer_rejects_schema_sample_the
     ]
     assert result["tool_trace"][1]["tool_input"] == {
         "group_by": "category",
+        "category": None,
+        "intent": None,
+        "text_query": None,
         "top_k": 100,
     }
 
 
-def test_assignment_question_shipping_examples_filters_then_samples(
+def test_assignment_question_shipping_examples_samples_with_filters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -390,49 +374,64 @@ def test_assignment_question_shipping_examples_filters_then_samples(
 
     monkeypatch.setattr(
         graph,
-        "filter_rows_impl",
-        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
-            row_ids=[20, 21, 22, 23, 24, 25],
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "SHIPPING",
+                    "count": 6,
+                    "score": 1.0,
+                    "reason": "Exact normalized value match.",
+                }
+            ],
+            recommended_filter={
+                "category": "SHIPPING",
+                "intent": None,
+            },
+            confidence="high",
+        ),
+    )
+    monkeypatch.setattr(
+        graph,
+        "sample_examples_impl",
+        lambda category=None, intent=None, text_query=None, n=3, offset=0: _model_result(
+            examples=[
+                _example_row(
+                    row_id=20,
+                    instruction="Where is my package?",
+                    response="You can track it from your account.",
+                    category="SHIPPING",
+                    intent="track_order",
+                )
+            ],
+            next_offset=5,
             match_count=6,
             applied_filters={
                 "category": category,
                 "intent": intent,
                 "text_query": text_query,
-                "limit": limit,
             },
         ),
     )
 
-    monkeypatch.setattr(
-        graph,
-        "sample_examples_impl",
-        lambda row_ids=None, n=3, offset=0: type(
-            "SampleExamplesResult",
-            (),
-            {
-                "examples": [
-                    type(
-                        "ExampleRow",
-                        (),
-                        {
-                            "row_id": 20,
-                            "instruction": "Where is my package?",
-                            "response": "You can track it from your account.",
-                            "category": "SHIPPING",
-                            "intent": "track_order",
-                        },
-                    )()
-                ],
-                "next_offset": 5,
-            },
-        )(),
-    )
-
     planner = FakePlannerLLM(
-        _plan_call("filter_rows", {"category": "SHIPPING"}),
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "SHIPPING",
+                "columns": ["category"],
+                "top_k": 5,
+            },
+        ),
         _plan_call(
             "sample_examples",
-            {"row_ids": [20, 21, 22, 23, 24, 25], "n": 5, "offset": 0},
+            {
+                "category": "SHIPPING",
+                "n": 5,
+                "offset": 0,
+            },
         ),
     )
     reviewer = FakeReviewerLLM(
@@ -440,12 +439,11 @@ def test_assignment_question_shipping_examples_filters_then_samples(
             reason="Examples require sample_examples output.",
             suggested_tool_name="sample_examples",
             suggested_tool_input={
-                "row_ids": [20, 21, 22, 23, 24, 25],
+                "category": "SHIPPING",
                 "n": 5,
                 "offset": 0,
             },
-        ),
-        _review_answer("Here are 5 SHIPPING examples from the dataset."),
+        )
     )
 
     monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
@@ -457,14 +455,14 @@ def test_assignment_question_shipping_examples_filters_then_samples(
         user_id="max",
     )
 
-    assert result["route"] == "structured"
     assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
+        "resolve_filter_value",
         "sample_examples",
     ]
-    assert result["tool_trace"][0]["tool_input"] == {"category": "SHIPPING"}
     assert result["tool_trace"][1]["tool_input"] == {
-        "row_ids": [20, 21, 22, 23, 24, 25],
+        "category": "SHIPPING",
+        "intent": None,
+        "text_query": None,
         "n": 5,
         "offset": 0,
     }
@@ -472,11 +470,18 @@ def test_assignment_question_shipping_examples_filters_then_samples(
         "label": "sample_examples",
         "value": 5,
         "query_type": "sample",
-        "row_ids": [20, 21, 22, 23, 24, 25],
+        "filters": {
+            "category": "SHIPPING",
+            "intent": None,
+            "text_query": None,
+        },
+        "match_count": 6,
     }
+    assert "row_id=20" in result["final_answer"]
+    assert "category=SHIPPING" in result["final_answer"]
 
 
-def test_assignment_question_account_intent_distribution_filters_then_groups(
+def test_assignment_question_account_intent_distribution_groups_with_category_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -491,48 +496,68 @@ def test_assignment_question_account_intent_distribution_filters_then_groups(
 
     monkeypatch.setattr(
         graph,
-        "filter_rows_impl",
-        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
-            row_ids=[30, 31, 32],
-            match_count=3,
-            applied_filters={
-                "category": category,
-                "intent": intent,
-                "text_query": text_query,
-                "limit": limit,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "ACCOUNT",
+                    "count": 3,
+                    "score": 1.0,
+                    "reason": "Exact normalized value match.",
+                }
+            ],
+            recommended_filter={
+                "category": "ACCOUNT",
+                "intent": None,
             },
+            confidence="high",
         ),
     )
     monkeypatch.setattr(
         graph,
         "group_counts_impl",
-        lambda group_by, row_ids=None, top_k=20: _model_result(
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
             group_by=group_by,
             counts=[
                 {"label": "recover_password", "count": 2},
                 {"label": "delete_account", "count": 1},
             ],
+            match_count=3,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
         ),
     )
 
     planner = FakePlannerLLM(
-        _plan_call("filter_rows", {"category": "ACCOUNT"}),
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "ACCOUNT",
+                "columns": ["category"],
+                "top_k": 5,
+            },
+        ),
         _plan_call(
             "group_counts",
             {
                 "group_by": "intent",
-                "row_ids": [30, 31, 32],
+                "category": "ACCOUNT",
                 "top_k": 20,
             },
         ),
     )
     reviewer = FakeReviewerLLM(
         _review_needs_more(
-            reason="Intent distribution requires grouping filtered ACCOUNT rows.",
+            reason="Intent distribution requires grouping rows with the ACCOUNT category filter.",
             suggested_tool_name="group_counts",
             suggested_tool_input={
                 "group_by": "intent",
-                "row_ids": [30, 31, 32],
+                "category": "ACCOUNT",
                 "top_k": 20,
             },
         ),
@@ -550,20 +575,23 @@ def test_assignment_question_account_intent_distribution_filters_then_groups(
         user_id="max",
     )
 
-    assert result["route"] == "structured"
     assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
+        "resolve_filter_value",
         "group_counts",
     ]
-    assert result["tool_trace"][0]["tool_input"] == {"category": "ACCOUNT"}
     assert result["tool_trace"][1]["tool_input"] == {
         "group_by": "intent",
-        "row_ids": [30, 31, 32],
+        "category": "ACCOUNT",
+        "intent": None,
+        "text_query": None,
         "top_k": 20,
     }
+    assert result["final_answer"] == (
+        "In ACCOUNT, recover_password appears 2 times and delete_account appears once."
+    )
 
 
-def test_group_counts_rejects_symbolic_row_ids_without_calling_tool(
+def test_group_counts_rejects_missing_category_filter_for_scoped_intent_distribution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = graph.create_initial_state(
@@ -572,47 +600,9 @@ def test_group_counts_rejects_symbolic_row_ids_without_calling_tool(
         user_id="max",
     )
 
-    def fail_if_group_counts_called(group_by, row_ids=None, top_k=20):
+    def fail_if_group_counts_called(group_by, category=None, intent=None, text_query=None, top_k=20):
         raise AssertionError(
-            "group_counts_impl should not be called with invalid row_ids."
-        )
-
-    monkeypatch.setattr(graph, "group_counts_impl", fail_if_group_counts_called)
-
-    graph._execute_selected_tool(
-        state=state,
-        tool_name="group_counts",
-        tool_input={
-            "group_by": "intent",
-            "row_ids": "resolve_filter_value",
-            "query": "ACCOUNT",
-            "columns": ["category"],
-            "top_k": 5,
-        },
-    )
-
-    assert len(state["tool_trace"]) == 1
-    assert state["tool_trace"][0]["tool_name"] == "group_counts"
-
-    observation = json.loads(state["tool_trace"][0]["observation"])
-    assert "error" in observation
-    assert "row_ids must be a list of integer row IDs or null" in observation["error"]
-    assert "required_next_step" in observation
-    assert state["last_structured_results"] == []
-
-
-def test_group_counts_rejects_global_grouping_for_scoped_distribution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = graph.create_initial_state(
-        query="What is the distribution of intents in the ACCOUNT category?",
-        session_id="test_session",
-        user_id="max",
-    )
-
-    def fail_if_group_counts_called(group_by, row_ids=None, top_k=20):
-        raise AssertionError(
-            "group_counts_impl should not be called for an unscoped distribution."
+            "group_counts_impl should not be called for an unfiltered scoped distribution."
         )
 
     monkeypatch.setattr(graph, "group_counts_impl", fail_if_group_counts_called)
@@ -631,12 +621,12 @@ def test_group_counts_rejects_global_grouping_for_scoped_distribution(
 
     observation = json.loads(state["tool_trace"][0]["observation"])
     assert "error" in observation
-    assert "would group all rows" in observation["error"]
-    assert "filter_rows" in observation["required_next_step"]
+    assert "category filter" in observation["error"]
+    assert "group_by='intent'" in observation["required_next_step"]
     assert state["last_structured_results"] == []
 
 
-def test_scoped_distribution_answer_contract_blocks_answer_after_late_resolve(
+def test_scoped_distribution_answer_contract_blocks_answer_after_only_resolve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -672,45 +662,23 @@ def test_scoped_distribution_answer_contract_blocks_answer_after_late_resolve(
     )
     monkeypatch.setattr(
         graph,
-        "filter_rows_impl",
-        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
-            row_ids=[30, 31, 32, 33, 34, 35],
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "create_account", "count": 997},
+                {"label": "delete_account", "count": 995},
+            ],
             match_count=5986,
             applied_filters={
                 "category": category,
                 "intent": intent,
                 "text_query": text_query,
-                "limit": limit,
             },
-        ),
-    )
-    monkeypatch.setattr(
-        graph,
-        "group_counts_impl",
-        lambda group_by, row_ids=None, top_k=20: _model_result(
-            group_by=group_by,
-            counts=[
-                {"label": "create_account", "count": 997},
-                {"label": "delete_account", "count": 995},
-                {"label": "edit_account", "count": 1000},
-                {"label": "recover_password", "count": 995},
-                {"label": "registration_problems", "count": 999},
-                {"label": "switch_account", "count": 1000},
-            ],
         ),
     )
 
     planner = FakePlannerLLM(
-        _plan_call(
-            "group_counts",
-            {
-                "group_by": "intent",
-                "row_ids": "resolve_filter_value",
-                "query": "ACCOUNT",
-                "columns": ["category"],
-                "top_k": 5,
-            },
-        ),
         _plan_call(
             "resolve_filter_value",
             {
@@ -719,42 +687,21 @@ def test_scoped_distribution_answer_contract_blocks_answer_after_late_resolve(
                 "top_k": 5,
             },
         ),
-        _plan_call("filter_rows", {"category": "ACCOUNT"}),
         _plan_call(
             "group_counts",
             {
                 "group_by": "intent",
-                "scope": "latest_filter",
+                "category": "ACCOUNT",
                 "top_k": 20,
             },
         ),
     )
     reviewer = FakeReviewerLLM(
-        _review_needs_more(
-            reason="The symbolic row_ids group_counts call is invalid.",
-            suggested_tool_name="resolve_filter_value",
-            suggested_tool_input={
-                "query": "ACCOUNT",
-                "columns": ["category"],
-                "top_k": 5,
-            },
-        ),
         _review_answer(
             "Wrong answer that should be blocked because only resolve_filter_value ran."
         ),
-        _review_needs_more(
-            reason="The ACCOUNT subset exists; now group intents over that subset.",
-            suggested_tool_name="group_counts",
-            suggested_tool_input={
-                "group_by": "intent",
-                "scope": "latest_filter",
-                "top_k": 20,
-            },
-        ),
         _review_answer(
-            "The ACCOUNT category has create_account (997), delete_account (995), "
-            "edit_account (1000), recover_password (995), registration_problems "
-            "(999), and switch_account (1000)."
+            "The ACCOUNT category has create_account (997) and delete_account (995)."
         ),
     )
 
@@ -768,28 +715,16 @@ def test_scoped_distribution_answer_contract_blocks_answer_after_late_resolve(
     )
 
     assert result["final_answer"] == (
-        "The ACCOUNT category has create_account (997), delete_account (995), "
-        "edit_account (1000), recover_password (995), registration_problems "
-        "(999), and switch_account (1000)."
+        "The ACCOUNT category has create_account (997) and delete_account (995)."
     )
     assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "group_counts",
         "resolve_filter_value",
-        "filter_rows",
         "group_counts",
     ]
-
-    bad_group_observation = json.loads(result["tool_trace"][0]["observation"])
-    assert "error" in bad_group_observation
-    assert result["tool_trace"][3]["tool_input"] == {
-        "group_by": "intent",
-        "scope": "latest_filter",
-        "top_k": 20,
-        "row_ids": [30, 31, 32, 33, 34, 35],
-    }
+    assert result["tool_trace"][1]["tool_input"]["category"] == "ACCOUNT"
 
 
-def test_unstructured_query_filters_then_summarizes(
+def test_unstructured_query_summarizes_with_category_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -804,34 +739,55 @@ def test_unstructured_query_filters_then_summarizes(
 
     monkeypatch.setattr(
         graph,
-        "filter_rows_impl",
-        lambda category=None, intent=None, text_query=None, limit=None: _model_result(
-            row_ids=[10, 11],
-            match_count=2,
-            applied_filters={
-                "category": category,
-                "intent": intent,
-                "text_query": text_query,
-                "limit": limit,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "FEEDBACK",
+                    "count": 2,
+                    "score": 1.0,
+                    "reason": "Exact normalized value match.",
+                }
+            ],
+            recommended_filter={
+                "category": "FEEDBACK",
+                "intent": None,
             },
+            confidence="high",
         ),
     )
     monkeypatch.setattr(
         graph,
         "summarize_rows_impl",
-        lambda row_ids, focus, max_examples=100: _model_result(
+        lambda category=None, intent=None, text_query=None, focus="", target_field="both", max_examples=100: _model_result(
             summary="Customers mainly provide product feedback.",
             row_count_used=2,
+            match_count=2,
             focus=focus,
+            target_field=target_field,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
         ),
     )
 
     planner = FakePlannerLLM(
-        _plan_call("filter_rows", {"category": "FEEDBACK"}),
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "FEEDBACK",
+                "columns": ["category"],
+                "top_k": 5,
+            },
+        ),
         _plan_call(
             "summarize_rows",
             {
-                "row_ids": [10, 11],
+                "category": "FEEDBACK",
                 "focus": "Summarize the FEEDBACK category.",
                 "max_examples": 100,
             },
@@ -842,7 +798,7 @@ def test_unstructured_query_filters_then_summarizes(
             reason="A qualitative summary requires summarize_rows output.",
             suggested_tool_name="summarize_rows",
             suggested_tool_input={
-                "row_ids": [10, 11],
+                "category": "FEEDBACK",
                 "focus": "Summarize the FEEDBACK category.",
                 "max_examples": 100,
             },
@@ -859,14 +815,83 @@ def test_unstructured_query_filters_then_summarizes(
         user_id="max",
     )
 
-    assert result["route"] == "unstructured"
-    assert result["final_answer"] == "Customers mainly provide product feedback."
     assert [step["tool_name"] for step in result["tool_trace"]] == [
-        "filter_rows",
+        "resolve_filter_value",
         "summarize_rows",
     ]
-    assert result["last_structured_results"][-1]["query_type"] == "filter"
+    assert result["tool_trace"][1]["tool_input"]["category"] == "FEEDBACK"
+    assert result["last_structured_results"][-1]["query_type"] == "summary"
     assert result["last_structured_results"][-1]["value"] == 2
+    assert result["final_answer"] == "Customers mainly provide product feedback."
+
+
+def test_agent_response_summary_uses_target_field_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = graph.create_initial_state(
+        query="Summarize how agents respond to complaint intents.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    captured_inputs: list[dict] = []
+
+    monkeypatch.setattr(
+        graph,
+        "summarize_rows_impl",
+        lambda category=None, intent=None, text_query=None, focus="", target_field="both", max_examples=100: (
+            captured_inputs.append(
+                {
+                    "category": category,
+                    "intent": intent,
+                    "text_query": text_query,
+                    "focus": focus,
+                    "target_field": target_field,
+                    "max_examples": max_examples,
+                }
+            )
+            or _model_result(
+                summary="Agents usually acknowledge the complaint and ask for more details.",
+                row_count_used=10,
+                match_count=10,
+                focus=focus,
+                target_field=target_field,
+                applied_filters={
+                    "category": category,
+                    "intent": intent,
+                    "text_query": text_query,
+                },
+            )
+        ),
+    )
+
+    graph._execute_selected_tool(
+        state=state,
+        tool_name="summarize_rows",
+        tool_input={
+            "category": "COMPLAINT",
+            "focus": "how agents respond to complaint intents",
+            "target_field": "response",
+            "max_examples": 100,
+        },
+    )
+
+    assert captured_inputs == [
+        {
+            "category": "COMPLAINT",
+            "intent": None,
+            "text_query": None,
+            "focus": "how agents respond to complaint intents",
+            "target_field": "response",
+            "max_examples": 100,
+        }
+    ]
+    assert state["last_structured_results"][-1]["query_type"] == "summary"
+    assert state["last_structured_results"][-1]["filters"] == {
+        "category": "COMPLAINT",
+        "intent": None,
+        "text_query": None,
+    }
 
 
 def test_out_of_scope_query_refuses_without_planner(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1059,7 +1084,12 @@ def test_create_invocation_state_returns_partial_update_for_existing_thread() ->
                     "label": "count_rows",
                     "value": 3,
                     "query_type": "count",
-                    "row_ids": [1, 2, 3],
+                    "filters": {
+                        "category": "REFUND",
+                        "intent": None,
+                        "text_query": None,
+                    },
+                    "match_count": 3,
                 }
             ],
         }
@@ -1165,7 +1195,7 @@ def test_route_after_router_sends_out_of_scope_to_refusal_node() -> None:
     assert graph.route_after_router(state) == "refusal_node"
 
 
-def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
+def test_follow_up_show_me_three_more_uses_previous_filters_and_offset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = graph.create_initial_state(
@@ -1181,7 +1211,12 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
             "label": "sample_examples",
             "value": 3,
             "query_type": "sample",
-            "row_ids": [10, 11, 12, 13, 14, 15],
+            "filters": {
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+            },
+            "match_count": 6,
         }
     ]
 
@@ -1190,56 +1225,48 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
     monkeypatch.setattr(
         graph,
         "sample_examples_impl",
-        lambda row_ids=None, n=3, offset=0: (
+        lambda category=None, intent=None, text_query=None, n=3, offset=0: (
             captured_inputs.append(
                 {
-                    "row_ids": row_ids,
+                    "category": category,
+                    "intent": intent,
+                    "text_query": text_query,
                     "n": n,
                     "offset": offset,
                 }
             )
-            or type(
-                "SampleExamplesResult",
-                (),
-                {
-                    "examples": [
-                        type(
-                            "ExampleRow",
-                            (),
-                            {
-                                "row_id": 13,
-                                "category": "REFUND",
-                                "intent": "check_refund_status",
-                                "instruction": "Example 4",
-                                "response": "Refunds usually take several business days.",
-                            },
-                        )(),
-                        type(
-                            "ExampleRow",
-                            (),
-                            {
-                                "row_id": 14,
-                                "category": "REFUND",
-                                "intent": "get_refund",
-                                "instruction": "Example 5",
-                                "response": "You can request a refund through your account.",
-                            },
-                        )(),
-                        type(
-                            "ExampleRow",
-                            (),
-                            {
-                                "row_id": 15,
-                                "category": "REFUND",
-                                "intent": "check_refund_status",
-                                "instruction": "Example 6",
-                                "response": "Your refund status is available in your account.",
-                            },
-                        )(),
-                    ],
-                    "next_offset": 6,
+            or _model_result(
+                examples=[
+                    _example_row(
+                        row_id=13,
+                        category="REFUND",
+                        intent="check_refund_status",
+                        instruction="Example 4",
+                        response="Refunds usually take several business days.",
+                    ),
+                    _example_row(
+                        row_id=14,
+                        category="REFUND",
+                        intent="get_refund",
+                        instruction="Example 5",
+                        response="You can request a refund through your account.",
+                    ),
+                    _example_row(
+                        row_id=15,
+                        category="REFUND",
+                        intent="check_refund_status",
+                        instruction="Example 6",
+                        response="Your refund status is available in your account.",
+                    ),
+                ],
+                next_offset=6,
+                match_count=6,
+                applied_filters={
+                    "category": category,
+                    "intent": intent,
+                    "text_query": text_query,
                 },
-            )()
+            )
         ),
     )
 
@@ -1252,7 +1279,9 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
 
     assert captured_inputs == [
         {
-            "row_ids": [10, 11, 12, 13, 14, 15],
+            "category": "REFUND",
+            "intent": None,
+            "text_query": None,
             "n": 3,
             "offset": 3,
         }
@@ -1265,11 +1294,16 @@ def test_follow_up_show_me_three_more_uses_previous_row_ids_and_offset(
         "label": "sample_examples",
         "value": 6,
         "query_type": "sample",
-        "row_ids": [10, 11, 12, 13, 14, 15],
+        "filters": {
+            "category": "REFUND",
+            "intent": None,
+            "text_query": None,
+        },
+        "match_count": 6,
     }
 
 
-def test_total_of_last_two_follow_up_goes_to_planner_with_context(
+def test_total_of_last_two_follow_up_goes_to_planner_with_filter_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = graph.create_initial_state(
@@ -1285,13 +1319,23 @@ def test_total_of_last_two_follow_up_goes_to_planner_with_context(
             "label": "complaints",
             "value": 514,
             "query_type": "count",
-            "row_ids": None,
+            "filters": {
+                "category": "COMPLAINT",
+                "intent": None,
+                "text_query": None,
+            },
+            "match_count": 514,
         },
         {
             "label": "refunds",
             "value": 842,
-            "query_type": "filter",
-            "row_ids": [1, 2, 3],
+            "query_type": "count",
+            "filters": {
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+            },
+            "match_count": 842,
         },
     ]
 
@@ -1307,8 +1351,11 @@ def test_total_of_last_two_follow_up_goes_to_planner_with_context(
 
     assert "complaints" in context_message
     assert "514" in context_message
+    assert "COMPLAINT" in context_message
     assert "refunds" in context_message
     assert "842" in context_message
+    assert "REFUND" in context_message
+    assert "row_ids" not in context_message
     assert result["final_answer"] == "The total count of the last two results is 1,356."
 
 
@@ -1316,35 +1363,38 @@ def test_sample_examples_trace_includes_full_example_details(monkeypatch: pytest
     monkeypatch.setattr(
         graph,
         "sample_examples_impl",
-        lambda row_ids=None, n=3, offset=0: type(
-            "SampleExamplesResult",
-            (),
-            {
-                "examples": [
-                    type(
-                        "ExampleRow",
-                        (),
-                        {
-                            "row_id": 10,
-                            "category": "REFUND",
-                            "intent": "check_refund_status",
-                            "instruction": "Where is my refund?",
-                            "response": "You can check your refund status in your account.",
-                        },
-                    )()
-                ],
-                "next_offset": 1,
+        lambda category=None, intent=None, text_query=None, n=3, offset=0: _model_result(
+            examples=[
+                _example_row(
+                    row_id=10,
+                    category="REFUND",
+                    intent="check_refund_status",
+                    instruction="Where is my refund?",
+                    response="You can check your refund status in your account.",
+                )
+            ],
+            next_offset=1,
+            match_count=1,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
             },
-        )(),
+        ),
     )
 
-    observation, next_offset = graph._format_sample_examples_observation(
-        row_ids=[10],
+    observation, next_offset, match_count = graph._format_sample_examples_observation(
+        filters={
+            "category": "REFUND",
+            "intent": None,
+            "text_query": None,
+        },
         n=1,
         offset=0,
     )
 
     assert next_offset == 1
+    assert match_count == 1
     assert "row_id=10" in observation
     assert "category=REFUND" in observation
     assert "intent=check_refund_status" in observation
@@ -1352,30 +1402,83 @@ def test_sample_examples_trace_includes_full_example_details(monkeypatch: pytest
     assert "support_response=You can check your refund status in your account." in observation
 
 
+def test_structured_results_prompt_uses_filters_not_row_ids() -> None:
+    prompt_text = graph._structured_results_for_prompt(
+        [
+            {
+                "label": "refunds",
+                "value": 842,
+                "query_type": "count",
+                "filters": {
+                    "category": "REFUND",
+                    "intent": None,
+                    "text_query": None,
+                },
+                "match_count": 842,
+            }
+        ]
+    )
+
+    assert "filters=" in prompt_text
+    assert "REFUND" in prompt_text
+    assert "row_ids" not in prompt_text
+
+
 def test_create_invocation_state_falls_back_to_initial_state_when_checkpoint_read_fails() -> None:
     class FailingCheckpointGraph:
         def get_state(self, config):
-            raise RuntimeError("No checkpointer available in this test.")
+            raise RuntimeError("Checkpoint unavailable.")
 
     config = graph._build_graph_config(
-        session_id="fallback_session",
+        session_id="test_session",
         user_id="max",
         max_iterations=12,
     )
 
     result = graph._create_invocation_state(
         graph=FailingCheckpointGraph(),
-        query="How many rows are in the dataset?",
-        session_id="fallback_session",
+        query="How many refund requests?",
+        session_id="test_session",
         user_id="max",
         max_iterations=12,
         config=config,
     )
 
-    assert result["session_id"] == "fallback_session"
+    assert result["session_id"] == "test_session"
     assert result["user_id"] == "max"
-    assert result["route"] is None
-    assert result["tool_trace"] == []
     assert result["last_structured_results"] == []
     assert isinstance(result["messages"][0], HumanMessage)
-    assert result["messages"][0].content == "How many rows are in the dataset?"
+
+
+def test_unknown_tool_error_returns_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks a dataset question.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    planner = FakePlannerLLM(
+        graph.ToolPlanDecision(
+            action="call_tool",
+            tool_name="",
+            tool_input={},
+            reason="Malformed planner output.",
+        )
+    )
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+
+    result = graph.invoke_agent(
+        query="How many rows are there?",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["final_answer"] == (
+        "I could not complete the analysis within the allowed number of "
+        "reasoning steps. Please try asking a more specific dataset question."
+    )
