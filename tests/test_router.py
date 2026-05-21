@@ -20,12 +20,27 @@ class FakeStructuredRouterLLM:
     ("query", "expected_route"),
     [
         ("How many refund requests?", "structured"),
+        ("How many refund requests did we get?", "structured"),
         ("Show 3 examples from REFUND", "structured"),
+        ("Show me 5 examples of the SHIPPING category.", "structured"),
+        ("What categories exist in the dataset?", "structured"),
+        ("What is the distribution of intents in the ACCOUNT category?", "structured"),
         ("Give me a few reimbursement cases", "structured"),
+        ("Show me examples of people wanting their money back.", "structured"),
         ("Summarize FEEDBACK", "unstructured"),
+        ("Summarize the FEEDBACK category.", "unstructured"),
         ("What are common themes in complaints?", "unstructured"),
+        ("Summarize how agents respond to complaint intents.", "unstructured"),
+        (
+            "How do customer service representatives typically respond to cancellation requests?",
+            "unstructured",
+        ),
         ("Who is the president?", "out_of_scope"),
         ("What is the weather?", "out_of_scope"),
+        ("What's the best CRM software for handling complaints?", "out_of_scope"),
+        ("Who is the president of France?", "out_of_scope"),
+        ("Who won the 2024 Champions League?", "out_of_scope"),
+        ("Write me a poem about customer service.", "out_of_scope"),
     ],
 )
 def test_route_query_returns_llm_selected_route(

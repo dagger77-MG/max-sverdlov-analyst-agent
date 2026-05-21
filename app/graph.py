@@ -1,28 +1,58 @@
 from __future__ import annotations
 
-import ast
 import json
 import re
 import sqlite3
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.langchain_tools import LANGCHAIN_TOOLS
 from app.logging_utils import summarize_row_ids
 from app.memory import read_user_profile_impl, update_user_profile_impl
 from app.prompts import (
-    DATA_AGENT_SYSTEM_PROMPT,
     OUT_OF_SCOPE_REFUSAL,
     PROFILE_UPDATE_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+    REVIEWER_SYSTEM_PROMPT,
 )
 from app.router import RouteDecision, route_query_with_reason
 from app.state import AgentState, AnalysisResult, ToolTraceItem
-from app.tools import sample_examples_impl
+from app.tools import (
+    count_rows_impl,
+    filter_rows_impl,
+    get_dataset_schema_impl,
+    group_counts_impl,
+    resolve_filter_value_impl,
+    sample_examples_impl,
+    summarize_rows_impl,
+)
+
+
+PlannerToolName = Literal[
+    "get_dataset_schema",
+    "resolve_filter_value",
+    "filter_rows",
+    "count_rows",
+    "sample_examples",
+    "group_counts",
+    "summarize_rows",
+    "read_user_profile",
+]
+
+VALID_PLANNER_TOOL_NAMES = {
+    "get_dataset_schema",
+    "resolve_filter_value",
+    "filter_rows",
+    "count_rows",
+    "sample_examples",
+    "group_counts",
+    "summarize_rows",
+    "read_user_profile",
+}
 
 
 class ProfileObservationDecision(BaseModel):
@@ -31,6 +61,69 @@ class ProfileObservationDecision(BaseModel):
     observation: str = Field(
         default="",
         description="Concise durable observation to save, or empty string.",
+    )
+
+
+class ToolPlanDecision(BaseModel):
+    """Planner decision for the next data-agent action."""
+
+    action: Literal["call_tool", "final_answer"] = Field(
+        description="Whether to call one tool or produce a final answer."
+    )
+    tool_name: PlannerToolName | Literal[""] = Field(
+        default="",
+        description=(
+            "Tool to call when action is 'call_tool'. Must be empty when "
+            "action is 'final_answer'."
+        ),
+    )
+    tool_input: dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON-serializable input for the selected tool.",
+    )
+    final_answer: str = Field(
+        default="",
+        description="Final answer when no more tools are needed.",
+    )
+    reason: str = Field(
+        description="Brief explanation of the planning decision."
+    )
+
+
+class ObservationReviewDecision(BaseModel):
+    """Reviewer decision about whether observations answer the user."""
+
+    status: Literal["answered", "needs_more", "cannot_answer"] = Field(
+        description=(
+            "answered if the trace is sufficient. "
+            "needs_more only if one specific new tool call can add missing evidence. "
+            "cannot_answer if the requested value/subset does not exist or no tool "
+            "can add useful evidence."
+        )
+    )
+    reason: str = Field(
+        description=(
+            "One short sentence explaining what the observations prove or miss. "
+            "Do not include step-by-step reasoning."
+        )
+    )
+    final_answer: str = Field(
+        default="",
+        description=(
+            "Concise grounded final answer when status is answered or cannot_answer. "
+            "Leave empty when status is needs_more."
+        ),
+    )
+    suggested_tool_name: str = Field(
+        default="",
+        description=(
+            "Required only when status is needs_more. Must be a new useful tool call, "
+            "not a repeat of an already observed call. Empty otherwise."
+        )
+    )
+    suggested_tool_input: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Minimal next tool input when status is needs_more; otherwise empty.",
     )
 
 
@@ -56,30 +149,24 @@ def get_agent_llm():
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         temperature=0,
-        max_tokens=2056,
-        extra_body={
-            "enable_thinking": False,
-            "thinking_budget": 0,
-        },
+        max_tokens=settings.max_tokens,
+        # extra_body={
+        #     "enable_thinking": False,
+        #     "thinking_budget": 0,
+        # },
     )
 
 
 @lru_cache(maxsize=1)
-def get_langchain_data_agent():
-    """Return the standard LangChain data agent runtime."""
-    try:
-        from langchain.agents import create_agent
-    except ImportError as exc:
-        raise RuntimeError(
-            "The standard LangChain agent requires 'langchain'. "
-            "Install project dependencies before running the agent."
-        ) from exc
+def get_structured_tool_planner_llm():
+    """Return a cached model configured for next-tool planning decisions."""
+    return get_agent_llm().with_structured_output(ToolPlanDecision)
 
-    return create_agent(
-        model=get_agent_llm(),
-        tools=LANGCHAIN_TOOLS,
-        system_prompt="/no_think\n" + DATA_AGENT_SYSTEM_PROMPT,
-    )
+
+@lru_cache(maxsize=1)
+def get_structured_observation_reviewer_llm():
+    """Return a cached model configured for observation-readiness decisions."""
+    return get_agent_llm().with_structured_output(ObservationReviewDecision)
 
 
 @lru_cache(maxsize=1)
@@ -131,6 +218,26 @@ def _append_trace(
             tool_input=tool_input,
             observation=observation,
         )
+    )
+
+def _append_tool_error(
+    state: AgentState,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    error: str,
+    required_next_step: str,
+) -> None:
+    """Record a non-fatal tool contract error as a visible observation."""
+    _append_trace(
+        state,
+        tool_name,
+        tool_input,
+        _format_model_dict(
+            {
+                "error": error,
+                "required_next_step": required_next_step,
+            }
+        ),
     )
 
 
@@ -195,7 +302,92 @@ def _is_more_examples_query(query: str) -> bool:
             r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
             normalized,
         )
+        or re.search(
+            r"\b(?:show|give|list|display)?\s*(?:me\s+)?(?:another|next|additional)\s+\d+\b",
+            normalized,
+        )
     )
+
+
+def _is_example_request(query: str) -> bool:
+    """Return True when the user asks to show dataset examples/samples/cases."""
+    normalized = query.strip().lower()
+
+    if not normalized:
+        return False
+
+    action_markers = (
+       "show",
+        "give",
+        "list",
+        "display",
+        "provide",
+    )
+    example_markers = (
+        "example",
+        "examples",
+        "sample",
+        "samples",
+        "case",
+        "cases",
+        "row",
+        "rows",
+    )
+
+    return any(marker in normalized for marker in action_markers) and any(
+        marker in normalized for marker in example_markers
+    )
+
+
+def _is_distribution_query(query: str) -> bool:
+    """Return True when the user asks for a distribution or breakdown."""
+    normalized = query.strip().lower()
+
+    if not normalized:
+        return False
+
+    distribution_markers = (
+        "distribution",
+        "breakdown",
+        "group count",
+        "group counts",
+        "count by",
+        "counts by",
+        "by category",
+        "by intent",
+    )
+
+    return any(marker in normalized for marker in distribution_markers)
+
+
+def _has_explicit_top_k_request(query: str) -> bool:
+    """Return True when the user explicitly asks for a limited top-N result."""
+    normalized = query.strip().lower()
+
+    if not normalized:
+        return False
+
+    return bool(
+        re.search(r"\b(top|first|highest|lowest)\s+\d+\b", normalized)
+        or "most common" in normalized
+        or "least common" in normalized
+    )
+
+
+def _requires_grouped_filtered_scope(query: str, group_by: str) -> bool:
+    """Detect grouped questions that require a prior filtered subset."""
+    normalized = query.strip().lower()
+
+    if not _is_distribution_query(normalized):
+        return False
+
+    if group_by == "intent" and "category" in normalized:
+        return True
+
+    if group_by == "category" and "intent" in normalized:
+        return True
+
+    return False
 
 
 def _requested_example_count(query: str, default: int = 3) -> int:
@@ -309,159 +501,739 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
     }
 
 
-def _message_content_as_text(message: BaseMessage) -> str:
-    """Return message content as display-safe text."""
-    content = getattr(message, "content", "")
+def _compact_tool_input_for_prompt(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return tool input without exposing long row_id lists to the LLM."""
+    compacted = dict(tool_input)
+    row_ids = compacted.get("row_ids")
 
-    if isinstance(content, str):
-        return content
+    if isinstance(row_ids, list):
+        compacted["row_ids_summary"] = summarize_row_ids(row_ids)
+        compacted["row_ids_access_note"] = (
+            "Do not copy preview IDs. Use scope='latest_filter' when operating "
+            "on the latest filtered subset."
+        )
+        del compacted["row_ids"]
 
-    return str(content)
-
-
-def _safe_parse_tool_output(content: Any) -> Any:
-    """Best-effort parse of a LangChain tool message content."""
-    if isinstance(content, dict | list):
-        return content
-
-    if not isinstance(content, str):
-        return content
-
-    stripped = content.strip()
-    if not stripped:
-        return stripped
-
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        return ast.literal_eval(stripped)
-    except (SyntaxError, ValueError):
-        return stripped
+    return compacted
 
 
-def _build_langchain_agent_messages(state: AgentState) -> list[BaseMessage]:
-    """Build compact input messages for the standard LangChain agent."""
+def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
+    """Format the current turn trace for planner/reviewer prompts."""
+    if not tool_trace:
+        return "No tool calls yet in this turn."
+
+    lines: list[str] = []
+    for index, item in enumerate(tool_trace, start=1):
+        tool_input = _compact_tool_input_for_prompt(item["tool_input"])
+        lines.append(
+            f"{index}. tool={item['tool_name']}\n"
+             f"input={json.dumps(tool_input, ensure_ascii=False, default=str)}\n"
+            f"observation={item['observation']}"
+        )
+
+    return "\n\n".join(lines)
+
+
+def _profile_context_for_planner(state: AgentState) -> str:
+    """Return profile context only when the user explicitly asks about memory.
+
+    The dataset planner should not see the full durable user profile by default:
+    task-specific profile pollution can bias tool planning. Profile content is
+    still available through read_user_profile when the user asks profile/memory
+    questions.
+    """
+    user_query = _latest_user_message(state["messages"]).lower()
+    if "remember" in user_query or "profile" in user_query:
+        return state["user_profile"]
+    return "Profile hidden for dataset tool planning. Use read_user_profile only for explicit profile/memory questions."
+
+
+def _build_planner_messages(
+        state: AgentState,
+        reviewer_feedback: str | None,
+) -> list[BaseMessage]:
+    """Build input messages for next-tool planning."""
     user_query = _latest_user_message(state["messages"])
 
     context = f"""Current route: {state["route"]}
 Route reason: {state["route_reason"]}
 
 User profile:
-{state["user_profile"]}
+{_profile_context_for_planner(state)}
 
 Recent structured results:
 {_structured_results_for_prompt(state["last_structured_results"])}
 
-Follow-up guidance:
-- If the user asks for a total of recent counts, use recent structured results when available.
-- Example-pagination follow-ups are handled deterministically by the graph when previous sample context is available.
-- Do not reconstruct row IDs from compact previews.
-- Do not answer from general knowledge.
+Current turn tool trace:
+{_compact_tool_trace_for_prompt(state["tool_trace"])}
+
+
+Reviewer feedback:
+{reviewer_feedback or "No reviewer feedback yet."}
 """
 
     return [
+        SystemMessage(content=PLANNER_SYSTEM_PROMPT),
         SystemMessage(content=context),
         HumanMessage(content=user_query),
     ]
 
 
-def _extract_langchain_tool_trace_and_results(
-    messages: list[BaseMessage],
-) -> tuple[list[ToolTraceItem], list[AnalysisResult]]:
-    """Extract visible tool steps and compact follow-up results from agent messages."""
-    trace: list[ToolTraceItem] = []
-    structured_results: list[AnalysisResult] = []
-    pending_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+def _build_reviewer_messages(state: AgentState) -> list[BaseMessage]:
+    """Build input messages for observation review."""
+    user_query = _latest_user_message(state["messages"])
+    context = f"""Current route: {state["route"]}
+Route reason: {state["route_reason"]}
 
-    for message in messages:
-        tool_calls = getattr(message, "tool_calls", None) or []
-        for tool_call in tool_calls:
-            call_id = str(tool_call.get("id", ""))
-            tool_name = str(tool_call.get("name", "unknown_tool"))
-            tool_args = tool_call.get("args") or {}
-            if not isinstance(tool_args, dict):
-                tool_args = {"input": tool_args}
-            pending_tool_calls[call_id] = (tool_name, tool_args)
+Recent structured results:
+{_structured_results_for_prompt(state["last_structured_results"])}
 
-        if getattr(message, "type", None) != "tool":
+Current turn tool trace:
+{_compact_tool_trace_for_prompt(state["tool_trace"])}
+
+"""
+
+    return [
+        SystemMessage(content=REVIEWER_SYSTEM_PROMPT),
+        SystemMessage(content=context),
+        HumanMessage(content=user_query),
+    ]
+
+
+def _normalize_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow JSON-like copy of planner-supplied tool input."""
+    return dict(tool_input or {})
+
+
+def _tool_call_already_exists(
+    state: AgentState,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> bool:
+    """Return True when the same tool call already exists in this turn trace.
+    A call with scope='latest_filter' is only a duplicate if it happened after
+    the latest current-turn filter_rows call. The same raw scope can point to a
+    different subset after a new filter_rows call.
+    """
+    normalized_input = _normalize_tool_input(tool_input)
+    latest_filter_index = _latest_current_turn_filter_index(state)
+    uses_latest_filter_scope = normalized_input.get("scope") in {
+        "latest_filter",
+        "latest_filtered_subset",
+    }
+
+    for index, item in enumerate(state["tool_trace"]):
+        if item["tool_name"] != tool_name:
             continue
+        if _normalize_tool_input(item["tool_input"]) != normalized_input:
+            continue
+        if (
+            uses_latest_filter_scope
+            and latest_filter_index is not None
+            and index < latest_filter_index
+        ):
+            continue
+        return True
 
-        tool_call_id = str(getattr(message, "tool_call_id", ""))
-        tool_name, tool_input = pending_tool_calls.get(
-            tool_call_id,
-            (str(getattr(message, "name", "unknown_tool")), {}),
+    return False
+
+
+def _format_model_dict(data: dict[str, Any]) -> str:
+    """Format tool output as stable JSON for trace observations."""
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def _format_filter_rows_observation(result) -> str:
+    """Format filter_rows output without dumping every matching row_id.
+
+    Full row IDs are preserved in last_structured_results for follow-up logic.
+    The observation only needs the exact match count, compact row-id summary,
+    and applied filters.
+    """
+    return _format_model_dict(
+        {
+            "match_count": result.match_count,
+            "row_ids_summary": summarize_row_ids(result.row_ids),
+            "row_ids_access_note": (
+                "Full row IDs are stored in graph state. Use "
+                "scope='latest_filter' for the latest filtered subset."
+            ),
+            "applied_filters": result.applied_filters,
+        }
+    )
+
+
+def _coerce_row_ids(value: Any) -> list[int] | None:
+    """Coerce planner-supplied row IDs into integers or reject invalid values."""
+    if value is None:
+        return None
+
+    if not isinstance(value, list):
+        raise ValueError(
+            "row_ids must be a list of integer row IDs or null; "
+            f"got {type(value).__name__}."
         )
-        observation_text = _message_content_as_text(message)
 
-        trace.append(
-            ToolTraceItem(
-                tool_name=tool_name,
-                tool_input=tool_input,
-                observation=observation_text,
+    row_ids: list[int] = []
+    for item in value:
+        try:
+            row_ids.append(int(item))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "row_ids must contain only integer-compatible values; "
+                f"got {item!r}."
+            ) from exc
+
+    return row_ids
+
+
+def _resolve_row_ids_from_tool_input(
+    state: AgentState,
+    normalized_input: dict[str, Any],
+) -> list[int] | None:
+    """Resolve row_ids or the controlled latest-filter scope reference."""
+    scope = normalized_input.get("scope")
+    if scope in {"latest_filter", "latest_filtered_subset"}:
+        row_ids = _latest_filter_row_ids(state)
+        if row_ids is None:
+            raise ValueError(
+                "scope='latest_filter' was requested, but no filtered subset "
+                "exists in recent structured results."
             )
+        normalized_input["row_ids"] = row_ids
+        return row_ids
+
+    return _coerce_row_ids(normalized_input.get("row_ids"))
+
+
+def _latest_filter_row_ids(state: AgentState) -> list[int] | None:
+    """Return the latest full row_id subset produced by filter_rows."""
+    for result in reversed(state["last_structured_results"]):
+        if result.get("query_type") != "filter":
+            continue
+
+        row_ids = result.get("row_ids")
+        if isinstance(row_ids, list):
+            return row_ids
+
+    return None
+
+
+def _latest_current_turn_filter_index(state: AgentState) -> int | None:
+    """Return the latest non-error filter_rows index in the current turn trace."""
+    for index in range(len(state["tool_trace"]) - 1, -1, -1):
+        item = state["tool_trace"][index]
+        if item["tool_name"] != "filter_rows":
+            continue
+        if _trace_observation_is_error(item["observation"]):
+            continue
+        return index
+
+    return None
+
+
+def _latest_current_turn_filter_row_ids(state: AgentState) -> list[int] | None:
+    """Return latest-filter row IDs only after filter_rows ran this turn."""
+    if _latest_current_turn_filter_index(state) is None:
+        return None
+
+    return _latest_filter_row_ids(state)
+
+
+def _resolve_scoped_group_count_row_ids(
+    state: AgentState,
+    normalized_input: dict[str, Any],
+    group_by: str,
+) -> list[int] | None:
+    """Resolve row IDs for group_counts while preventing stale latest_filter use."""
+    user_query = _latest_user_message(state["messages"])
+    needs_filtered_scope = _requires_grouped_filtered_scope(user_query, group_by)
+    scope = normalized_input.get("scope")
+
+    if scope in {"latest_filter", "latest_filtered_subset"}:
+        if needs_filtered_scope:
+            row_ids = _latest_current_turn_filter_row_ids(state)
+            if row_ids is None:
+                raise ValueError(
+                    "scope='latest_filter' was requested for a scoped distribution, "
+                    "but filter_rows has not created a filtered subset in the "
+                    "current turn."
+                )
+        else:
+            row_ids = _latest_filter_row_ids(state)
+            if row_ids is None:
+                raise ValueError(
+                    "scope='latest_filter' was requested, but no filtered subset "
+                    "exists in recent structured results."
+                )
+
+        normalized_input["row_ids"] = row_ids
+        return row_ids
+
+    return _coerce_row_ids(normalized_input.get("row_ids"))
+
+
+def _execute_selected_tool(
+    state: AgentState,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> None:
+    """Execute one selected tool and append trace/structured follow-up state."""
+    normalized_input = _normalize_tool_input(tool_input)
+
+    if tool_name == "get_dataset_schema":
+        result = get_dataset_schema_impl(
+            include_sample_values=bool(
+                normalized_input.get("include_sample_values", True)
+            ),
+        )
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        return
+
+    if tool_name == "resolve_filter_value":
+        result = resolve_filter_value_impl(
+            query=str(normalized_input.get("query", "")),
+            columns=normalized_input.get("columns") or ["category", "intent"],
+            top_k=int(normalized_input.get("top_k", 5)),
+        )
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label=f"resolve_filter_value:{result.query}",
+                value=result.confidence,
+                query_type="resolve_filter_value",
+                row_ids=None,
+            ),
+        )
+        return
+
+    if tool_name == "filter_rows":
+        if (
+            normalized_input.get("limit") is not None
+            and _is_example_request(_latest_user_message(state["messages"]))
+        ):
+            normalized_input = {
+                **normalized_input,
+                "limit": None,
+            }
+
+        result = filter_rows_impl(
+            category=normalized_input.get("category"),
+            intent=normalized_input.get("intent"),
+            text_query=normalized_input.get("text_query"),
+            limit=normalized_input.get("limit"),
+        )
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_filter_rows_observation(result),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label=str(result.applied_filters),
+                value=result.match_count,
+                query_type="filter",
+                row_ids=result.row_ids,
+            ),
+        )
+        return
+
+    if tool_name == "count_rows":
+        try:
+            row_ids = _resolve_scoped_group_count_row_ids(
+                state=state,
+                normalized_input=normalized_input,
+                group_by=group_by,
+            )
+        except ValueError as exc:
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=str(exc),
+                required_next_step=(
+                    "Use actual row IDs from filter_rows, scope='latest_filter', "
+                    "or omit row_ids to count all rows."
+                ),
+            )
+            return
+
+        result = count_rows_impl(row_ids=row_ids)
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label="count_rows",
+                value=result.count,
+                query_type="count",
+                row_ids=row_ids,
+            ),
+        )
+        return
+
+    if tool_name == "sample_examples":
+        try:
+            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+        except ValueError:
+            if (
+                normalized_input.get("row_ids") is not None
+                and _is_example_request(_latest_user_message(state["messages"]))
+            ):
+                latest_filter_row_ids = _latest_filter_row_ids(state)
+                if latest_filter_row_ids is not None:
+                    row_ids = latest_filter_row_ids
+                    normalized_input["row_ids"] = row_ids
+                else:
+                    _append_tool_error(
+                        state=state,
+                        tool_name=tool_name,
+                        tool_input=normalized_input,
+                        error=(
+                            "sample_examples received invalid row_ids and no "
+                            "filtered subset exists to repair them."
+                        ),
+                        required_next_step=(
+                            "Call filter_rows first, then sample_examples with "
+                            "scope='latest_filter' or actual row IDs."
+                        ),
+                    )
+                    return
+            else:
+                _append_tool_error(
+                    state=state,
+                    tool_name=tool_name,
+                    tool_input=normalized_input,
+                    error="sample_examples received invalid row_ids.",
+                    required_next_step=(
+                        "Use actual row IDs from filter_rows, scope='latest_filter', "
+                        "or omit row_ids for all rows."
+                    ),
+                )
+                return
+
+        n = int(normalized_input.get("n", 3))
+        offset = int(normalized_input.get("offset", 0))
+        observation, next_offset = _format_sample_examples_observation(
+            row_ids=row_ids,
+            n=n,
+            offset=offset,
+        )
+        _append_trace(state, tool_name, normalized_input, observation)
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label="sample_examples",
+                value=next_offset,
+                query_type="sample",
+                row_ids=row_ids,
+            ),
+        )
+        return
+
+    if tool_name == "group_counts":
+        group_by = normalized_input.get("group_by")
+        if group_by not in {"category", "intent"}:
+            raise ValueError(
+                "group_counts requires group_by='category' or group_by='intent'."
+            )
+
+        try:
+            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+        except ValueError as exc:
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=str(exc),
+                required_next_step=(
+                    "For filtered distributions, call filter_rows first in the "
+                    "current turn and then call group_counts with "
+                    "scope='latest_filter'."
+                ),
+            )
+            return
+
+        user_query = _latest_user_message(state["messages"])
+        if row_ids is None and _requires_grouped_filtered_scope(user_query, group_by):
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=(
+                    "group_counts would group all rows, but the user asked for a "
+                    "distribution inside a filtered category or intent."
+                ),
+                required_next_step=(
+                    "Resolve the requested value, call filter_rows, then call "
+                    "group_counts with scope='latest_filter' or actual row IDs."
+                ),
+            )
+            return
+
+        top_k = int(normalized_input.get("top_k", 20))
+        if (
+            _is_distribution_query(user_query)
+            and not _has_explicit_top_k_request(user_query)
+            and top_k < 20
+        ):
+            top_k = 20
+            normalized_input["top_k"] = top_k
+
+        result = group_counts_impl(
+            group_by=group_by,
+            row_ids=row_ids,
+            top_k=top_k,
+        )
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        _append_structured_result(
+            state,
+            AnalysisResult(
+                label=f"group_counts:{group_by}",
+                value=len(result.counts),
+                query_type="group_counts",
+                row_ids=row_ids,
+            ),
+        )
+        return
+
+    if tool_name == "summarize_rows":
+        try:
+            row_ids = _resolve_row_ids_from_tool_input(state, normalized_input)
+        except ValueError as exc:
+            _append_tool_error(
+                state=state,
+                tool_name=tool_name,
+                tool_input=normalized_input,
+                error=str(exc),
+                required_next_step=(
+                    "Call filter_rows first, then summarize_rows with "
+                    "scope='latest_filter' or actual row IDs."
+                ),
+            )
+            return
+
+        row_ids = row_ids or []
+        result = summarize_rows_impl(
+            row_ids=row_ids,
+            focus=str(
+                normalized_input.get("focus", _latest_user_message(state["messages"]))
+            ),
+            max_examples=int(normalized_input.get("max_examples", 100)),
+        )
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        return
+
+    if tool_name == "read_user_profile":
+        profile_user_id = str(normalized_input.get("user_id") or state["user_id"])
+        result = read_user_profile_impl(user_id=profile_user_id)
+        _append_trace(
+            state,
+            tool_name,
+            normalized_input,
+            _format_model_dict(result.model_dump()),
+        )
+        return
+
+    raise ValueError(f"Unknown tool selected by planner: {tool_name}")
+
+
+def _trace_observation_is_error(observation: str) -> bool:
+    """Return True when an observation is a tool-contract error payload."""
+    try:
+        parsed = json.loads(observation)
+    except json.JSONDecodeError:
+        return False
+
+    return isinstance(parsed, dict) and "error" in parsed
+
+
+def _has_prior_filter_trace(
+    state: AgentState,
+    max_index: int,
+    required_filter_column: str,
+) -> bool:
+    """Return True when a filter_rows call for the required column precedes a tool."""
+    for item in state["tool_trace"][:max_index]:
+        if item["tool_name"] != "filter_rows":
+            continue
+        if item["tool_input"].get(required_filter_column):
+            return True
+    return False
+
+
+def _has_valid_scoped_group_counts_trace(
+    state: AgentState,
+    group_by: str,
+    required_filter_column: str,
+) -> bool:
+    """Validate scoped distribution evidence using the existing tool trace only."""
+    for index, item in enumerate(state["tool_trace"]):
+        if item["tool_name"] != "group_counts":
+            continue
+        if item["tool_input"].get("group_by") != group_by:
+            continue
+        if _trace_observation_is_error(item["observation"]):
+            continue
+
+        row_ids = item["tool_input"].get("row_ids")
+        if not isinstance(row_ids, list):
+            continue
+
+        if _has_prior_filter_trace(
+            state=state,
+            max_index=index,
+            required_filter_column=required_filter_column,
+        ):
+            return True
+
+    return False
+
+
+def _has_filter_trace_for_column(state: AgentState, column: str) -> bool:
+    """Return True when this turn already has a filter_rows call for column."""
+    return any(
+        item["tool_name"] == "filter_rows"
+        and bool(item["tool_input"].get(column))
+        and not _trace_observation_is_error(item["observation"])
+        for item in state["tool_trace"]
+    )
+
+
+def _has_resolver_trace_for_column(state: AgentState, column: str) -> bool:
+    """Return True when this turn has a resolver call that searched column."""
+    for item in state["tool_trace"]:
+        if item["tool_name"] != "resolve_filter_value":
+            continue
+        columns = item["tool_input"].get("columns") or []
+        if column in columns and not _trace_observation_is_error(item["observation"]):
+            return True
+    return False
+
+
+def _answer_contract_error(state: AgentState) -> str | None:
+    """Block final answers for scoped distributions until the scoped group exists."""
+    user_query = _latest_user_message(state["messages"])
+
+    if _requires_grouped_filtered_scope(user_query, group_by="intent"):
+        if _has_valid_scoped_group_counts_trace(
+            state=state,
+            group_by="intent",
+            required_filter_column="category",
+        ):
+            return None
+
+        if _has_filter_trace_for_column(state, "category"):
+            return (
+                "The user asked for an intent distribution inside a category. "
+                "filter_rows has created the category subset, but there is no "
+                "valid group_counts(group_by='intent') over that subset yet."
+            )
+
+        if _has_resolver_trace_for_column(state, "category"):
+            return (
+                "The user asked for an intent distribution inside a category. "
+                "The category has been resolved, but filter_rows has not created "
+                "the category subset yet."
+            )
+
+        return (
+            "The user asked for an intent distribution inside a category. "
+            "Valid evidence requires resolving the category, filtering rows to "
+            "that category, and grouping intents over that filtered subset."
         )
 
-        parsed_output = _safe_parse_tool_output(getattr(message, "content", ""))
+    if _requires_grouped_filtered_scope(user_query, group_by="category"):
+        if _has_valid_scoped_group_counts_trace(
+            state=state,
+            group_by="category",
+            required_filter_column="intent",
+        ):
+            return None
 
-        if tool_name == "filter_rows" and isinstance(parsed_output, dict):
-            row_ids = parsed_output.get("row_ids")
-            match_count = parsed_output.get("match_count")
-            if isinstance(row_ids, list) and isinstance(match_count, int):
-                structured_results.append(
-                    AnalysisResult(
-                        label=str(parsed_output.get("applied_filters", {})),
-                        value=match_count,
-                        query_type="filter",
-                        row_ids=row_ids,
-                    )
-                )
+        if _has_filter_trace_for_column(state, "intent"):
+            return (
+                "The user asked for a category distribution inside an intent. "
+                "filter_rows has created the intent subset, but there is no "
+                "valid group_counts(group_by='category') over that subset yet."
+            )
 
-        if tool_name == "count_rows" and isinstance(parsed_output, dict):
-            count = parsed_output.get("count")
-            if isinstance(count, int):
-                row_ids = tool_input.get("row_ids")
-                structured_results.append(
-                    AnalysisResult(
-                        label="count_rows",
-                        value=count,
-                        query_type="count",
-                        row_ids=row_ids if isinstance(row_ids, list) else None,
-                    )
-                )
+        if _has_resolver_trace_for_column(state, "intent"):
+            return (
+                "The user asked for a category distribution inside an intent. "
+                "The intent has been resolved, but filter_rows has not created "
+                "the intent subset yet."
+            )
 
-        if tool_name == "sample_examples" and isinstance(parsed_output, dict):
-            next_offset = parsed_output.get("next_offset")
-            row_ids = tool_input.get("row_ids")
-            if isinstance(next_offset, int):
-                structured_results.append(
-                    AnalysisResult(
-                        label="sample_examples",
-                        value=next_offset,
-                        query_type="sample",
-                        row_ids=row_ids if isinstance(row_ids, list) else None,
-                    )
-                )
+        return (
+            "The user asked for a category distribution inside an intent. "
+            "Valid evidence requires resolving the intent, filtering rows to "
+            "that intent, and grouping categories over that filtered subset."
+        )
 
-    return trace, structured_results
+    return None
 
 
-def _extract_final_answer(messages: list[BaseMessage]) -> str:
-    """Extract the final AI answer from LangChain agent messages."""
-    for message in reversed(messages):
-        if not isinstance(message, AIMessage):
-            continue
+def _build_final_answer_block_feedback(contract_error: str) -> str:
+    """Convert deterministic contract validation into planner feedback."""
+    return (
+        f"Final answer blocked by deterministic validation: {contract_error} "
+        "Do not answer from the current observations. Call the missing tool. "
+        "For scoped grouping, use actual row IDs from filter_rows or "
+        "scope='latest_filter'."
+    )
 
-        if getattr(message, "tool_calls", None):
-            continue
 
-        content = _message_content_as_text(message).strip()
-        if content:
-            return content
+def _fallback_answer() -> str:
+    """Return a safe graph fallback for planner/reviewer/tool errors."""
+    return (
+        "I could not complete the analysis within the allowed number of "
+        "reasoning steps. Please try asking a more specific dataset question."
+    )
 
-    return "I completed the analysis, but no final answer was provided."
+
+def _debug_trace_enabled() -> bool:
+    """Return True when local live graph-loop debug output is enabled."""
+    value = settings.debug_trace
+    return value
+
+
+def _debug_trace(message: str) -> None:
+    """Print live graph-loop debug events for local development.
+
+    This is intentionally separate from the user-facing tool_trace. It helps
+    debug planner/reviewer loops and swallowed exceptions while the agent is
+    still running.
+    """
+    if _debug_trace_enabled():
+        print(f"[debug] {message}", flush=True)
 
 
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
@@ -491,56 +1263,284 @@ def refusal_node(state: AgentState) -> dict[str, Any]:
     }
 
 
-def langchain_data_agent_node(state: AgentState) -> dict[str, Any]:
-    """Run the standard LangChain agent runtime for dataset questions."""
+def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
+    """Run a graph-owned plan -> execute -> review loop for dataset questions."""
     deterministic_result = _handle_more_examples_follow_up(state)
     if deterministic_result is not None:
         return deterministic_result
 
-    data_agent = get_langchain_data_agent()
+    reviewer_feedback: str | None = None
+    reviewer_requires_tool = False
 
-    try:
-        result = data_agent.invoke(
-            {
-                "messages": _build_langchain_agent_messages(state),
-            },
-            config={
-                "recursion_limit": state["max_iterations"] + 5,
-            },
-        )
-    except Exception:
-        fallback = (
-            "I could not complete the analysis within the allowed number of "
-            "reasoning steps. Please try asking a more specific dataset question."
-        )
-        state["final_answer"] = fallback
-        return {
-            "tool_trace": state["tool_trace"],
-            "last_structured_results": state["last_structured_results"],
-            "final_answer": fallback,
-            "messages": [AIMessage(content=fallback)],
-        }
+    for iteration_index in range(state["max_iterations"]):
+        iteration_number = iteration_index + 1
+        try:
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                "planner start"
+            )
+            planner_llm = get_structured_tool_planner_llm()
+            plan = planner_llm.invoke(
+                _build_planner_messages(state, reviewer_feedback)
+            )
+            if not isinstance(plan, ToolPlanDecision):
+                plan = ToolPlanDecision.model_validate(plan)
 
-    result_messages = result.get("messages", [])
-    if not isinstance(result_messages, list):
-        result_messages = []
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"planner action={plan.action}; "
+                f"tool={plan.tool_name or '-'}; "
+                f"reason={plan.reason}"
+            )
 
-    tool_trace, new_structured_results = _extract_langchain_tool_trace_and_results(
-        result_messages
+            if plan.action == "final_answer":
+                if reviewer_requires_tool:
+                    reviewer_feedback = (
+                        "The previous reviewer decision was needs_more, so the "
+                        "current observations are not sufficient for a final answer. "
+                        "Call exactly one valid next tool. If the user-provided "
+                        "category or intent value was not resolved yet, call "
+                        "resolve_filter_value with the columns implied by the user's wording."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "blocked planner final_answer after reviewer needs_more"
+                    )
+                    continue
+
+                final_answer = plan.final_answer.strip()
+                if not final_answer:
+                    reviewer_feedback = (
+                        "Planner chose final_answer but returned empty text."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "planner returned empty final_answer"
+                    )
+                    continue
+                contract_error = _answer_contract_error(state)
+                if contract_error:
+                    reviewer_requires_tool = True
+                    reviewer_feedback = _build_final_answer_block_feedback(
+                        contract_error
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "blocked planner final_answer by evidence contract"
+                    )
+                    continue
+
+                state["final_answer"] = final_answer
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    "returning planner final_answer"
+                )
+                return {
+                    "tool_trace": state["tool_trace"],
+                                "last_structured_results": state["last_structured_results"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
+
+            if (
+                plan.action == "call_tool"
+                and _tool_call_already_exists(
+                    state=state,
+                    tool_name=plan.tool_name,
+                    tool_input=plan.tool_input,
+                )
+            ):
+                reviewer_requires_tool = False
+                reviewer_feedback = (
+                    "This exact tool call already exists in the current turn trace. "
+                    "Do not repeat it. Use the existing observation to produce a "
+                    "final answer or a cannot-answer style final answer."
+                )
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"blocked duplicate planner tool call={plan.tool_name}"
+                )
+                continue
+
+            _execute_selected_tool(
+                state=state,
+                tool_name=plan.tool_name,
+                tool_input=plan.tool_input,
+            )
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"executed tool={plan.tool_name}; "
+                f"trace_steps={len(state['tool_trace'])}"
+            )
+
+            if (
+                    plan.tool_name == "sample_examples"
+                    and _is_example_request(_latest_user_message(state["messages"]))
+            ):
+                final_answer = state["tool_trace"][-1]["observation"]
+                state["final_answer"] = final_answer
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    "returning deterministic sample_examples answer"
+                )
+                return {
+                    "tool_trace": state["tool_trace"],
+                                "last_structured_results": state["last_structured_results"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                "reviewer start"
+            )
+            try:
+                reviewer_llm = get_structured_observation_reviewer_llm()
+                review = reviewer_llm.invoke(_build_reviewer_messages(state))
+                if not isinstance(review, ObservationReviewDecision):
+                    review = ObservationReviewDecision.model_validate(review)
+            except Exception as exc:
+                reviewer_requires_tool = False
+                reviewer_feedback = (
+                    "The reviewer failed to return a valid structured decision "
+                    f"after the latest tool call. Error: {type(exc).__name__}: {exc}. "
+                    "Continue agentically from the current tool trace. Do not repeat "
+                    "the same failed or already-observed tool call. If the current "
+                    "observations fully answer the exact user request, produce a "
+                    "grounded final answer. Otherwise, choose exactly one next useful "
+                    "tool based on the current observations."
+                )
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"reviewer exception={type(exc).__name__}: {exc}; "
+                    "continuing with planner feedback"
+                )
+                continue
+
+            reviewer_feedback = review.reason
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"reviewer status={review.status}; "
+                f"suggested_tool={review.suggested_tool_name or '-'}; "
+                f"reason={review.reason}"
+            )
+
+            if review.status in {"answered", "cannot_answer"}:
+                if review.status == "answered":
+                    contract_error = _answer_contract_error(state)
+                    if contract_error:
+                        reviewer_requires_tool = True
+                        reviewer_feedback = _build_final_answer_block_feedback(
+                            contract_error
+                        )
+                        _debug_trace(
+                            f"iteration {iteration_number}/{state['max_iterations']}: "
+                            "blocked reviewer answered by evidence contract"
+                        )
+                        continue
+
+                reviewer_requires_tool = False
+                final_answer = review.final_answer.strip() or review.reason.strip()
+                state["final_answer"] = final_answer
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"returning reviewer status={review.status}"
+                )
+                return {
+                    "tool_trace": state["tool_trace"],
+                                "last_structured_results": state["last_structured_results"],
+                    "final_answer": final_answer,
+                    "messages": [AIMessage(content=final_answer)],
+                }
+
+            if review.status == "needs_more":
+                reviewer_requires_tool = True
+
+                if not review.suggested_tool_name:
+                    reviewer_feedback = (
+                        f"{review.reason}\n"
+                        "Reviewer returned needs_more but did not provide a suggested tool. "
+                        "Choose exactly one valid next tool yourself. For unresolved "
+                        "category/intent filters, use resolve_filter_value first."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "reviewer returned needs_more without suggested tool"
+                    )
+                    continue
+
+                if review.suggested_tool_name not in VALID_PLANNER_TOOL_NAMES:
+                    reviewer_requires_tool = False
+                    reviewer_feedback = (
+                        f"{review.reason}\n"
+                        f"Reviewer returned needs_more with invalid suggested_tool_name="
+                        f"{review.suggested_tool_name!r}. This is not a callable tool. "
+                        "Do not call another tool only because of this malformed reviewer "
+                        "decision. If the existing observations are enough, produce a "
+                        "final answer. If the requested subset/value does not exist, "
+                        "produce a cannot-answer style final answer."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        f"reviewer suggested invalid tool={review.suggested_tool_name!r}"
+                    )
+                    continue
+
+                if _tool_call_already_exists(
+                    state=state,
+                    tool_name=review.suggested_tool_name,
+                    tool_input=review.suggested_tool_input,
+                ):
+                    reviewer_requires_tool = False
+                    reviewer_feedback = (
+                        f"{review.reason}\n"
+                        "The reviewer suggested a tool call that already exists in "
+                        "the current turn trace. Do not repeat the same tool call. "
+                        "Use the existing observation to produce a final answer or "
+                        "a cannot-answer style final answer."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "reviewer suggested duplicate tool call"
+                    )
+                    continue
+
+                reviewer_feedback = (
+                    f"{review.reason}\n"
+                    f"Suggested next tool: {review.suggested_tool_name}\n"
+                    f"Suggested next input: "
+                    f"{json.dumps(review.suggested_tool_input, ensure_ascii=False, default=str)}"
+                )
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"reviewer requested next tool={review.suggested_tool_name}"
+                )
+
+        except Exception as exc:
+            fallback = _fallback_answer()
+            state["final_answer"] = fallback
+            _debug_trace(
+                f"iteration {iteration_number}/{state['max_iterations']}: "
+                f"exception={type(exc).__name__}: {exc}"
+            )
+            return {
+                "tool_trace": state["tool_trace"],
+                        "last_structured_results": state["last_structured_results"],
+                "final_answer": fallback,
+                "messages": [AIMessage(content=fallback)],
+            }
+
+    fallback = _fallback_answer()
+    state["final_answer"] = fallback
+    _debug_trace(
+        f"max_iterations_exhausted={state['max_iterations']}; "
+        f"trace_steps={len(state['tool_trace'])}"
     )
-
-    state["tool_trace"] = tool_trace
-    for structured_result in new_structured_results:
-        _append_structured_result(state, structured_result)
-
-    final_answer = _extract_final_answer(result_messages)
-    state["final_answer"] = final_answer
 
     return {
         "tool_trace": state["tool_trace"],
         "last_structured_results": state["last_structured_results"],
-        "final_answer": final_answer,
-        "messages": [AIMessage(content=final_answer)],
+        "final_answer": fallback,
+        "messages": [AIMessage(content=fallback)],
     }
 
 
@@ -582,7 +1582,7 @@ def route_after_router(state: AgentState) -> str:
     if state["route"] == "out_of_scope":
         return "refusal_node"
 
-    return "langchain_data_agent_node"
+    return "data_agent_loop_node"
 
 
 @lru_cache(maxsize=1)
@@ -613,7 +1613,7 @@ def build_graph():
 
     graph_builder.add_node("load_user_profile_node", load_user_profile_node)
     graph_builder.add_node("router_node", router_node)
-    graph_builder.add_node("langchain_data_agent_node", langchain_data_agent_node)
+    graph_builder.add_node("data_agent_loop_node", data_agent_loop_node)
     graph_builder.add_node("refusal_node", refusal_node)
     graph_builder.add_node("profile_update_node", profile_update_node)
 
@@ -623,11 +1623,11 @@ def build_graph():
         "router_node",
         route_after_router,
         {
-            "langchain_data_agent_node": "langchain_data_agent_node",
+            "data_agent_loop_node": "data_agent_loop_node",
             "refusal_node": "refusal_node",
         },
     )
-    graph_builder.add_edge("langchain_data_agent_node", "profile_update_node")
+    graph_builder.add_edge("data_agent_loop_node", "profile_update_node")
     graph_builder.add_edge("refusal_node", "profile_update_node")
     graph_builder.add_edge("profile_update_node", END)
 

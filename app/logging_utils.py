@@ -79,6 +79,6 @@ def summarize_row_ids(row_ids: list[int] | None) -> str:
         return "0 row IDs"
 
     preview = ", ".join(str(row_id) for row_id in row_ids[:5])
-    suffix = "..." if len(row_ids) > 5 else ""
+    suffix = "..." if len(row_ids) > 10 else ""
 
     return f"{len(row_ids)} row IDs [{preview}{suffix}]"
