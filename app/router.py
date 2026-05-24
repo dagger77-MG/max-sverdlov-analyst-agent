@@ -93,6 +93,7 @@ def get_router_llm():
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         temperature=0,
+        max_tokens=settings.router_max_tokens,
     )
 
 
@@ -114,17 +115,23 @@ def route_query_with_reason(query: str) -> RouteDecision:
 
     structured_llm = get_structured_router_llm()
 
-    decision = structured_llm.invoke(
-        [
-            SystemMessage(content=ROUTER_SYSTEM_PROMPT),
-            HumanMessage(content=normalized_query),
-        ]
-    )
+    try:
+        decision = structured_llm.invoke(
+            [
+                SystemMessage(content=ROUTER_SYSTEM_PROMPT),
+                HumanMessage(content=normalized_query),
+            ]
+        )
 
-    if isinstance(decision, RouteDecision):
-        return decision
+        if isinstance(decision, RouteDecision):
+            return decision
 
-    return RouteDecision.model_validate(decision)
+        return RouteDecision.model_validate(decision)
+    except Exception as exc:
+        raise RuntimeError(
+            "Router failed to produce a valid route decision. "
+            f"Original error: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def route_query(query: str) -> RouteType:

@@ -28,8 +28,16 @@ def test_app_config_from_env_uses_expected_project_paths() -> None:
 def test_app_config_keeps_model_names_in_config() -> None:
     config = AppConfig.from_env()
 
-    assert config.router_model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
-    assert config.agent_model == "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    assert config.router_model == "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+    assert config.agent_model == "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
+
+
+def test_app_config_sets_small_router_output_budget() -> None:
+    config = AppConfig.from_env()
+
+    assert config.router_max_tokens == 128
+    assert config.router_max_tokens > 0
+    assert config.router_max_tokens < config.max_tokens
 
 
 def test_normalize_max_iterations_uses_default_when_missing() -> None:
