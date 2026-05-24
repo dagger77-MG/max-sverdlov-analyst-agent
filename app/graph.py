@@ -4,20 +4,41 @@ import json
 import re
 import sqlite3
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.memory import read_user_profile_impl, update_user_profile_impl
+from app.agent.llm_factory import (
+    _create_agent_chat_llm,
+    get_agent_llm,
+    get_structured_observation_reviewer_llm,
+    get_structured_profile_llm,
+    get_structured_tool_planner_llm,
+)
+from app.agent.context import (
+    _build_planner_messages,
+    _build_reviewer_messages,
+    _compact_tool_input_for_prompt,
+    _compact_tool_trace_for_prompt,
+    _latest_user_message,
+    _profile_context_for_planner,
+    _structured_results_for_prompt,
+)
 from app.prompts import (
     OUT_OF_SCOPE_REFUSAL,
     PROFILE_UPDATE_SYSTEM_PROMPT,
-    PLANNER_SYSTEM_PROMPT,
-    REVIEWER_SYSTEM_PROMPT,
 )
+from app.agent.schemas import (
+    ObservationReviewDecision,
+    PlannerToolName,
+    ProfileObservationDecision,
+    ToolPlanDecision,
+    VALID_PLANNER_TOOL_NAMES,
+)
+
 from app.router import RouteDecision, route_query_with_reason
 from app.state import AgentState, AnalysisResult, ToolTraceItem
 from app.tools import (
@@ -28,157 +49,6 @@ from app.tools import (
     sample_examples_impl,
     summarize_rows_impl,
 )
-
-
-PlannerToolName = Literal[
-    "get_dataset_schema",
-    "resolve_filter_value",
-    "count_rows",
-    "sample_examples",
-    "group_counts",
-    "summarize_rows",
-    "read_user_profile",
-]
-
-VALID_PLANNER_TOOL_NAMES = {
-    "get_dataset_schema",
-    "resolve_filter_value",
-    "count_rows",
-    "sample_examples",
-    "group_counts",
-    "summarize_rows",
-    "read_user_profile",
-}
-
-
-class ProfileObservationDecision(BaseModel):
-    """Decision about whether a durable profile observation should be saved."""
-
-    observation: str = Field(
-        default="",
-        description="Concise durable observation to save, or empty string.",
-    )
-
-
-class ToolPlanDecision(BaseModel):
-    """Planner decision for the next data-agent action."""
-
-    action: Literal["call_tool", "final_answer"] = Field(
-        description="Whether to call one tool or produce a final answer."
-    )
-    tool_name: PlannerToolName | Literal[""] = Field(
-        default="",
-        description=(
-            "Tool to call when action is 'call_tool'. Must be empty when "
-            "action is 'final_answer'."
-        ),
-    )
-    tool_input: dict[str, Any] = Field(
-        default_factory=dict,
-        description="JSON-serializable input for the selected tool.",
-    )
-    final_answer: str = Field(
-        default="",
-        description="Final answer when no more tools are needed.",
-    )
-    reason: str = Field(
-        description=(
-            "One short sentence explaining the planning decision. "
-            "Do not include hidden reasoning, chains of thought, or long analysis."
-        )
-    )
-
-
-class ObservationReviewDecision(BaseModel):
-    """Reviewer decision about whether observations answer the user."""
-
-    status: Literal["answered", "needs_more", "cannot_answer"] = Field(
-        description=(
-            "answered if the trace is sufficient. "
-            "needs_more only if one specific new tool call can add missing evidence. "
-            "cannot_answer if the requested value/subset does not exist or no tool "
-            "can add useful evidence."
-        )
-    )
-    reason: str = Field(
-        description=(
-            "One short sentence explaining what the observations prove or miss. "
-            "Do not include step-by-step reasoning."
-        )
-    )
-    final_answer: str = Field(
-        default="",
-        description=(
-            "Concise grounded final answer when status is answered or cannot_answer. "
-            "Leave empty when status is needs_more."
-        ),
-    )
-    suggested_tool_name: str = Field(
-        default="",
-        description=(
-            "Required only when status is needs_more. Must be a new useful tool call, "
-            "not a repeat of an already observed call. Empty otherwise."
-        )
-    )
-    suggested_tool_input: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Minimal next tool input when status is needs_more; otherwise empty.",
-    )
-
-
-@lru_cache(maxsize=1)
-def get_agent_llm():
-    """Return a cached OpenAI-compatible chat model for the data agent."""
-    return _create_agent_chat_llm(max_tokens=settings.max_tokens)
-
-
-def _create_agent_chat_llm(max_tokens: int):
-    """Create an OpenAI-compatible chat model with an explicit output budget."""
-    if not settings.nebius_api_key:
-        raise RuntimeError(
-            "NEBIUS_API_KEY is missing. Add it to your environment or .env file "
-            "before using the graph agent."
-        )
-
-    try:
-        from langchain_openai import ChatOpenAI
-    except ImportError as exc:
-        raise RuntimeError(
-            "The graph agent requires 'langchain-openai'. "
-            "Install project dependencies before running the agent."
-        ) from exc
-
-    return ChatOpenAI(
-        model=settings.agent_model,
-        api_key=settings.nebius_api_key,
-        base_url=settings.nebius_base_url,
-        temperature=0,
-        max_tokens=max_tokens,
-        # extra_body={
-        #     "enable_thinking": False,
-        #     "thinking_budget": 0,
-        # },
-    )
-
-
-@lru_cache(maxsize=1)
-def get_structured_tool_planner_llm():
-    """Return a cached model configured for next-tool planning decisions."""
-    return _create_agent_chat_llm(
-        max_tokens=min(settings.max_tokens, 512),
-    ).with_structured_output(ToolPlanDecision)
-
-
-@lru_cache(maxsize=1)
-def get_structured_observation_reviewer_llm():
-    """Return a cached model configured for observation-readiness decisions."""
-    return get_agent_llm().with_structured_output(ObservationReviewDecision)
-
-
-@lru_cache(maxsize=1)
-def get_structured_profile_llm():
-    """Return a cached model configured for profile-update decisions."""
-    return get_agent_llm().with_structured_output(ProfileObservationDecision)
 
 
 def create_initial_state(
@@ -200,15 +70,6 @@ def create_initial_state(
         max_iterations=settings.normalize_max_iterations(max_iterations),
         final_answer=None,
     )
-
-
-def _latest_user_message(messages: list[BaseMessage]) -> str:
-    """Return the latest human message content from graph state."""
-    for message in reversed(messages):
-        if isinstance(message, HumanMessage):
-            return str(message.content)
-
-    return ""
 
 
 def _append_trace(
@@ -269,24 +130,6 @@ def _final_answer_update(
         "final_answer": final_answer,
         "messages": [AIMessage(content=final_answer)],
     }
-
-
-def _structured_results_for_prompt(results: list[AnalysisResult]) -> str:
-    """Format recent structured results for follow-up resolution."""
-    if not results:
-        return "No recent structured results."
-
-    lines: list[str] = []
-    for index, result in enumerate(results[-5:], start=1):
-        filters = result.get("filters") or {}
-        lines.append(
-            f"{index}. label={result['label']}; "
-            f"value={result['value']}; "
-            f"query_type={result['query_type']}; "
-            f"filters={json.dumps(filters, ensure_ascii=False, default=str)}"
-        )
-
-    return "\n".join(lines)
 
 
 def _is_more_examples_query(query: str) -> bool:
@@ -527,94 +370,6 @@ def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
         "final_answer": observation,
         "messages": [AIMessage(content=observation)],
     }
-
-
-def _compact_tool_input_for_prompt(tool_input: dict[str, Any]) -> dict[str, Any]:
-    """Return a prompt-safe copy of a tool input dictionary."""
-    return dict(tool_input)
-
-
-def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
-    """Format the current turn trace for planner/reviewer prompts."""
-    if not tool_trace:
-        return "No tool calls yet in this turn."
-
-    lines: list[str] = []
-    for index, item in enumerate(tool_trace, start=1):
-        tool_input = _compact_tool_input_for_prompt(item["tool_input"])
-        lines.append(
-            f"{index}. tool={item['tool_name']}\n"
-             f"input={json.dumps(tool_input, ensure_ascii=False, default=str)}\n"
-            f"observation={item['observation']}"
-        )
-
-    return "\n\n".join(lines)
-
-
-def _profile_context_for_planner(state: AgentState) -> str:
-    """Return profile context only when the user explicitly asks about memory.
-
-    The dataset planner should not see the full durable user profile by default:
-    task-specific profile pollution can bias tool planning. Profile content is
-    still available through read_user_profile when the user asks profile/memory
-    questions.
-    """
-    user_query = _latest_user_message(state["messages"]).lower()
-    if "remember" in user_query or "profile" in user_query:
-        return state["user_profile"]
-    return "Profile hidden for dataset tool planning. Use read_user_profile only for explicit profile/memory questions."
-
-
-def _build_planner_messages(
-        state: AgentState,
-        reviewer_feedback: str | None,
-) -> list[BaseMessage]:
-    """Build input messages for next-tool planning."""
-    user_query = _latest_user_message(state["messages"])
-
-    context = f"""Current route: {state["route"]}
-Route reason: {state["route_reason"]}
-
-User profile:
-{_profile_context_for_planner(state)}
-
-Recent structured results:
-{_structured_results_for_prompt(state["last_structured_results"])}
-
-Current turn tool trace:
-{_compact_tool_trace_for_prompt(state["tool_trace"])}
-
-
-Reviewer feedback:
-{reviewer_feedback or "No reviewer feedback yet."}
-"""
-
-    return [
-        SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-        SystemMessage(content=context),
-        HumanMessage(content=user_query),
-    ]
-
-
-def _build_reviewer_messages(state: AgentState) -> list[BaseMessage]:
-    """Build input messages for observation review."""
-    user_query = _latest_user_message(state["messages"])
-    context = f"""Current route: {state["route"]}
-Route reason: {state["route_reason"]}
-
-Recent structured results:
-{_structured_results_for_prompt(state["last_structured_results"])}
-
-Current turn tool trace:
-{_compact_tool_trace_for_prompt(state["tool_trace"])}
-
-"""
-
-    return [
-        SystemMessage(content=REVIEWER_SYSTEM_PROMPT),
-        SystemMessage(content=context),
-        HumanMessage(content=user_query),
-    ]
 
 
 def _normalize_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
