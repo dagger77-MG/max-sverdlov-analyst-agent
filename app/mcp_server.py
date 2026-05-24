@@ -4,6 +4,7 @@ from typing import Literal
 
 from fastmcp import FastMCP
 
+from app.memory import read_user_profile_impl
 from app.tools import (
     count_rows_impl,
     get_dataset_schema_impl,
@@ -15,6 +16,13 @@ from app.tools import (
 
 
 mcp = FastMCP("bitext-data-tools")
+
+
+@mcp.tool
+def read_user_profile(user_id: str) -> dict:
+    """Read the persistent distilled profile for a user."""
+    result = read_user_profile_impl(user_id=user_id)
+    return result.model_dump()
 
 
 @mcp.tool

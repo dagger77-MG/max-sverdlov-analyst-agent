@@ -69,6 +69,20 @@ def _debug_trace(message: str) -> None:
         print(f"[debug] {message}", flush=True)
 
 
+def _reviewer_exception_feedback(exc: Exception, context: str) -> str:
+    """Build planner feedback after reviewer structured-output failure."""
+    return (
+        "The reviewer failed to return a valid structured decision "
+        f"{context}. Error: {type(exc).__name__}: {exc}. "
+        "Continue agentically from the current tool trace. Do not repeat "
+        "the same failed or already-observed tool call. If the current "
+        "observations fully answer the exact user request, produce a "
+        "grounded final answer. Otherwise, choose exactly one next useful "
+        "tool based on the current observations. If no useful tool exists, "
+        "produce a cannot-answer style final answer."
+    )
+
+
 def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
     """Run a graph-owned plan -> execute -> review loop for dataset questions."""
     deterministic_result = _handle_more_examples_follow_up(state)
@@ -204,15 +218,10 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             try:
                 review = _review_observations(state)
             except Exception as exc:
-                must_call_tool_before_final_answer = True
-                reviewer_feedback = (
-                    "The reviewer failed to return a valid structured decision "
-                    f"after the latest tool call. Error: {type(exc).__name__}: {exc}. "
-                    "Continue agentically from the current tool trace. Do not repeat "
-                    "the same failed or already-observed tool call. Because the latest "
-                    "observation was not successfully reviewed, do not produce a normal "
-                    "answered final answer from it. Choose exactly one next useful tool, "
-                    "or produce a cannot-answer style final answer if no useful tool exists."
+                must_call_tool_before_final_answer = False
+                reviewer_feedback = _reviewer_exception_feedback(
+                    exc,
+                    "after the latest tool call",
                 )
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
@@ -349,14 +358,10 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 try:
                     follow_up_review = _review_observations(state)
                 except Exception as exc:
-                    must_call_tool_before_final_answer = True
-                    reviewer_feedback = (
-                        "The reviewer failed to return a valid structured decision "
-                        f"after the reviewer-suggested tool. Error: "
-                        f"{type(exc).__name__}: {exc}. Because the latest observation "
-                        "was not successfully reviewed, do not produce a normal answered "
-                        "final answer from it. Choose exactly one next useful tool, or "
-                        "produce a cannot-answer style final answer if no useful tool exists."
+                    must_call_tool_before_final_answer = False
+                    reviewer_feedback = _reviewer_exception_feedback(
+                        exc,
+                        "after the reviewer-suggested tool",
                     )
                     _debug_trace(
                         f"iteration {iteration_number}/{state['max_iterations']}: "
