@@ -219,6 +219,23 @@ _CATEGORY_ALIASES: dict[str, str] = {
 }
 
 
+def _resolve_category_alias_in_text(value: str) -> str | None:
+    """Resolve exact or embedded natural-language category aliases."""
+    normalized = _normalize_filter_value(value)
+
+    if normalized is None:
+        return None
+
+    exact_alias = _CATEGORY_ALIASES.get(normalized)
+    if exact_alias is not None:
+        return exact_alias
+
+    for alias, category in _CATEGORY_ALIASES.items():
+        if alias in normalized:
+            return category
+
+    return None
+
 def _normalize_category_filter(value: str | None) -> str | None:
     """Normalize category filter values, including common natural-language aliases."""
     normalized = _normalize_filter_value(value)
@@ -226,7 +243,7 @@ def _normalize_category_filter(value: str | None) -> str | None:
     if normalized is None:
         return None
 
-    return _CATEGORY_ALIASES.get(normalized, normalized)
+    return _resolve_category_alias_in_text(normalized) or normalized
 
 
 def _tokenize_filter_text(value: str) -> set[str]:
@@ -258,7 +275,7 @@ def _score_filter_candidate(
         return 0.0, "Empty query or candidate."
 
     if column == "category":
-        alias_value = _normalize_category_filter(normalized_query)
+        alias_value = _resolve_category_alias_in_text(normalized_query)
         if alias_value == normalized_candidate:
             return 1.0, "Category alias resolves exactly to this dataset value."
 

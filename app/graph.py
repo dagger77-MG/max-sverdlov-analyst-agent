@@ -82,7 +82,10 @@ class ToolPlanDecision(BaseModel):
         description="Final answer when no more tools are needed.",
     )
     reason: str = Field(
-        description="Brief explanation of the planning decision."
+        description=(
+            "One short sentence explaining the planning decision. "
+            "Do not include hidden reasoning, chains of thought, or long analysis."
+        )
     )
 
 
@@ -126,6 +129,11 @@ class ObservationReviewDecision(BaseModel):
 @lru_cache(maxsize=1)
 def get_agent_llm():
     """Return a cached OpenAI-compatible chat model for the data agent."""
+    return _create_agent_chat_llm(max_tokens=settings.max_tokens)
+
+
+def _create_agent_chat_llm(max_tokens: int):
+    """Create an OpenAI-compatible chat model with an explicit output budget."""
     if not settings.nebius_api_key:
         raise RuntimeError(
             "NEBIUS_API_KEY is missing. Add it to your environment or .env file "
@@ -145,7 +153,7 @@ def get_agent_llm():
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         temperature=0,
-        max_tokens=settings.max_tokens,
+        max_tokens=max_tokens,
         # extra_body={
         #     "enable_thinking": False,
         #     "thinking_budget": 0,
@@ -156,7 +164,9 @@ def get_agent_llm():
 @lru_cache(maxsize=1)
 def get_structured_tool_planner_llm():
     """Return a cached model configured for next-tool planning decisions."""
-    return get_agent_llm().with_structured_output(ToolPlanDecision)
+    return _create_agent_chat_llm(
+        max_tokens=min(settings.max_tokens, 512),
+    ).with_structured_output(ToolPlanDecision)
 
 
 @lru_cache(maxsize=1)
@@ -245,6 +255,20 @@ def _append_structured_result(
     """Store compact structured results for follow-up questions."""
     state["last_structured_results"].append(result)
     state["last_structured_results"] = state["last_structured_results"][-max_results:]
+
+
+def _final_answer_update(
+    state: AgentState,
+    final_answer: str,
+) -> dict[str, Any]:
+    """Set final_answer and return the standard graph state update."""
+    state["final_answer"] = final_answer
+    return {
+        "tool_trace": state["tool_trace"],
+        "last_structured_results": state["last_structured_results"],
+        "final_answer": final_answer,
+        "messages": [AIMessage(content=final_answer)],
+    }
 
 
 def _structured_results_for_prompt(results: list[AnalysisResult]) -> str:
@@ -598,16 +622,85 @@ def _normalize_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return dict(tool_input or {})
 
 
+def _normalize_resolve_filter_value_input(
+    tool_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize resolver input aliases produced by planner/reviewer models."""
+    normalized_input = _normalize_tool_input(tool_input)
+    query = (
+        normalized_input.get("query")
+        or normalized_input.get("filter_value")
+        or normalized_input.get("value")
+        or ""
+    )
+
+    return {
+        "query": str(query),
+        "columns": normalized_input.get("columns") or ["category", "intent"],
+        "top_k": int(normalized_input.get("top_k", 5)),
+    }
+
+
+def _tool_filters(
+    normalized_input: dict[str, Any],
+) -> dict[str, str | None]:
+    """Extract canonical dataset filters from tool input."""
+    return {
+        "category": normalized_input.get("category"),
+        "intent": normalized_input.get("intent"),
+        "text_query": normalized_input.get("text_query"),
+    }
+
+
+def _canonical_tool_input(
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Return canonical tool input for execution and duplicate checks."""
+    normalized_input = _normalize_tool_input(tool_input)
+
+    if tool_name == "resolve_filter_value":
+        return _normalize_resolve_filter_value_input(normalized_input)
+
+    if tool_name == "count_rows":
+        return _tool_filters(normalized_input)
+
+    if tool_name == "sample_examples":
+        return {
+            **_tool_filters(normalized_input),
+            "n": int(normalized_input.get("n", 3)),
+            "offset": int(normalized_input.get("offset", 0)),
+        }
+
+    if tool_name == "group_counts":
+        return {
+            "group_by": normalized_input.get("group_by"),
+            **_tool_filters(normalized_input),
+            "top_k": int(normalized_input.get("top_k", 20)),
+        }
+
+    if tool_name == "summarize_rows":
+        return {
+            **_tool_filters(normalized_input),
+            "focus": normalized_input.get("focus"),
+            "target_field": normalized_input.get("target_field", "both"),
+            "max_examples": int(normalized_input.get("max_examples", 100)),
+        }
+
+    return normalized_input
+
+
 def _tool_call_already_exists(
     state: AgentState,
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> bool:
     """Return True when the same tool call already exists in this turn trace."""
-    normalized_input = _normalize_tool_input(tool_input)
+    normalized_input = _canonical_tool_input(tool_name, tool_input)
     return any(
         item["tool_name"] == tool_name
-        and _normalize_tool_input(item["tool_input"]) == normalized_input
+        and _canonical_tool_input(item["tool_name"], item["tool_input"])
+        == normalized_input
         for item in state["tool_trace"]
     )
 
@@ -617,22 +710,13 @@ def _format_model_dict(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-def _tool_filters(normalized_input: dict[str, Any]) -> dict[str, str | None]:
-    """Extract dataset filters from a planner-supplied tool input."""
-    return {
-        "category": normalized_input.get("category"),
-        "intent": normalized_input.get("intent"),
-        "text_query": normalized_input.get("text_query"),
-    }
-
-
 def _execute_selected_tool(
     state: AgentState,
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> None:
     """Execute one selected tool and append trace/structured follow-up state."""
-    normalized_input = _normalize_tool_input(tool_input)
+    normalized_input = _canonical_tool_input(tool_name, tool_input)
 
     if tool_name == "get_dataset_schema":
         result = get_dataset_schema_impl(
@@ -650,9 +734,9 @@ def _execute_selected_tool(
 
     if tool_name == "resolve_filter_value":
         result = resolve_filter_value_impl(
-            query=str(normalized_input.get("query", "")),
-            columns=normalized_input.get("columns") or ["category", "intent"],
-            top_k=int(normalized_input.get("top_k", 5)),
+            query=normalized_input["query"],
+            columns=normalized_input["columns"],
+            top_k=normalized_input["top_k"],
         )
         _append_trace(
             state,
@@ -851,6 +935,106 @@ def _trace_observation_is_error(observation: str) -> bool:
         return False
 
     return isinstance(parsed, dict) and "error" in parsed
+
+
+def _failed_explicit_resolver_final_answer(state: AgentState) -> str | None:
+    """Return a deterministic cannot-answer after an explicit resolver miss."""
+    if not state["tool_trace"]:
+        return None
+
+    latest_step = state["tool_trace"][-1]
+    if latest_step["tool_name"] != "resolve_filter_value":
+        return None
+
+    try:
+        observation = json.loads(latest_step["observation"])
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(observation, dict):
+        return None
+
+    if observation.get("confidence") != "none":
+        return None
+
+    tool_input = _normalize_resolve_filter_value_input(latest_step["tool_input"])
+    columns = tool_input["columns"]
+    query = tool_input["query"].strip()
+    user_query = _latest_user_message(state["messages"]).lower()
+
+    if not query:
+        return None
+
+    if columns == ["intent"] and "intent" in user_query:
+        return (
+            f'No matching intent value exists for "{query}" in the dataset, '
+            "so I can't show examples for that intent."
+        )
+
+    if columns == ["category"] and "category" in user_query:
+        return (
+            f'No matching category value exists for "{query}" in the dataset, '
+            "so I can't show examples for that category."
+        )
+
+    return None
+
+
+def _return_failed_explicit_resolver_answer_if_ready(
+    state: AgentState,
+) -> dict[str, Any] | None:
+    """Return immediately after an explicit category/intent resolver miss."""
+    final_answer = _failed_explicit_resolver_final_answer(state)
+    if final_answer is None:
+        return None
+
+    return _final_answer_update(state, final_answer)
+
+
+def _sample_examples_observation_has_examples(observation: str) -> bool:
+    """Return True when a formatted sample_examples observation contains rows."""
+    match = re.search(
+        r"Returned\s+(\d+)\s+examples\s+from\s+(\d+)\s+matching\s+rows",
+        observation,
+    )
+
+    if match is None:
+        return False
+
+    returned_examples = int(match.group(1))
+    matching_rows = int(match.group(2))
+
+    return returned_examples > 0 and matching_rows > 0
+
+
+def _return_deterministic_sample_examples_answer_if_ready(
+    state: AgentState,
+    tool_name: str,
+) -> dict[str, Any] | None:
+    """Return sample_examples output directly only when actual examples exist."""
+    if (
+        tool_name == "sample_examples"
+        and _is_example_request(_latest_user_message(state["messages"]))
+        and state["tool_trace"]
+        and _sample_examples_observation_has_examples(
+            state["tool_trace"][-1]["observation"]
+        )
+    ):
+        final_answer = state["tool_trace"][-1]["observation"]
+        return _final_answer_update(state, final_answer)
+
+    return None
+
+
+def _review_observations(
+    state: AgentState,
+) -> ObservationReviewDecision:
+    """Ask the reviewer whether the current observations answer the query."""
+    reviewer_llm = get_structured_observation_reviewer_llm()
+    review = reviewer_llm.invoke(_build_reviewer_messages(state))
+    if not isinstance(review, ObservationReviewDecision):
+        review = ObservationReviewDecision.model_validate(review)
+    return review
 
 
 def _has_filtered_group_counts_trace(
@@ -1063,12 +1247,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     f"iteration {iteration_number}/{state['max_iterations']}: "
                     "returning planner final_answer"
                 )
-                return {
-                    "tool_trace": state["tool_trace"],
-                                "last_structured_results": state["last_structured_results"],
-                    "final_answer": final_answer,
-                    "messages": [AIMessage(content=final_answer)],
-                }
+                return _final_answer_update(state, final_answer)
 
             if (
                 plan.action == "call_tool"
@@ -1101,31 +1280,36 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 f"trace_steps={len(state['tool_trace'])}"
             )
 
-            if (
-                    plan.tool_name == "sample_examples"
-                    and _is_example_request(_latest_user_message(state["messages"]))
-            ):
-                final_answer = state["tool_trace"][-1]["observation"]
-                state["final_answer"] = final_answer
+            failed_resolver_answer = (
+                _return_failed_explicit_resolver_answer_if_ready(state)
+            )
+            if failed_resolver_answer is not None:
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    "returning deterministic failed resolver answer"
+                )
+                return failed_resolver_answer
+
+
+            deterministic_sample_answer = (
+                _return_deterministic_sample_examples_answer_if_ready(
+                    state=state,
+                    tool_name=plan.tool_name,
+                )
+            )
+            if deterministic_sample_answer is not None:
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
                     "returning deterministic sample_examples answer"
                 )
-                return {
-                    "tool_trace": state["tool_trace"],
-                                "last_structured_results": state["last_structured_results"],
-                    "final_answer": final_answer,
-                    "messages": [AIMessage(content=final_answer)],
-                }
+                return deterministic_sample_answer
+
             _debug_trace(
                 f"iteration {iteration_number}/{state['max_iterations']}: "
                 "reviewer start"
             )
             try:
-                reviewer_llm = get_structured_observation_reviewer_llm()
-                review = reviewer_llm.invoke(_build_reviewer_messages(state))
-                if not isinstance(review, ObservationReviewDecision):
-                    review = ObservationReviewDecision.model_validate(review)
+                review = _review_observations(state)
             except Exception as exc:
                 reviewer_requires_tool = False
                 reviewer_feedback = (
@@ -1168,17 +1352,11 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
 
                 reviewer_requires_tool = False
                 final_answer = review.final_answer.strip() or review.reason.strip()
-                state["final_answer"] = final_answer
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
                     f"returning reviewer status={review.status}"
                 )
-                return {
-                    "tool_trace": state["tool_trace"],
-                                "last_structured_results": state["last_structured_results"],
-                    "final_answer": final_answer,
-                    "messages": [AIMessage(content=final_answer)],
-                }
+                return _final_answer_update(state, final_answer)
 
             if review.status == "needs_more":
                 reviewer_requires_tool = True
@@ -1232,44 +1410,131 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     )
                     continue
 
-                reviewer_feedback = (
-                    f"{review.reason}\n"
-                    f"Suggested next tool: {review.suggested_tool_name}\n"
-                    f"Suggested next input: "
-                    f"{json.dumps(_compact_tool_input_for_prompt(review.suggested_tool_input), ensure_ascii=False, default=str)}"
-                )
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
                     f"reviewer requested next tool={review.suggested_tool_name}"
+                    "\nexecuting directly"
                 )
+
+                _execute_selected_tool(
+                    state=state,
+                    tool_name=review.suggested_tool_name,
+                    tool_input=review.suggested_tool_input,
+                )
+
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"executed reviewer tool={review.suggested_tool_name}; "
+                    f"trace_steps={len(state['tool_trace'])}"
+                )
+
+                failed_resolver_answer = (
+                    _return_failed_explicit_resolver_answer_if_ready(state)
+                )
+                if failed_resolver_answer is not None:
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "returning deterministic reviewer failed resolver answer"
+                    )
+                    return failed_resolver_answer
+
+                deterministic_sample_answer = (
+                    _return_deterministic_sample_examples_answer_if_ready(
+                        state=state,
+                        tool_name=review.suggested_tool_name,
+                    )
+                )
+                if deterministic_sample_answer is not None:
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        "returning deterministic reviewer sample_examples answer"
+                    )
+                    return deterministic_sample_answer
+
+                reviewer_requires_tool = False
+                reviewer_feedback = (
+                    f"The reviewer-suggested tool {review.suggested_tool_name} "
+                    "has now been executed. The observation reviewer will inspect "
+                    "the latest observation before another planner step is allowed."
+                )
+
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    "reviewer start after direct tool execution"
+                )
+                try:
+                    follow_up_review = _review_observations(state)
+                except Exception as exc:
+                    reviewer_feedback = (
+                        "The reviewer failed to return a valid structured decision "
+                        f"after the reviewer-suggested tool. Error: "
+                        f"{type(exc).__name__}: {exc}. Continue agentically from "
+                        "the current tool trace. Do not repeat the same tool call."
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        f"follow-up reviewer exception={type(exc).__name__}: {exc}; "
+                        "continuing with planner feedback"
+                    )
+                    continue
+
+                reviewer_feedback = follow_up_review.reason
+                _debug_trace(
+                    f"iteration {iteration_number}/{state['max_iterations']}: "
+                    f"follow-up reviewer status={follow_up_review.status}; "
+                    f"suggested_tool={follow_up_review.suggested_tool_name or '-'}; "
+                    f"reason={follow_up_review.reason}"
+                )
+
+                if follow_up_review.status in {"answered", "cannot_answer"}:
+                    if follow_up_review.status == "answered":
+                        contract_error = _answer_contract_error(state)
+                        if contract_error:
+                            reviewer_requires_tool = True
+                            reviewer_feedback = _build_final_answer_block_feedback(
+                                contract_error
+                            )
+                            _debug_trace(
+                                f"iteration {iteration_number}/{state['max_iterations']}: "
+                                "blocked follow-up reviewer answered by evidence contract"
+                            )
+                            continue
+
+                    final_answer = (
+                        follow_up_review.final_answer.strip()
+                        or follow_up_review.reason.strip()
+                    )
+                    _debug_trace(
+                        f"iteration {iteration_number}/{state['max_iterations']}: "
+                        f"returning follow-up reviewer status={follow_up_review.status}"
+                    )
+                    return _final_answer_update(state, final_answer)
+
+                if follow_up_review.status == "needs_more":
+                    reviewer_requires_tool = True
+                    reviewer_feedback = (
+                        f"{follow_up_review.reason}\n"
+                        f"Suggested next tool: {follow_up_review.suggested_tool_name}\n"
+                        f"Suggested next input: "
+                        f"{json.dumps(_compact_tool_input_for_prompt(follow_up_review.suggested_tool_input), ensure_ascii=False, default=str)}"
+                    )
+                    continue
 
         except Exception as exc:
             fallback = _fallback_answer()
-            state["final_answer"] = fallback
             _debug_trace(
                 f"iteration {iteration_number}/{state['max_iterations']}: "
                 f"exception={type(exc).__name__}: {exc}"
             )
-            return {
-                "tool_trace": state["tool_trace"],
-                        "last_structured_results": state["last_structured_results"],
-                "final_answer": fallback,
-                "messages": [AIMessage(content=fallback)],
-            }
+            return _final_answer_update(state, fallback)
 
     fallback = _fallback_answer()
-    state["final_answer"] = fallback
     _debug_trace(
         f"max_iterations_exhausted={state['max_iterations']}; "
         f"trace_steps={len(state['tool_trace'])}"
     )
 
-    return {
-        "tool_trace": state["tool_trace"],
-        "last_structured_results": state["last_structured_results"],
-        "final_answer": fallback,
-        "messages": [AIMessage(content=fallback)],
-    }
+    return _final_answer_update(state, fallback)
 
 
 def profile_update_node(state: AgentState) -> dict[str, Any]:
