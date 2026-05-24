@@ -16,6 +16,11 @@ class FakeStructuredRouterLLM:
         return router.RouteDecision(route=self.route, reason=self.reason)
 
 
+class FailingStructuredRouterLLM:
+    def invoke(self, messages):
+        raise ValueError("Simulated structured-output failure.")
+
+
 @pytest.mark.parametrize(
     ("query", "expected_route"),
     [
@@ -43,6 +48,8 @@ class FakeStructuredRouterLLM:
         ("Write me a poem about customer service.", "out_of_scope"),
     ],
 )
+
+
 def test_route_query_returns_llm_selected_route(
     monkeypatch: pytest.MonkeyPatch,
     query: str,
@@ -103,6 +110,23 @@ def test_route_query_with_reason_validates_dict_response(
         route="structured",
         reason="The query asks for an exact dataset count.",
     )
+
+
+def test_route_query_with_reason_wraps_router_llm_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        router,
+        "get_structured_router_llm",
+        lambda: FailingStructuredRouterLLM(),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+       router.route_query_with_reason("show me 2 more")
+
+    assert "Router failed to produce a valid route decision." in str(exc_info.value)
+    assert "ValueError" in str(exc_info.value)
+    assert "Simulated structured-output failure." in str(exc_info.value)
 
 
 def test_route_query_sends_system_and_human_messages(
