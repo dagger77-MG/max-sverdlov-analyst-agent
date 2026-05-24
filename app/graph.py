@@ -1067,6 +1067,128 @@ def _has_resolver_trace_for_column(state: AgentState, column: str) -> bool:
     return False
 
 
+def _parse_trace_observation_json(
+    trace_item: ToolTraceItem,
+) -> dict[str, Any] | None:
+    """Parse a trace observation as JSON when possible."""
+    try:
+        parsed = json.loads(trace_item["observation"])
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    return parsed
+
+
+def _normalize_contract_text(value: Any) -> str:
+    """Normalize trace text for lightweight contract comparisons."""
+    return str(value or "").strip().lower()
+
+
+def _is_text_query_only_summary(trace_item: ToolTraceItem) -> bool:
+    """Return True for summarize_rows calls that used only text_query filtering."""
+    if trace_item["tool_name"] != "summarize_rows":
+        return False
+
+    tool_input = trace_item["tool_input"]
+    return (
+        not tool_input.get("category")
+        and not tool_input.get("intent")
+        and bool(tool_input.get("text_query"))
+    )
+
+
+def _summarize_rows_uses_resolved_filter(
+    trace_item: ToolTraceItem,
+    recommended_filter: dict[str, Any],
+) -> bool:
+    """Return True when summarize_rows uses the resolver's semantic filter."""
+    if trace_item["tool_name"] != "summarize_rows":
+        return False
+
+    tool_input = trace_item["tool_input"]
+    category = recommended_filter.get("category")
+    intent = recommended_filter.get("intent")
+
+    if category and tool_input.get("category") != category:
+        return False
+
+    if intent and tool_input.get("intent") != intent:
+        return False
+
+    return bool(category or intent)
+
+
+def _semantic_summary_contract_error(state: AgentState) -> str | None:
+    """Block final answers from text-query-only summaries after resolution.
+
+    If a broad phrase was first summarized with only text_query, and a resolver
+    later found a concrete category/intent, the final answer must be based on a
+    later summarize_rows call using that resolved semantic filter.
+    """
+    trace = state["tool_trace"]
+
+    for resolver_index, trace_item in enumerate(trace):
+        if trace_item["tool_name"] != "resolve_filter_value":
+            continue
+
+        observation = _parse_trace_observation_json(trace_item)
+        if observation is None:
+            continue
+
+        if observation.get("confidence") not in {"medium", "high"}:
+            continue
+
+        recommended_filter = observation.get("recommended_filter")
+        if not isinstance(recommended_filter, dict):
+            continue
+
+        if not recommended_filter.get("category") and not recommended_filter.get("intent"):
+            continue
+
+        resolver_query = _normalize_contract_text(
+            observation.get("query") or trace_item["tool_input"].get("query")
+        )
+        if not resolver_query:
+            continue
+
+        has_matching_text_query_summary = any(
+            _is_text_query_only_summary(summary_item)
+            and _normalize_contract_text(summary_item["tool_input"].get("text_query"))
+            == resolver_query
+            for summary_item in trace
+        )
+        if not has_matching_text_query_summary:
+            continue
+
+        has_later_semantic_summary = any(
+            _summarize_rows_uses_resolved_filter(
+                summary_item,
+                recommended_filter=recommended_filter,
+            )
+            for summary_item in trace[resolver_index + 1 :]
+        )
+        if has_later_semantic_summary:
+            continue
+
+        filter_parts = [
+            f'{column}="{value}"'
+            for column, value in recommended_filter.items()
+            if value
+        ]
+        filter_text = ", ".join(filter_parts)
+        return (
+            f'resolve_filter_value recommended {filter_text} for '
+            f'"{resolver_query}", but summarize_rows has not been called with '
+            "that resolved semantic filter yet. The earlier text_query-only "
+            "summarize_rows call is not valid final evidence."
+        )
+
+    return None
+
+
 def _answer_contract_error(state: AgentState) -> str | None:
     """Block final answers for scoped distributions until scoped grouping exists."""
     user_query = _latest_user_message(state["messages"])
@@ -1110,6 +1232,10 @@ def _answer_contract_error(state: AgentState) -> str | None:
             "Valid evidence requires resolving the intent and calling "
             "group_counts with group_by='category' and intent=<resolved_intent>."
         )
+
+    semantic_summary_error = _semantic_summary_contract_error(state)
+    if semantic_summary_error:
+        return semantic_summary_error
 
     return None
 

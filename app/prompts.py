@@ -84,6 +84,12 @@ Filter resolution rules:
   "account problems", "cancellation requests", "delivery questions",
   "people wanting their money back", or similar phrases must be resolved
   against both category and intent.
+- Do not use text_query as a shortcut for these broad business phrases.
+  text_query is for literal full-text search when the user is clearly asking
+  for rows containing specific words, not when the phrase likely names a
+  dataset category or intent. For example, "cancellation requests" should be
+  resolved with resolve_filter_value before summarize_rows, not passed directly
+  as text_query="cancellation requests".
 - Use top_k=5 for resolve_filter_value unless the reviewer explicitly asks
   for a different value. Do not use top_k=1 for broad business phrases.
 - Do not invent exact category or intent values unless resolve_filter_value
@@ -114,6 +120,12 @@ Task patterns:
   before resolve_filter_value, it is not valid evidence.
 - For summaries/themes/tone/pain points, first resolve any user-provided
   category/intent value, then call summarize_rows with semantic filters.
+- For summaries/themes/tone/pain points about broad business phrases such as
+  "cancellation requests", "refund requests", "shipping issues", or
+  "account problems", first call resolve_filter_value. Do not call
+  summarize_rows(text_query=...) as the first tool for those phrases.
+- For summarize_rows.focus, use the full user question or a concise restatement
+  of it. Do not set focus to only "response", "instruction", or "both"
 - If the user asks how agents/support representatives respond, use
   summarize_rows with target_field="response".
 - If the user asks what customers ask, want, request, or complain about, use
@@ -156,6 +168,13 @@ Hard rules:
    answering evidence; follow the required next step instead.
 6. Do not suggest tools with row_ids or scope. Suggested tool inputs must use
    semantic filters directly.
+7. Never suggest an exact tool call that already appears in the current turn
+   trace. If a prior tool call was insufficient, suggest a different useful
+   tool call. If no different useful tool exists, return answered or
+   cannot_answer instead of needs_more.
+8. If summarize_rows already ran with only text_query for a broad business
+   phrase, and the result appears to be the wrong semantic subset, suggest
+   resolve_filter_value rather than repeating summarize_rows.
 
 Filter rules:
 1. A filtered count_rows, sample_examples, group_counts, or summarize_rows call
@@ -176,6 +195,19 @@ Filter rules:
    final answer saying no matching category exists. Do not broaden to intent.
 6. If resolve_filter_value recommends a filter, the next tool is normally
    the exact analysis tool needed by the user, using that recommended_filter.
+7. A summarize_rows call with category=None and intent=None but a text_query
+   based on a broad business phrase is not valid evidence for a question about
+   that business area when no resolver evidence exists in the same trace.
+   Examples of broad business phrases include "cancellation requests",
+   "refund requests", "shipping issues", "delivery questions", "account
+   problems", and "people wanting their money back".
+8. When rule 7 applies, return needs_more with:
+   suggested_tool_name="resolve_filter_value"
+   suggested_tool_input={
+     "query": <the broad business phrase>,
+     "columns": ["category", "intent"],
+     "top_k": 5
+   }
    
 Scoped distribution rules:
 0. For unscoped discovery questions such as "What categories exist?" or
@@ -219,5 +251,13 @@ Summary rules:
    target_field="response".
 3. Questions about what customers ask/request/want require summarize_rows with
    target_field="instruction" or "both".
-4. If one more tool is needed, provide suggested_tool_name and suggested_tool_input.
+4. For summary questions about a broad business phrase, valid evidence normally
+   requires resolver evidence first, followed by summarize_rows with the
+   recommended semantic filter. A text_query-only summarize_rows call is weak
+   evidence and should not be accepted when it selected an unrelated category
+   or intent.
+5. summarize_rows.focus should preserve the user's analytical focus. If the user
+   asks how agents respond to cancellation requests, the focus should be about
+   response patterns to cancellation requests, not just "response".
+6. If one more tool is needed, provide suggested_tool_name and suggested_tool_input.
 """

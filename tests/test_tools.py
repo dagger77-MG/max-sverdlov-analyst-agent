@@ -449,6 +449,76 @@ def test_summarize_rows_uses_llm_summary_when_available(
     assert "Focus: refund requests" in fake_llm.received_messages[1].content
 
 
+def test_summarize_rows_strips_thinking_markup_from_llm_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLLMResponse:
+        content = (
+            "<think>\n"
+            "Internal reasoning that should not appear in the summary.\n"
+            "</think>\n\n"
+            "Refund rows mainly describe customers asking for refunds or refund status."
+        )
+
+    class FakeSummarizerLLM:
+        def invoke(self, messages):
+            return FakeLLMResponse()
+
+    monkeypatch.setattr(
+        tools,
+        "get_summarizer_llm",
+        lambda: FakeSummarizerLLM(),
+    )
+
+    result = tools.summarize_rows_impl(
+        category="REFUND",
+        focus="refund requests",
+        max_examples=10,
+    )
+
+    assert result.summary == (
+        "Refund rows mainly describe customers asking for refunds or refund status."
+    )
+    assert "<think>" not in result.summary
+    assert "</think>" not in result.summary
+    assert "Internal reasoning" not in result.summary
+
+
+def test_summarize_rows_falls_back_when_llm_summary_is_only_thinking_markup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLLMResponse:
+        content = (
+            "<think>\n"
+            "Internal reasoning that should be stripped completely.\n"
+            "</think>"
+        )
+
+    class FakeSummarizerLLM:
+        def invoke(self, messages):
+            return FakeLLMResponse()
+
+    monkeypatch.setattr(
+        tools,
+        "get_summarizer_llm",
+        lambda: FakeSummarizerLLM(),
+    )
+
+    result = tools.summarize_rows_impl(
+        category="REFUND",
+        focus="refund requests",
+        max_examples=10,
+    )
+
+    assert result.row_count_used == 2
+    assert result.match_count == 2
+    assert result.applied_filters["category"] == "REFUND"
+    assert "<think>" not in result.summary
+    assert "</think>" not in result.summary
+    assert "Rows reviewed: 2" in result.summary
+    assert "Top categories: REFUND (2)" in result.summary
+
+
 def test_schema_based_wrappers_call_implementations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

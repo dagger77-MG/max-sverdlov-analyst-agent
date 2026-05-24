@@ -686,6 +686,17 @@ def _rows_to_summary_context(
     return "\n\n---\n\n".join(lines)
 
 
+def _strip_thinking_markup(text: str) -> str:
+    """Remove model thinking markup from user-facing summaries."""
+    cleaned = re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return cleaned.strip()
+
+
 def _llm_rows_summary(
     df,
     focus: str,
@@ -717,7 +728,7 @@ def _llm_rows_summary(
         ]
     )
 
-    return str(response.content).strip()
+    return _strip_thinking_markup(str(response.content))
 
 
 def summarize_rows_impl(
@@ -757,6 +768,12 @@ def summarize_rows_impl(
             focus=focus,
             target_field=target_field,
         )
+        if not summary:
+            summary = _deterministic_rows_summary(
+                df=df,
+                focus=focus,
+                target_field=target_field,
+            )
     except Exception:
         summary = _deterministic_rows_summary(
             df=df,

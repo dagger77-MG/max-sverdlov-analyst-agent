@@ -825,6 +825,189 @@ def test_unstructured_query_summarizes_with_category_filter(
     assert result["final_answer"] == "Customers mainly provide product feedback."
 
 
+def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="unstructured",
+            reason="The user asks for response patterns for cancellation requests.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        graph,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "CANCEL",
+                    "count": 950,
+                    "score": 0.9,
+                    "reason": "Dataset value appears inside the user phrase.",
+                },
+                {
+                    "column": "intent",
+                    "value": "check_cancellation_fee",
+                    "count": 950,
+                    "score": 0.6333,
+                    "reason": "Token overlap: cancellation.",
+                },
+            ],
+            recommended_filter={
+                "category": "CANCEL",
+                "intent": None,
+            },
+            confidence="high",
+        ),
+    )
+
+    captured_summaries: list[dict] = []
+
+    def fake_summarize_rows(
+        category=None,
+        intent=None,
+        text_query=None,
+        focus="",
+        target_field="both",
+        max_examples=100,
+    ):
+        captured_summaries.append(
+            {
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+                "focus": focus,
+                "target_field": target_field,
+                "max_examples": max_examples,
+            }
+        )
+
+        if text_query == "cancellation requests":
+            return _model_result(
+                summary="Weak summary from one REFUND policy row.",
+                row_count_used=1,
+                match_count=1,
+                focus=focus,
+                target_field=target_field,
+                applied_filters={
+                    "category": category,
+                    "intent": intent,
+                    "text_query": text_query,
+                },
+            )
+
+        return _model_result(
+            summary="Agents explain cancellation policy and guide customers through next steps.",
+            row_count_used=100,
+            match_count=950,
+            focus=focus,
+            target_field=target_field,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        )
+
+    monkeypatch.setattr(graph, "summarize_rows_impl", fake_summarize_rows)
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "summarize_rows",
+            {
+                "text_query": "cancellation requests",
+                "focus": (
+                    "How do customer service representatives typically respond "
+                    "to cancellation requests?"
+                ),
+                "target_field": "response",
+                "max_examples": 100,
+            },
+        ),
+        _plan_call(
+            "summarize_rows",
+            {
+                "category": "CANCEL",
+                "focus": (
+                    "How do customer service representatives typically respond "
+                    "to cancellation requests?"
+                ),
+                "target_field": "response",
+                "max_examples": 100,
+            },
+        ),
+    )
+
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason=(
+                "The text-query summary lacks resolver evidence for the broad "
+                "business phrase."
+            ),
+            suggested_tool_name="resolve_filter_value",
+            suggested_tool_input={
+                "query": "cancellation requests",
+                "columns": ["category", "intent"],
+                "top_k": 5,
+            },
+        ),
+        _review_answer(
+            "Wrong premature answer from text-query-only summary."
+        ),
+        _review_answer(
+            "Agents explain cancellation policy and guide customers through next steps."
+        ),
+    )
+
+    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="How do customer service representatives typically respond to cancellation requests?",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert [step["tool_name"] for step in result["tool_trace"]] == [
+        "summarize_rows",
+        "resolve_filter_value",
+        "summarize_rows",
+    ]
+    assert captured_summaries == [
+        {
+            "category": None,
+            "intent": None,
+            "text_query": "cancellation requests",
+            "focus": (
+                "How do customer service representatives typically respond "
+                "to cancellation requests?"
+            ),
+            "target_field": "response",
+            "max_examples": 100,
+        },
+        {
+            "category": "CANCEL",
+            "intent": None,
+            "text_query": None,
+            "focus": (
+                "How do customer service representatives typically respond "
+                "to cancellation requests?"
+            ),
+            "target_field": "response",
+            "max_examples": 100,
+        },
+    ]
+    assert result["final_answer"] == (
+        "Agents explain cancellation policy and guide customers through next steps."
+    )
+
+
 def test_agent_response_summary_uses_target_field_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
