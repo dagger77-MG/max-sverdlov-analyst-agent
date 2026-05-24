@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from functools import lru_cache
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 
 from app.config import settings
+from app.agent import loop as _loop
+from app.agent import profile as _profile
 from app.agent import evidence_contracts as _evidence_contracts
 from app.agent import followups as _followups
 from app.agent import tool_executor as _tool_executor
@@ -29,10 +30,7 @@ from app.agent.context import (
     _profile_context_for_planner,
     _structured_results_for_prompt,
 )
-from app.prompts import (
-    OUT_OF_SCOPE_REFUSAL,
-    PROFILE_UPDATE_SYSTEM_PROMPT,
-)
+from app.prompts import OUT_OF_SCOPE_REFUSAL
 from app.agent.schemas import (
     ObservationReviewDecision,
     PlannerToolName,
@@ -188,37 +186,59 @@ def _review_observations(
     return review
 
 
-def _fallback_answer() -> str:
-    """Return a safe graph fallback for planner/reviewer/tool errors."""
-    return (
-        "I could not complete the analysis within the allowed number of "
-        "reasoning steps. Please try asking a more specific dataset question."
+_fallback_answer = _loop._fallback_answer
+_debug_trace_enabled = _loop._debug_trace_enabled
+_debug_trace = _loop._debug_trace
+
+
+def _sync_loop_dependencies() -> None:
+    """Keep graph-level monkeypatch compatibility during loop extraction.
+
+    Current tests patch planner/reviewer/tool functions on app.graph. The
+    extracted loop module imports its own dependencies, so this bridge copies
+    graph-level patched callables into app.agent.loop immediately before the
+    loop runs.
+    """
+    _sync_tool_executor_dependencies()
+
+    _loop.get_structured_tool_planner_llm = get_structured_tool_planner_llm
+    _loop.get_structured_observation_reviewer_llm = (
+        get_structured_observation_reviewer_llm
+    )
+
+    _loop._build_planner_messages = _build_planner_messages
+    _loop._build_reviewer_messages = _build_reviewer_messages
+    _loop._compact_tool_input_for_prompt = _compact_tool_input_for_prompt
+
+    _loop._execute_selected_tool = _execute_selected_tool
+    _loop._tool_call_already_exists = _tool_call_already_exists
+    _loop._handle_more_examples_follow_up = _handle_more_examples_follow_up
+    _loop._review_observations = _review_observations
+
+    _loop._answer_contract_error = _answer_contract_error
+    _loop._build_final_answer_block_feedback = _build_final_answer_block_feedback
+    _loop._final_answer_update = _final_answer_update
+    _loop._return_failed_explicit_resolver_answer_if_ready = (
+        _return_failed_explicit_resolver_answer_if_ready
+    )
+    _loop._return_deterministic_sample_examples_answer_if_ready = (
+        _return_deterministic_sample_examples_answer_if_ready
     )
 
 
-def _debug_trace_enabled() -> bool:
-    """Return True when local live graph-loop debug output is enabled."""
-    value = settings.debug_trace
-    return value
-
-
-def _debug_trace(message: str) -> None:
-    """Print live graph-loop debug events for local development.
-
-    This is intentionally separate from the user-facing tool_trace. It helps
-    debug planner/reviewer loops and swallowed exceptions while the agent is
-    still running.
-    """
-    if _debug_trace_enabled():
-        print(f"[debug] {message}", flush=True)
+def _sync_profile_dependencies() -> None:
+    """Keep graph-level monkeypatch compatibility during profile extraction."""
+    _profile.read_user_profile_impl = read_user_profile_impl
+    _profile.update_user_profile_impl = update_user_profile_impl
+    _profile.get_structured_profile_llm = get_structured_profile_llm
+    _profile.ProfileObservationDecision = ProfileObservationDecision
+    _profile._latest_user_message = _latest_user_message
 
 
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
-    """Load persistent profile memory into graph state."""
-    profile = read_user_profile_impl(state["user_id"])
-    return {
-        "user_profile": profile.profile,
-    }
+    """Compatibility wrapper for the extracted profile-load node."""
+    _sync_profile_dependencies()
+    return _profile.load_user_profile_node(state)
 
 
 def router_node(state: AgentState) -> dict[str, Any]:
@@ -241,398 +261,15 @@ def refusal_node(state: AgentState) -> dict[str, Any]:
 
 
 def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
-    """Run a graph-owned plan -> execute -> review loop for dataset questions."""
-    deterministic_result = _handle_more_examples_follow_up(state)
-    if deterministic_result is not None:
-        return deterministic_result
-
-    reviewer_feedback: str | None = None
-    reviewer_requires_tool = False
-
-    for iteration_index in range(state["max_iterations"]):
-        iteration_number = iteration_index + 1
-        try:
-            _debug_trace(
-                f"iteration {iteration_number}/{state['max_iterations']}: "
-                "planner start"
-            )
-            planner_llm = get_structured_tool_planner_llm()
-            plan = planner_llm.invoke(
-                _build_planner_messages(state, reviewer_feedback)
-            )
-            if not isinstance(plan, ToolPlanDecision):
-                plan = ToolPlanDecision.model_validate(plan)
-
-            _debug_trace(
-                f"iteration {iteration_number}/{state['max_iterations']}: "
-                f"planner action={plan.action}; "
-                f"tool={plan.tool_name or '-'}; "
-                f"reason={plan.reason}"
-            )
-
-            if plan.action == "final_answer":
-                if reviewer_requires_tool:
-                    reviewer_feedback = (
-                        "The previous reviewer decision was needs_more, so the "
-                        "current observations are not sufficient for a final answer. "
-                        "Call exactly one valid next tool. If the user-provided "
-                        "category or intent value was not resolved yet, call "
-                        "resolve_filter_value with the columns implied by the user's wording."
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "blocked planner final_answer after reviewer needs_more"
-                    )
-                    continue
-
-                final_answer = plan.final_answer.strip()
-                if not final_answer:
-                    reviewer_feedback = (
-                        "Planner chose final_answer but returned empty text."
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "planner returned empty final_answer"
-                    )
-                    continue
-                contract_error = _answer_contract_error(state)
-                if contract_error:
-                    reviewer_requires_tool = True
-                    reviewer_feedback = _build_final_answer_block_feedback(
-                        contract_error
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "blocked planner final_answer by evidence contract"
-                    )
-                    continue
-
-                state["final_answer"] = final_answer
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    "returning planner final_answer"
-                )
-                return _final_answer_update(state, final_answer)
-
-            if (
-                plan.action == "call_tool"
-                and _tool_call_already_exists(
-                    state=state,
-                    tool_name=plan.tool_name,
-                    tool_input=plan.tool_input,
-                )
-            ):
-                reviewer_requires_tool = False
-                reviewer_feedback = (
-                    "This exact tool call already exists in the current turn trace. "
-                    "Do not repeat it. Use the existing observation to produce a "
-                    "final answer or a cannot-answer style final answer."
-                )
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"blocked duplicate planner tool call={plan.tool_name}"
-                )
-                continue
-
-            _execute_selected_tool(
-                state=state,
-                tool_name=plan.tool_name,
-                tool_input=plan.tool_input,
-            )
-            _debug_trace(
-                f"iteration {iteration_number}/{state['max_iterations']}: "
-                f"executed tool={plan.tool_name}; "
-                f"trace_steps={len(state['tool_trace'])}"
-            )
-
-            failed_resolver_answer = (
-                _return_failed_explicit_resolver_answer_if_ready(state)
-            )
-            if failed_resolver_answer is not None:
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    "returning deterministic failed resolver answer"
-                )
-                return failed_resolver_answer
-
-
-            deterministic_sample_answer = (
-                _return_deterministic_sample_examples_answer_if_ready(
-                    state=state,
-                    tool_name=plan.tool_name,
-                )
-            )
-            if deterministic_sample_answer is not None:
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    "returning deterministic sample_examples answer"
-                )
-                return deterministic_sample_answer
-
-            _debug_trace(
-                f"iteration {iteration_number}/{state['max_iterations']}: "
-                "reviewer start"
-            )
-            try:
-                review = _review_observations(state)
-            except Exception as exc:
-                reviewer_requires_tool = False
-                reviewer_feedback = (
-                    "The reviewer failed to return a valid structured decision "
-                    f"after the latest tool call. Error: {type(exc).__name__}: {exc}. "
-                    "Continue agentically from the current tool trace. Do not repeat "
-                    "the same failed or already-observed tool call. If the current "
-                    "observations fully answer the exact user request, produce a "
-                    "grounded final answer. Otherwise, choose exactly one next useful "
-                    "tool based on the current observations."
-                )
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"reviewer exception={type(exc).__name__}: {exc}; "
-                    "continuing with planner feedback"
-                )
-                continue
-
-            reviewer_feedback = review.reason
-            _debug_trace(
-                f"iteration {iteration_number}/{state['max_iterations']}: "
-                f"reviewer status={review.status}; "
-                f"suggested_tool={review.suggested_tool_name or '-'}; "
-                f"reason={review.reason}"
-            )
-
-            if review.status in {"answered", "cannot_answer"}:
-                if review.status == "answered":
-                    contract_error = _answer_contract_error(state)
-                    if contract_error:
-                        reviewer_requires_tool = True
-                        reviewer_feedback = _build_final_answer_block_feedback(
-                            contract_error
-                        )
-                        _debug_trace(
-                            f"iteration {iteration_number}/{state['max_iterations']}: "
-                            "blocked reviewer answered by evidence contract"
-                        )
-                        continue
-
-                reviewer_requires_tool = False
-                final_answer = review.final_answer.strip() or review.reason.strip()
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"returning reviewer status={review.status}"
-                )
-                return _final_answer_update(state, final_answer)
-
-            if review.status == "needs_more":
-                reviewer_requires_tool = True
-
-                if not review.suggested_tool_name:
-                    reviewer_feedback = (
-                        f"{review.reason}\n"
-                        "Reviewer returned needs_more but did not provide a suggested tool. "
-                        "Choose exactly one valid next tool yourself. For unresolved "
-                        "category/intent filters, use resolve_filter_value first."
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "reviewer returned needs_more without suggested tool"
-                    )
-                    continue
-
-                if review.suggested_tool_name not in VALID_PLANNER_TOOL_NAMES:
-                    reviewer_requires_tool = False
-                    reviewer_feedback = (
-                        f"{review.reason}\n"
-                        f"Reviewer returned needs_more with invalid suggested_tool_name="
-                        f"{review.suggested_tool_name!r}. This is not a callable tool. "
-                        "Do not call another tool only because of this malformed reviewer "
-                        "decision. If the existing observations are enough, produce a "
-                        "final answer. If the requested subset/value does not exist, "
-                        "produce a cannot-answer style final answer."
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        f"reviewer suggested invalid tool={review.suggested_tool_name!r}"
-                    )
-                    continue
-
-                if _tool_call_already_exists(
-                    state=state,
-                    tool_name=review.suggested_tool_name,
-                    tool_input=review.suggested_tool_input,
-                ):
-                    reviewer_requires_tool = False
-                    reviewer_feedback = (
-                        f"{review.reason}\n"
-                        "The reviewer suggested a tool call that already exists in "
-                        "the current turn trace. Do not repeat the same tool call. "
-                        "Use the existing observation to produce a final answer or "
-                        "a cannot-answer style final answer."
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "reviewer suggested duplicate tool call"
-                    )
-                    continue
-
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"reviewer requested next tool={review.suggested_tool_name}"
-                    "\nexecuting directly"
-                )
-
-                _execute_selected_tool(
-                    state=state,
-                    tool_name=review.suggested_tool_name,
-                    tool_input=review.suggested_tool_input,
-                )
-
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"executed reviewer tool={review.suggested_tool_name}; "
-                    f"trace_steps={len(state['tool_trace'])}"
-                )
-
-                failed_resolver_answer = (
-                    _return_failed_explicit_resolver_answer_if_ready(state)
-                )
-                if failed_resolver_answer is not None:
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "returning deterministic reviewer failed resolver answer"
-                    )
-                    return failed_resolver_answer
-
-                deterministic_sample_answer = (
-                    _return_deterministic_sample_examples_answer_if_ready(
-                        state=state,
-                        tool_name=review.suggested_tool_name,
-                    )
-                )
-                if deterministic_sample_answer is not None:
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "returning deterministic reviewer sample_examples answer"
-                    )
-                    return deterministic_sample_answer
-
-                reviewer_requires_tool = False
-                reviewer_feedback = (
-                    f"The reviewer-suggested tool {review.suggested_tool_name} "
-                    "has now been executed. The observation reviewer will inspect "
-                    "the latest observation before another planner step is allowed."
-                )
-
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    "reviewer start after direct tool execution"
-                )
-                try:
-                    follow_up_review = _review_observations(state)
-                except Exception as exc:
-                    reviewer_feedback = (
-                        "The reviewer failed to return a valid structured decision "
-                        f"after the reviewer-suggested tool. Error: "
-                        f"{type(exc).__name__}: {exc}. Continue agentically from "
-                        "the current tool trace. Do not repeat the same tool call."
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        f"follow-up reviewer exception={type(exc).__name__}: {exc}; "
-                        "continuing with planner feedback"
-                    )
-                    continue
-
-                reviewer_feedback = follow_up_review.reason
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"follow-up reviewer status={follow_up_review.status}; "
-                    f"suggested_tool={follow_up_review.suggested_tool_name or '-'}; "
-                    f"reason={follow_up_review.reason}"
-                )
-
-                if follow_up_review.status in {"answered", "cannot_answer"}:
-                    if follow_up_review.status == "answered":
-                        contract_error = _answer_contract_error(state)
-                        if contract_error:
-                            reviewer_requires_tool = True
-                            reviewer_feedback = _build_final_answer_block_feedback(
-                                contract_error
-                            )
-                            _debug_trace(
-                                f"iteration {iteration_number}/{state['max_iterations']}: "
-                                "blocked follow-up reviewer answered by evidence contract"
-                            )
-                            continue
-
-                    final_answer = (
-                        follow_up_review.final_answer.strip()
-                        or follow_up_review.reason.strip()
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        f"returning follow-up reviewer status={follow_up_review.status}"
-                    )
-                    return _final_answer_update(state, final_answer)
-
-                if follow_up_review.status == "needs_more":
-                    reviewer_requires_tool = True
-                    reviewer_feedback = (
-                        f"{follow_up_review.reason}\n"
-                        f"Suggested next tool: {follow_up_review.suggested_tool_name}\n"
-                        f"Suggested next input: "
-                        f"{json.dumps(_compact_tool_input_for_prompt(follow_up_review.suggested_tool_input), ensure_ascii=False, default=str)}"
-                    )
-                    continue
-
-        except Exception as exc:
-            fallback = _fallback_answer()
-            _debug_trace(
-                f"iteration {iteration_number}/{state['max_iterations']}: "
-                f"exception={type(exc).__name__}: {exc}"
-            )
-            return _final_answer_update(state, fallback)
-
-    fallback = _fallback_answer()
-    _debug_trace(
-        f"max_iterations_exhausted={state['max_iterations']}; "
-        f"trace_steps={len(state['tool_trace'])}"
-    )
-
-    return _final_answer_update(state, fallback)
+    """Compatibility wrapper for the extracted data-agent loop."""
+    _sync_loop_dependencies()
+    return _loop.data_agent_loop_node(state)
 
 
 def profile_update_node(state: AgentState) -> dict[str, Any]:
-    """Update the persistent profile only when a durable fact is detected."""
-    user_query = _latest_user_message(state["messages"])
-
-    if not user_query.strip():
-        return {}
-
-    try:
-        profile_llm = get_structured_profile_llm()
-        decision = profile_llm.invoke(
-            [
-                SystemMessage(content=PROFILE_UPDATE_SYSTEM_PROMPT),
-                HumanMessage(content=user_query),
-            ]
-        )
-        if not isinstance(decision, ProfileObservationDecision):
-            decision = ProfileObservationDecision.model_validate(decision)
-    except Exception:
-        return {}
-
-    observation = decision.observation.strip()
-    if not observation:
-        return {}
-
-    updated_profile = update_user_profile_impl(
-        user_id=state["user_id"],
-        new_observation=observation,
-    )
-    return {
-        "user_profile": updated_profile.profile,
-    }
+    """Compatibility wrapper for the extracted profile-update node."""
+    _sync_profile_dependencies()
+    return _profile.profile_update_node(state)
 
 
 def route_after_router(state: AgentState) -> str:
