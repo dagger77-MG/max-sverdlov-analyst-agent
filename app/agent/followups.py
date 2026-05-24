@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from langchain_core.messages import AIMessage
 
-from app.agent.context import _latest_user_message
+from app.agent.context import latest_user_message
 from app.agent.tool_executor import (
     _append_structured_result,
     _append_trace,
@@ -103,7 +103,7 @@ def _handle_more_examples_follow_up(
     sample_formatter: SampleFormatter | None = None,
 ) -> dict[str, Any] | None:
     """Deterministically answer 'show more examples' without asking the LLM."""
-    user_query = _latest_user_message(state["messages"])
+    user_query = latest_user_message(state["messages"])
 
     if not _is_more_examples_query(user_query):
         return None

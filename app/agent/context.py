@@ -9,7 +9,7 @@ from app.prompts import PLANNER_SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT
 from app.state import AgentState, AnalysisResult, ToolTraceItem
 
 
-def _latest_user_message(messages: list[BaseMessage]) -> str:
+def latest_user_message(messages: list[BaseMessage]) -> str:
     """Return the latest human message content from graph state."""
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
@@ -66,7 +66,7 @@ def _profile_context_for_planner(state: AgentState) -> str:
     still available through read_user_profile when the user asks profile/memory
     questions.
     """
-    user_query = _latest_user_message(state["messages"]).lower()
+    user_query = latest_user_message(state["messages"]).lower()
     if "remember" in user_query or "profile" in user_query:
         return state["user_profile"]
     return (
@@ -80,7 +80,7 @@ def _build_planner_messages(
     reviewer_feedback: str | None,
 ) -> list[BaseMessage]:
     """Build input messages for next-tool planning."""
-    user_query = _latest_user_message(state["messages"])
+    user_query = latest_user_message(state["messages"])
 
     context = f"""Current route: {state["route"]}
 Route reason: {state["route_reason"]}
@@ -108,7 +108,7 @@ Reviewer feedback:
 
 def _build_reviewer_messages(state: AgentState) -> list[BaseMessage]:
     """Build input messages for observation review."""
-    user_query = _latest_user_message(state["messages"])
+    user_query = latest_user_message(state["messages"])
     context = f"""Current route: {state["route"]}
 Route reason: {state["route_reason"]}
 

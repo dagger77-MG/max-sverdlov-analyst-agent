@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any
 
-from app.agent.context import _latest_user_message
+from app.agent.context import latest_user_message
 from app.memory import read_user_profile_impl
 from app.state import AgentState, AnalysisResult, ToolTraceItem
 from app.tools import (
@@ -344,7 +344,7 @@ def _execute_selected_tool(
                 "group_counts requires group_by='category' or group_by='intent'."
             )
 
-        user_query = _latest_user_message(state["messages"])
+        user_query = latest_user_message(state["messages"])
         if (
             _requires_grouped_filtered_scope(user_query, group_by)
             and group_by == "intent"
@@ -420,11 +420,11 @@ def _execute_selected_tool(
 
     if tool_name == "summarize_rows":
         filters = _tool_filters(normalized_input)
+        focus = str(normalized_input.get("focus") or latest_user_message(state["messages"]))
+        normalized_input["focus"] = focus
         result = summarize_rows_impl(
             **filters,
-            focus=str(
-                normalized_input.get("focus", _latest_user_message(state["messages"]))
-            ),
+            focus=focus,
             target_field=normalized_input.get("target_field", "both"),
             max_examples=int(normalized_input.get("max_examples", 100)),
         )

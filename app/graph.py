@@ -7,48 +7,13 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 
-from app.config import settings
 from app.agent import loop as _loop
 from app.agent import profile as _profile
-from app.agent import evidence_contracts as _evidence_contracts
-from app.agent import followups as _followups
-from app.agent import tool_executor as _tool_executor
-from app.memory import read_user_profile_impl, update_user_profile_impl
-from app.agent.llm_factory import (
-    _create_agent_chat_llm,
-    get_agent_llm,
-    get_structured_observation_reviewer_llm,
-    get_structured_profile_llm,
-    get_structured_tool_planner_llm,
-)
-from app.agent.context import (
-    _build_planner_messages,
-    _build_reviewer_messages,
-    _compact_tool_input_for_prompt,
-    _compact_tool_trace_for_prompt,
-    _latest_user_message,
-    _profile_context_for_planner,
-    _structured_results_for_prompt,
-)
+from app.agent.context import latest_user_message
+from app.config import settings
 from app.prompts import OUT_OF_SCOPE_REFUSAL
-from app.agent.schemas import (
-    ObservationReviewDecision,
-    PlannerToolName,
-    ProfileObservationDecision,
-    ToolPlanDecision,
-    VALID_PLANNER_TOOL_NAMES,
-)
-
 from app.router import RouteDecision, route_query_with_reason
-from app.state import AgentState, AnalysisResult, ToolTraceItem
-from app.tools import (
-    count_rows_impl,
-    get_dataset_schema_impl,
-    group_counts_impl,
-    resolve_filter_value_impl,
-    sample_examples_impl,
-    summarize_rows_impl,
-)
+from app.state import AgentState
 
 
 def create_initial_state(
@@ -72,178 +37,14 @@ def create_initial_state(
     )
 
 
-_append_trace = _tool_executor._append_trace
-_append_tool_error = _tool_executor._append_tool_error
-_append_structured_result = _tool_executor._append_structured_result
-_normalize_tool_input = _tool_executor._normalize_tool_input
-_normalize_resolve_filter_value_input = (
-    _tool_executor._normalize_resolve_filter_value_input
-)
-_tool_filters = _tool_executor._tool_filters
-_canonical_tool_input = _tool_executor._canonical_tool_input
-_tool_call_already_exists = _tool_executor._tool_call_already_exists
-_format_model_dict = _tool_executor._format_model_dict
-_requires_grouped_filtered_scope = _tool_executor._requires_grouped_filtered_scope
-
-_final_answer_update = _evidence_contracts._final_answer_update
-_is_example_request = _evidence_contracts._is_example_request
-_trace_observation_is_error = _evidence_contracts._trace_observation_is_error
-_failed_explicit_resolver_final_answer = (
-    _evidence_contracts._failed_explicit_resolver_final_answer
-)
-_return_failed_explicit_resolver_answer_if_ready = (
-    _evidence_contracts._return_failed_explicit_resolver_answer_if_ready
-)
-_sample_examples_observation_has_examples = (
-    _evidence_contracts._sample_examples_observation_has_examples
-)
-_return_deterministic_sample_examples_answer_if_ready = (
-    _evidence_contracts._return_deterministic_sample_examples_answer_if_ready
-)
-_has_filtered_group_counts_trace = _evidence_contracts._has_filtered_group_counts_trace
-_has_resolver_trace_for_column = _evidence_contracts._has_resolver_trace_for_column
-_parse_trace_observation_json = _evidence_contracts._parse_trace_observation_json
-_normalize_contract_text = _evidence_contracts._normalize_contract_text
-_is_text_query_only_summary = _evidence_contracts._is_text_query_only_summary
-_summarize_rows_uses_resolved_filter = (
-    _evidence_contracts._summarize_rows_uses_resolved_filter
-)
-_semantic_summary_contract_error = _evidence_contracts._semantic_summary_contract_error
-_answer_contract_error = _evidence_contracts._answer_contract_error
-_build_final_answer_block_feedback = (
-    _evidence_contracts._build_final_answer_block_feedback
-)
-_is_more_examples_query = _followups._is_more_examples_query
-_requested_example_count = _followups._requested_example_count
-_latest_sample_context = _followups._latest_sample_context
-
-
-def _sync_tool_executor_dependencies() -> None:
-    """Keep temporary graph-level monkeypatch compatibility during extraction.
-
-    Current graph tests monkeypatch tool implementations on app.graph and then
-    call graph._execute_selected_tool. Until tests are migrated to
-    app.agent.tool_executor, copy graph-level patched callables into the
-    extracted executor module immediately before execution.
-    """
-    _tool_executor.count_rows_impl = count_rows_impl
-    _tool_executor.get_dataset_schema_impl = get_dataset_schema_impl
-    _tool_executor.group_counts_impl = group_counts_impl
-    _tool_executor.resolve_filter_value_impl = resolve_filter_value_impl
-    _tool_executor.sample_examples_impl = sample_examples_impl
-    _tool_executor.summarize_rows_impl = summarize_rows_impl
-    _tool_executor.read_user_profile_impl = read_user_profile_impl
-
-
-def _format_sample_examples_observation(
-    filters: dict[str, str | None],
-    n: int,
-    offset: int,
-) -> tuple[str, int, int]:
-    """Compatibility wrapper for the extracted sample-example formatter."""
-    _sync_tool_executor_dependencies()
-    return _tool_executor._format_sample_examples_observation(
-        filters=filters,
-        n=n,
-        offset=offset,
-    )
-
-
-def _execute_selected_tool(
-        state: AgentState,
-        tool_name: str,
-        tool_input: dict[str, Any],
-) -> None:
-    """Compatibility wrapper for the extracted tool executor."""
-    _sync_tool_executor_dependencies()
-    _tool_executor._execute_selected_tool(
-        state=state,
-        tool_name=tool_name,
-        tool_input=tool_input,
-    )
-
-
-def _handle_more_examples_follow_up(state: AgentState) -> dict[str, Any] | None:
-    """Compatibility wrapper for deterministic example follow-ups."""
-    return _followups._handle_more_examples_follow_up(
-        state,
-        sample_formatter=lambda filters, n, offset: _format_sample_examples_observation(
-            filters=filters,
-            n=n,
-            offset=offset,
-        ),
-    )
-
-
-def _review_observations(
-    state: AgentState,
-) -> ObservationReviewDecision:
-    """Ask the reviewer whether the current observations answer the query."""
-    reviewer_llm = get_structured_observation_reviewer_llm()
-    review = reviewer_llm.invoke(_build_reviewer_messages(state))
-    if not isinstance(review, ObservationReviewDecision):
-        review = ObservationReviewDecision.model_validate(review)
-    return review
-
-
-_fallback_answer = _loop._fallback_answer
-_debug_trace_enabled = _loop._debug_trace_enabled
-_debug_trace = _loop._debug_trace
-
-
-def _sync_loop_dependencies() -> None:
-    """Keep graph-level monkeypatch compatibility during loop extraction.
-
-    Current tests patch planner/reviewer/tool functions on app.graph. The
-    extracted loop module imports its own dependencies, so this bridge copies
-    graph-level patched callables into app.agent.loop immediately before the
-    loop runs.
-    """
-    _sync_tool_executor_dependencies()
-
-    _loop.get_structured_tool_planner_llm = get_structured_tool_planner_llm
-    _loop.get_structured_observation_reviewer_llm = (
-        get_structured_observation_reviewer_llm
-    )
-
-    _loop._build_planner_messages = _build_planner_messages
-    _loop._build_reviewer_messages = _build_reviewer_messages
-    _loop._compact_tool_input_for_prompt = _compact_tool_input_for_prompt
-
-    _loop._execute_selected_tool = _execute_selected_tool
-    _loop._tool_call_already_exists = _tool_call_already_exists
-    _loop._handle_more_examples_follow_up = _handle_more_examples_follow_up
-    _loop._review_observations = _review_observations
-
-    _loop._answer_contract_error = _answer_contract_error
-    _loop._build_final_answer_block_feedback = _build_final_answer_block_feedback
-    _loop._final_answer_update = _final_answer_update
-    _loop._return_failed_explicit_resolver_answer_if_ready = (
-        _return_failed_explicit_resolver_answer_if_ready
-    )
-    _loop._return_deterministic_sample_examples_answer_if_ready = (
-        _return_deterministic_sample_examples_answer_if_ready
-    )
-
-
-def _sync_profile_dependencies() -> None:
-    """Keep graph-level monkeypatch compatibility during profile extraction."""
-    _profile.read_user_profile_impl = read_user_profile_impl
-    _profile.update_user_profile_impl = update_user_profile_impl
-    _profile.get_structured_profile_llm = get_structured_profile_llm
-    _profile.ProfileObservationDecision = ProfileObservationDecision
-    _profile._latest_user_message = _latest_user_message
-
-
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
-    """Compatibility wrapper for the extracted profile-load node."""
-    _sync_profile_dependencies()
+    """Load persistent profile memory into graph state."""
     return _profile.load_user_profile_node(state)
 
 
 def router_node(state: AgentState) -> dict[str, Any]:
     """Classify the latest user query before tool selection."""
-    user_query = _latest_user_message(state["messages"])
+    user_query = latest_user_message(state["messages"])
     decision: RouteDecision = route_query_with_reason(user_query)
 
     return {
@@ -261,14 +62,12 @@ def refusal_node(state: AgentState) -> dict[str, Any]:
 
 
 def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
-    """Compatibility wrapper for the extracted data-agent loop."""
-    _sync_loop_dependencies()
+    """Run the extracted data-agent loop node."""
     return _loop.data_agent_loop_node(state)
 
 
 def profile_update_node(state: AgentState) -> dict[str, Any]:
-    """Compatibility wrapper for the extracted profile-update node."""
-    _sync_profile_dependencies()
+    """Update persistent profile memory after a turn."""
     return _profile.profile_update_node(state)
 
 

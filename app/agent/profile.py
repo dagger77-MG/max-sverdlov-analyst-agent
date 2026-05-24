@@ -4,7 +4,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.agent.context import _latest_user_message
+from app.agent.context import latest_user_message
 from app.agent.llm_factory import get_structured_profile_llm
 from app.agent.schemas import ProfileObservationDecision
 from app.memory import read_user_profile_impl, update_user_profile_impl
@@ -22,7 +22,7 @@ def load_user_profile_node(state: AgentState) -> dict[str, Any]:
 
 def profile_update_node(state: AgentState) -> dict[str, Any]:
     """Update the persistent profile only when a durable fact is detected."""
-    user_query = _latest_user_message(state["messages"])
+    user_query = latest_user_message(state["messages"])
 
     if not user_query.strip():
         return {}

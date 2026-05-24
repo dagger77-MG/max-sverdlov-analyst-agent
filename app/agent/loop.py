@@ -76,7 +76,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
         return deterministic_result
 
     reviewer_feedback: str | None = None
-    reviewer_requires_tool = False
+    must_call_tool_before_final_answer = False
 
     for iteration_index in range(state["max_iterations"]):
         iteration_number = iteration_index + 1
@@ -100,7 +100,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             )
 
             if plan.action == "final_answer":
-                if reviewer_requires_tool:
+                if must_call_tool_before_final_answer:
                     reviewer_feedback = (
                         "The previous reviewer decision was needs_more, so the "
                         "current observations are not sufficient for a final answer. "
@@ -127,7 +127,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
 
                 contract_error = _answer_contract_error(state)
                 if contract_error:
-                    reviewer_requires_tool = True
+                    must_call_tool_before_final_answer = True
                     reviewer_feedback = _build_final_answer_block_feedback(
                         contract_error
                     )
@@ -137,7 +137,6 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     )
                     continue
 
-                state["final_answer"] = final_answer
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
                     "returning planner final_answer"
@@ -152,7 +151,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     tool_input=plan.tool_input,
                 )
             ):
-                reviewer_requires_tool = False
+                must_call_tool_before_final_answer = False
                 reviewer_feedback = (
                     "This exact tool call already exists in the current turn trace. "
                     "Do not repeat it. Use the existing observation to produce a "
@@ -205,15 +204,15 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             try:
                 review = _review_observations(state)
             except Exception as exc:
-                reviewer_requires_tool = False
+                must_call_tool_before_final_answer = True
                 reviewer_feedback = (
                     "The reviewer failed to return a valid structured decision "
                     f"after the latest tool call. Error: {type(exc).__name__}: {exc}. "
                     "Continue agentically from the current tool trace. Do not repeat "
-                    "the same failed or already-observed tool call. If the current "
-                    "observations fully answer the exact user request, produce a "
-                    "grounded final answer. Otherwise, choose exactly one next useful "
-                    "tool based on the current observations."
+                    "the same failed or already-observed tool call. Because the latest "
+                    "observation was not successfully reviewed, do not produce a normal "
+                    "answered final answer from it. Choose exactly one next useful tool, "
+                    "or produce a cannot-answer style final answer if no useful tool exists."
                 )
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
@@ -222,7 +221,6 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 )
                 continue
 
-            reviewer_feedback = review.reason
             _debug_trace(
                 f"iteration {iteration_number}/{state['max_iterations']}: "
                 f"reviewer status={review.status}; "
@@ -234,7 +232,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 if review.status == "answered":
                     contract_error = _answer_contract_error(state)
                     if contract_error:
-                        reviewer_requires_tool = True
+                        must_call_tool_before_final_answer = True
                         reviewer_feedback = _build_final_answer_block_feedback(
                             contract_error
                         )
@@ -244,7 +242,6 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                         )
                         continue
 
-                reviewer_requires_tool = False
                 final_answer = review.final_answer.strip() or review.reason.strip()
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
@@ -253,7 +250,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 return _final_answer_update(state, final_answer)
 
             if review.status == "needs_more":
-                reviewer_requires_tool = True
+                must_call_tool_before_final_answer = True
 
                 if not review.suggested_tool_name:
                     reviewer_feedback = (
@@ -269,7 +266,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     continue
 
                 if review.suggested_tool_name not in VALID_PLANNER_TOOL_NAMES:
-                    reviewer_requires_tool = False
+                    must_call_tool_before_final_answer = False
                     reviewer_feedback = (
                         f"{review.reason}\n"
                         f"Reviewer returned needs_more with invalid suggested_tool_name="
@@ -290,7 +287,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     tool_name=review.suggested_tool_name,
                     tool_input=review.suggested_tool_input,
                 ):
-                    reviewer_requires_tool = False
+                    must_call_tool_before_final_answer = False
                     reviewer_feedback = (
                         f"{review.reason}\n"
                         "The reviewer suggested a tool call that already exists in "
@@ -345,13 +342,6 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     )
                     return deterministic_sample_answer
 
-                reviewer_requires_tool = False
-                reviewer_feedback = (
-                    f"The reviewer-suggested tool {review.suggested_tool_name} "
-                    "has now been executed. The observation reviewer will inspect "
-                    "the latest observation before another planner step is allowed."
-                )
-
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
                     "reviewer start after direct tool execution"
@@ -359,11 +349,14 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 try:
                     follow_up_review = _review_observations(state)
                 except Exception as exc:
+                    must_call_tool_before_final_answer = True
                     reviewer_feedback = (
                         "The reviewer failed to return a valid structured decision "
                         f"after the reviewer-suggested tool. Error: "
-                        f"{type(exc).__name__}: {exc}. Continue agentically from "
-                        "the current tool trace. Do not repeat the same tool call."
+                        f"{type(exc).__name__}: {exc}. Because the latest observation "
+                        "was not successfully reviewed, do not produce a normal answered "
+                        "final answer from it. Choose exactly one next useful tool, or "
+                        "produce a cannot-answer style final answer if no useful tool exists."
                     )
                     _debug_trace(
                         f"iteration {iteration_number}/{state['max_iterations']}: "
@@ -372,7 +365,6 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     )
                     continue
 
-                reviewer_feedback = follow_up_review.reason
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
                     f"follow-up reviewer status={follow_up_review.status}; "
@@ -384,7 +376,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     if follow_up_review.status == "answered":
                         contract_error = _answer_contract_error(state)
                         if contract_error:
-                            reviewer_requires_tool = True
+                            must_call_tool_before_final_answer = True
                             reviewer_feedback = _build_final_answer_block_feedback(
                                 contract_error
                             )
@@ -405,7 +397,7 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     return _final_answer_update(state, final_answer)
 
                 if follow_up_review.status == "needs_more":
-                    reviewer_requires_tool = True
+                    must_call_tool_before_final_answer = True
                     reviewer_feedback = (
                         f"{follow_up_review.reason}\n"
                         f"Suggested next tool: {follow_up_review.suggested_tool_name}\n"

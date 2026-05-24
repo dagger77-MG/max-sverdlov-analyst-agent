@@ -6,7 +6,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage
 
-from app.agent.context import _latest_user_message
+from app.agent.context import latest_user_message
 from app.agent.tool_executor import (
     _normalize_resolve_filter_value_input,
     _requires_grouped_filtered_scope,
@@ -91,7 +91,7 @@ def _failed_explicit_resolver_final_answer(state: AgentState) -> str | None:
     tool_input = _normalize_resolve_filter_value_input(latest_step["tool_input"])
     columns = tool_input["columns"]
     query = tool_input["query"].strip()
-    user_query = _latest_user_message(state["messages"]).lower()
+    user_query = latest_user_message(state["messages"]).lower()
 
     if not query:
         return None
@@ -145,7 +145,7 @@ def _return_deterministic_sample_examples_answer_if_ready(
     """Return sample_examples output directly only when actual examples exist."""
     if (
         tool_name == "sample_examples"
-        and _is_example_request(_latest_user_message(state["messages"]))
+        and _is_example_request(latest_user_message(state["messages"]))
         and state["tool_trace"]
         and _sample_examples_observation_has_examples(
             state["tool_trace"][-1]["observation"]
@@ -311,7 +311,7 @@ def _semantic_summary_contract_error(state: AgentState) -> str | None:
 
 def _answer_contract_error(state: AgentState) -> str | None:
     """Block final answers for scoped distributions until scoped grouping exists."""
-    user_query = _latest_user_message(state["messages"])
+    user_query = latest_user_message(state["messages"])
 
     if _requires_grouped_filtered_scope(user_query, group_by="intent"):
         if _has_filtered_group_counts_trace(
