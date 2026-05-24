@@ -1,19 +1,34 @@
 from __future__ import annotations
 
-import streamlit as st
+import sys
+from pathlib import Path
 
-from app.config import settings
-from app.graph import invoke_agent
-from app.logging_utils import format_reasoning_trace
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT_TEXT = str(PROJECT_ROOT)
+
+if PROJECT_ROOT_TEXT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT_TEXT)
 
 
-def initialize_chat_state() -> None:
+import streamlit as st # noqa: E402
+
+from app.config import settings # noqa: E402
+from app.graph import invoke_agent # noqa: E402
+from app.logging_utils import format_reasoning_trace # noqa: E402
+
+
+def get_chat_messages_key(session_id: str) -> str:
+    """Return the Streamlit session-state key for visible chat messages."""
+    normalized_session_id = session_id.strip() or settings.default_session_id
+    return f"chat_messages::{normalized_session_id}"
+
+def initialize_chat_state(chat_messages_key: str) -> None:
     """Initialize Streamlit session state for visible chat messages."""
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
+    if chat_messages_key not in st.session_state:
+        st.session_state[chat_messages_key] = []
 
 
-def render_sidebar() -> tuple[str, str, int]:
+def render_sidebar() -> tuple[str, str, int, str]:
     """Render sidebar controls and return session/user/max-iteration settings."""
     st.sidebar.title("Agent Settings")
 
@@ -22,6 +37,7 @@ def render_sidebar() -> tuple[str, str, int]:
         value=settings.default_session_id,
         help="Conversation session identifier.",
     )
+    chat_messages_key = get_chat_messages_key(session_id)
 
     user_id = st.sidebar.text_input(
         "User ID",
@@ -39,15 +55,15 @@ def render_sidebar() -> tuple[str, str, int]:
     )
 
     if st.sidebar.button("Clear visible chat"):
-        st.session_state.chat_messages = []
+        st.session_state[chat_messages_key] = []
         st.rerun()
 
-    return session_id, user_id, int(max_iterations)
+    return session_id, user_id, int(max_iterations), chat_messages_key
 
 
-def render_existing_messages() -> None:
+def render_existing_messages(chat_messages_key: str) -> None:
     """Render messages currently stored in visible Streamlit chat state."""
-    for message in st.session_state.chat_messages:
+    for message in st.session_state[chat_messages_key]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
@@ -57,8 +73,8 @@ def render_existing_messages() -> None:
                     st.text(trace)
 
 
-def append_user_message(content: str) -> None:
-    st.session_state.chat_messages.append(
+def append_user_message(chat_messages_key: str, content: str) -> None:
+    st.session_state[chat_messages_key].append(
         {
             "role": "user",
             "content": content,
@@ -66,8 +82,8 @@ def append_user_message(content: str) -> None:
     )
 
 
-def append_assistant_message(content: str, trace: str) -> None:
-    st.session_state.chat_messages.append(
+def append_assistant_message(chat_messages_key: str, content: str, trace: str) -> None:
+    st.session_state[chat_messages_key].append(
         {
             "role": "assistant",
             "content": content,
@@ -84,23 +100,22 @@ def main() -> None:
         layout="wide",
     )
 
-    initialize_chat_state()
-
     st.title("Bitext Customer Service Data Analyst Agent")
     st.caption(
         "Ask structured or qualitative questions about the Bitext customer service dataset."
     )
 
-    session_id, user_id, max_iterations = render_sidebar()
+    session_id, user_id, max_iterations, chat_messages_key = render_sidebar()
+    initialize_chat_state(chat_messages_key)
 
-    render_existing_messages()
+    render_existing_messages(chat_messages_key)
 
     query = st.chat_input("Ask about the dataset...")
 
     if not query:
         return
 
-    append_user_message(query)
+    append_user_message(chat_messages_key, query)
 
     with st.chat_message("user"):
         st.markdown(query)
@@ -135,7 +150,7 @@ def main() -> None:
             with st.expander("Reasoning trace"):
                 st.text(trace)
 
-    append_assistant_message(final_answer, trace)
+    append_assistant_message(chat_messages_key, final_answer, trace)
 
 
 if __name__ == "__main__":
