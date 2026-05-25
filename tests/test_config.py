@@ -35,7 +35,7 @@ def test_app_config_keeps_model_names_in_config() -> None:
 def test_app_config_sets_small_router_output_budget() -> None:
     config = AppConfig.from_env()
 
-    assert config.router_max_tokens == 128
+    assert config.router_max_tokens == 256
     assert config.router_max_tokens > 0
     assert config.router_max_tokens < config.max_tokens
 

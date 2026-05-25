@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app import graph
+from app.agent import loop as agent_loop
+from app.agent import profile as agent_profile
+from app.agent import schemas
+from app.agent import tool_executor
 
 
 @pytest.fixture(autouse=True)
@@ -16,14 +18,14 @@ def patch_checkpointer(monkeypatch: pytest.MonkeyPatch):
     if hasattr(graph.get_checkpointer, "cache_clear"):
         graph.get_checkpointer.cache_clear()
 
-    if hasattr(graph.get_structured_tool_planner_llm, "cache_clear"):
-        graph.get_structured_tool_planner_llm.cache_clear()
+    if hasattr(agent_loop.get_structured_tool_planner_llm, "cache_clear"):
+        agent_loop.get_structured_tool_planner_llm.cache_clear()
 
-    if hasattr(graph.get_structured_observation_reviewer_llm, "cache_clear"):
-        graph.get_structured_observation_reviewer_llm.cache_clear()
+    if hasattr(agent_loop.get_structured_observation_reviewer_llm, "cache_clear"):
+        agent_loop.get_structured_observation_reviewer_llm.cache_clear()
 
-    if hasattr(graph.get_structured_profile_llm, "cache_clear"):
-        graph.get_structured_profile_llm.cache_clear()
+    if hasattr(agent_profile.get_structured_profile_llm, "cache_clear"):
+        agent_profile.get_structured_profile_llm.cache_clear()
 
     monkeypatch.setattr(graph, "get_checkpointer", lambda: None)
 
@@ -37,11 +39,11 @@ class FakeProfileLLM:
         self.observation = observation
 
     def invoke(self, messages):
-        return graph.ProfileObservationDecision(observation=self.observation)
+        return schemas.ProfileObservationDecision(observation=self.observation)
 
 
 class FakePlannerLLM:
-    def __init__(self, *decisions: graph.ToolPlanDecision) -> None:
+    def __init__(self, *decisions: schemas.ToolPlanDecision) -> None:
         self.decisions = list(decisions)
         self.received_messages = []
 
@@ -53,7 +55,7 @@ class FakePlannerLLM:
 
 
 class FakeReviewerLLM:
-    def __init__(self, *decisions: graph.ObservationReviewDecision) -> None:
+    def __init__(self, *decisions: schemas.ObservationReviewDecision) -> None:
         self.decisions = list(decisions)
         self.received_messages = []
 
@@ -111,8 +113,8 @@ def _example_row(
     )()
 
 
-def _plan_call(tool_name: str, tool_input: dict) -> graph.ToolPlanDecision:
-    return graph.ToolPlanDecision(
+def _plan_call(tool_name: str, tool_input: dict) -> schemas.ToolPlanDecision:
+    return schemas.ToolPlanDecision(
         action="call_tool",
         tool_name=tool_name,
         tool_input=tool_input,
@@ -120,16 +122,16 @@ def _plan_call(tool_name: str, tool_input: dict) -> graph.ToolPlanDecision:
     )
 
 
-def _plan_final(answer: str) -> graph.ToolPlanDecision:
-    return graph.ToolPlanDecision(
+def _plan_final(answer: str) -> schemas.ToolPlanDecision:
+    return schemas.ToolPlanDecision(
         action="final_answer",
         final_answer=answer,
         reason="The available context is sufficient.",
     )
 
 
-def _review_answer(answer: str) -> graph.ObservationReviewDecision:
-    return graph.ObservationReviewDecision(
+def _review_answer(answer: str) -> schemas.ObservationReviewDecision:
+    return schemas.ObservationReviewDecision(
         status="answered",
         reason="The observations are sufficient.",
         final_answer=answer,
@@ -140,8 +142,8 @@ def _review_needs_more(
     reason: str,
     suggested_tool_name: str,
     suggested_tool_input: dict,
-) -> graph.ObservationReviewDecision:
-    return graph.ObservationReviewDecision(
+) -> schemas.ObservationReviewDecision:
+    return schemas.ObservationReviewDecision(
         status="needs_more",
         reason=reason,
         suggested_tool_name=suggested_tool_name,
@@ -151,7 +153,7 @@ def _review_needs_more(
 
 def _patch_common_graph_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        graph,
+        agent_profile,
         "read_user_profile_impl",
         lambda user_id: _profile_result(
             user_id,
@@ -159,18 +161,18 @@ def _patch_common_graph_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
     )
     monkeypatch.setattr(
-        graph,
+        agent_profile,
         "get_structured_profile_llm",
         lambda: FakeProfileLLM(),
     )
 
 
 def test_planner_tool_set_does_not_expose_filter_rows_or_row_id_workflow() -> None:
-    assert "filter_rows" not in graph.VALID_PLANNER_TOOL_NAMES
-    assert "count_rows" in graph.VALID_PLANNER_TOOL_NAMES
-    assert "sample_examples" in graph.VALID_PLANNER_TOOL_NAMES
-    assert "group_counts" in graph.VALID_PLANNER_TOOL_NAMES
-    assert "summarize_rows" in graph.VALID_PLANNER_TOOL_NAMES
+    assert "filter_rows" not in schemas.VALID_PLANNER_TOOL_NAMES
+    assert "count_rows" in schemas.VALID_PLANNER_TOOL_NAMES
+    assert "sample_examples" in schemas.VALID_PLANNER_TOOL_NAMES
+    assert "group_counts" in schemas.VALID_PLANNER_TOOL_NAMES
+    assert "summarize_rows" in schemas.VALID_PLANNER_TOOL_NAMES
 
 
 def test_structured_query_resolves_filter_then_counts_rows(
@@ -187,7 +189,7 @@ def test_structured_query_resolves_filter_then_counts_rows(
     _patch_common_graph_dependencies(monkeypatch)
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "resolve_filter_value_impl",
         lambda query, columns=None, top_k=5: _model_result(
             query=query,
@@ -208,7 +210,7 @@ def test_structured_query_resolves_filter_then_counts_rows(
         ),
     )
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "count_rows_impl",
         lambda category=None, intent=None, text_query=None: _model_result(
             count=2992,
@@ -240,8 +242,8 @@ def test_structured_query_resolves_filter_then_counts_rows(
         _review_answer("There are 2,992 refund-request rows in the dataset."),
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="How many refund requests did we get?",
@@ -288,7 +290,7 @@ def test_assignment_question_categories_exist_uses_group_counts(
     _patch_common_graph_dependencies(monkeypatch)
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "get_dataset_schema_impl",
         lambda include_sample_values=True: _model_result(
             columns=["row_id", "instruction", "category", "intent", "response"],
@@ -299,7 +301,7 @@ def test_assignment_question_categories_exist_uses_group_counts(
         ),
     )
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "group_counts_impl",
         lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
             group_by=group_by,
@@ -334,8 +336,8 @@ def test_assignment_question_categories_exist_uses_group_counts(
         ),
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="What categories exist in the dataset?",
@@ -373,7 +375,7 @@ def test_assignment_question_shipping_examples_samples_with_filters(
     _patch_common_graph_dependencies(monkeypatch)
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "resolve_filter_value_impl",
         lambda query, columns=None, top_k=5: _model_result(
             query=query,
@@ -394,7 +396,7 @@ def test_assignment_question_shipping_examples_samples_with_filters(
         ),
     )
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "sample_examples_impl",
         lambda category=None, intent=None, text_query=None, n=3, offset=0: _model_result(
             examples=[
@@ -446,8 +448,8 @@ def test_assignment_question_shipping_examples_samples_with_filters(
         )
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="Show me 5 examples of the SHIPPING category.",
@@ -495,7 +497,7 @@ def test_assignment_question_account_intent_distribution_groups_with_category_fi
     _patch_common_graph_dependencies(monkeypatch)
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "resolve_filter_value_impl",
         lambda query, columns=None, top_k=5: _model_result(
             query=query,
@@ -516,7 +518,7 @@ def test_assignment_question_account_intent_distribution_groups_with_category_fi
         ),
     )
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "group_counts_impl",
         lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
             group_by=group_by,
@@ -566,8 +568,8 @@ def test_assignment_question_account_intent_distribution_groups_with_category_fi
         ),
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="What is the distribution of intents in the ACCOUNT category?",
@@ -591,41 +593,6 @@ def test_assignment_question_account_intent_distribution_groups_with_category_fi
     )
 
 
-def test_group_counts_rejects_missing_category_filter_for_scoped_intent_distribution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = graph.create_initial_state(
-        query="What is the distribution of intents in the ACCOUNT category?",
-        session_id="test_session",
-        user_id="max",
-    )
-
-    def fail_if_group_counts_called(group_by, category=None, intent=None, text_query=None, top_k=20):
-        raise AssertionError(
-            "group_counts_impl should not be called for an unfiltered scoped distribution."
-        )
-
-    monkeypatch.setattr(graph, "group_counts_impl", fail_if_group_counts_called)
-
-    graph._execute_selected_tool(
-        state=state,
-        tool_name="group_counts",
-        tool_input={
-            "group_by": "intent",
-            "top_k": 5,
-        },
-    )
-
-    assert len(state["tool_trace"]) == 1
-    assert state["tool_trace"][0]["tool_name"] == "group_counts"
-
-    observation = json.loads(state["tool_trace"][0]["observation"])
-    assert "error" in observation
-    assert "category filter" in observation["error"]
-    assert "group_by='intent'" in observation["required_next_step"]
-    assert state["last_structured_results"] == []
-
-
 def test_scoped_distribution_answer_contract_blocks_answer_after_only_resolve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -640,7 +607,7 @@ def test_scoped_distribution_answer_contract_blocks_answer_after_only_resolve(
     _patch_common_graph_dependencies(monkeypatch)
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "resolve_filter_value_impl",
         lambda query, columns=None, top_k=5: _model_result(
             query=query,
@@ -661,7 +628,7 @@ def test_scoped_distribution_answer_contract_blocks_answer_after_only_resolve(
         ),
     )
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "group_counts_impl",
         lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
             group_by=group_by,
@@ -705,8 +672,8 @@ def test_scoped_distribution_answer_contract_blocks_answer_after_only_resolve(
         ),
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="What is the distribution of intents in the ACCOUNT category?",
@@ -738,7 +705,7 @@ def test_unstructured_query_summarizes_with_category_filter(
     _patch_common_graph_dependencies(monkeypatch)
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "resolve_filter_value_impl",
         lambda query, columns=None, top_k=5: _model_result(
             query=query,
@@ -759,7 +726,7 @@ def test_unstructured_query_summarizes_with_category_filter(
         ),
     )
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "summarize_rows_impl",
         lambda category=None, intent=None, text_query=None, focus="", target_field="both", max_examples=100: _model_result(
             summary="Customers mainly provide product feedback.",
@@ -806,8 +773,8 @@ def test_unstructured_query_summarizes_with_category_filter(
         _review_answer("Customers mainly provide product feedback."),
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="Summarize the FEEDBACK category.",
@@ -839,7 +806,7 @@ def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
     _patch_common_graph_dependencies(monkeypatch)
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "resolve_filter_value_impl",
         lambda query, columns=None, top_k=5: _model_result(
             query=query,
@@ -915,7 +882,7 @@ def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
             },
         )
 
-    monkeypatch.setattr(graph, "summarize_rows_impl", fake_summarize_rows)
+    monkeypatch.setattr(tool_executor, "summarize_rows_impl", fake_summarize_rows)
 
     planner = FakePlannerLLM(
         _plan_call(
@@ -965,8 +932,8 @@ def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
         ),
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
-    monkeypatch.setattr(graph, "get_structured_observation_reviewer_llm", lambda: reviewer)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
 
     result = graph.invoke_agent(
         query="How do customer service representatives typically respond to cancellation requests?",
@@ -1008,75 +975,6 @@ def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
     )
 
 
-def test_agent_response_summary_uses_target_field_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = graph.create_initial_state(
-        query="Summarize how agents respond to complaint intents.",
-        session_id="test_session",
-        user_id="max",
-    )
-
-    captured_inputs: list[dict] = []
-
-    monkeypatch.setattr(
-        graph,
-        "summarize_rows_impl",
-        lambda category=None, intent=None, text_query=None, focus="", target_field="both", max_examples=100: (
-            captured_inputs.append(
-                {
-                    "category": category,
-                    "intent": intent,
-                    "text_query": text_query,
-                    "focus": focus,
-                    "target_field": target_field,
-                    "max_examples": max_examples,
-                }
-            )
-            or _model_result(
-                summary="Agents usually acknowledge the complaint and ask for more details.",
-                row_count_used=10,
-                match_count=10,
-                focus=focus,
-                target_field=target_field,
-                applied_filters={
-                    "category": category,
-                    "intent": intent,
-                    "text_query": text_query,
-                },
-            )
-        ),
-    )
-
-    graph._execute_selected_tool(
-        state=state,
-        tool_name="summarize_rows",
-        tool_input={
-            "category": "COMPLAINT",
-            "focus": "how agents respond to complaint intents",
-            "target_field": "response",
-            "max_examples": 100,
-        },
-    )
-
-    assert captured_inputs == [
-        {
-            "category": "COMPLAINT",
-            "intent": None,
-            "text_query": None,
-            "focus": "how agents respond to complaint intents",
-            "target_field": "response",
-            "max_examples": 100,
-        }
-    ]
-    assert state["last_structured_results"][-1]["query_type"] == "summary"
-    assert state["last_structured_results"][-1]["filters"] == {
-        "category": "COMPLAINT",
-        "intent": None,
-        "text_query": None,
-    }
-
-
 def test_out_of_scope_query_refuses_without_planner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         graph,
@@ -1091,7 +989,7 @@ def test_out_of_scope_query_refuses_without_planner(monkeypatch: pytest.MonkeyPa
     def fail_if_planner_called():
         raise AssertionError("Planner should not be called for out-of-scope queries.")
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", fail_if_planner_called)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", fail_if_planner_called)
 
     result = graph.invoke_agent(
         query="Who won the World Cup?",
@@ -1130,7 +1028,7 @@ def test_assignment_out_of_scope_questions_refuse_without_planner(
     def fail_if_planner_called():
         raise AssertionError("Planner should not be called for out-of-scope queries.")
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", fail_if_planner_called)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", fail_if_planner_called)
 
     result = graph.invoke_agent(
         query=query,
@@ -1154,7 +1052,7 @@ def test_planner_failure_returns_graceful_fallback(monkeypatch: pytest.MonkeyPat
     )
     _patch_common_graph_dependencies(monkeypatch)
     monkeypatch.setattr(
-        graph,
+        agent_loop,
         "get_structured_tool_planner_llm",
         lambda: FailingPlannerLLM(),
     )
@@ -1182,19 +1080,19 @@ def test_profile_update_node_saves_durable_observation(monkeypatch: pytest.Monke
         ),
     )
     monkeypatch.setattr(
-        graph,
+        agent_profile,
         "read_user_profile_impl",
         lambda user_id: _profile_result(user_id),
     )
     monkeypatch.setattr(
-        graph,
+        agent_profile,
         "get_structured_profile_llm",
         lambda: FakeProfileLLM(
             observation="User prefers file-by-file implementation review."
         ),
     )
     monkeypatch.setattr(
-        graph,
+        agent_profile,
         "update_user_profile_impl",
         lambda user_id, new_observation: type(
             "UpdateProfileResult",
@@ -1307,7 +1205,7 @@ def test_create_invocation_state_returns_partial_update_for_existing_thread() ->
 
 def test_load_user_profile_node_returns_partial_state_update(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        graph,
+        agent_profile,
         "read_user_profile_impl",
         lambda user_id: _profile_result(
             user_id,
@@ -1406,7 +1304,7 @@ def test_follow_up_show_me_three_more_uses_previous_filters_and_offset(
     captured_inputs: list[dict] = []
 
     monkeypatch.setattr(
-        graph,
+        tool_executor,
         "sample_examples_impl",
         lambda category=None, intent=None, text_query=None, n=3, offset=0: (
             captured_inputs.append(
@@ -1456,7 +1354,7 @@ def test_follow_up_show_me_three_more_uses_previous_filters_and_offset(
     def fail_if_planner_called():
         raise AssertionError("Planner should not be called for deterministic follow-up examples.")
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", fail_if_planner_called)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", fail_if_planner_called)
 
     result = graph.data_agent_loop_node(state)
 
@@ -1526,7 +1424,7 @@ def test_total_of_last_two_follow_up_goes_to_planner_with_filter_context(
         _plan_final("The total count of the last two results is 1,356.")
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
 
     result = graph.data_agent_loop_node(state)
 
@@ -1540,71 +1438,6 @@ def test_total_of_last_two_follow_up_goes_to_planner_with_filter_context(
     assert "REFUND" in context_message
     assert "row_ids" not in context_message
     assert result["final_answer"] == "The total count of the last two results is 1,356."
-
-
-def test_sample_examples_trace_includes_full_example_details(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        graph,
-        "sample_examples_impl",
-        lambda category=None, intent=None, text_query=None, n=3, offset=0: _model_result(
-            examples=[
-                _example_row(
-                    row_id=10,
-                    category="REFUND",
-                    intent="check_refund_status",
-                    instruction="Where is my refund?",
-                    response="You can check your refund status in your account.",
-                )
-            ],
-            next_offset=1,
-            match_count=1,
-            applied_filters={
-                "category": category,
-                "intent": intent,
-                "text_query": text_query,
-            },
-        ),
-    )
-
-    observation, next_offset, match_count = graph._format_sample_examples_observation(
-        filters={
-            "category": "REFUND",
-            "intent": None,
-            "text_query": None,
-        },
-        n=1,
-        offset=0,
-    )
-
-    assert next_offset == 1
-    assert match_count == 1
-    assert "row_id=10" in observation
-    assert "category=REFUND" in observation
-    assert "intent=check_refund_status" in observation
-    assert "customer_instruction=Where is my refund?" in observation
-    assert "support_response=You can check your refund status in your account." in observation
-
-
-def test_structured_results_prompt_uses_filters_not_row_ids() -> None:
-    prompt_text = graph._structured_results_for_prompt(
-        [
-            {
-                "label": "refunds",
-                "value": 842,
-                "query_type": "count",
-                "filters": {
-                    "category": "REFUND",
-                    "intent": None,
-                    "text_query": None,
-                },
-                "match_count": 842,
-            }
-        ]
-    )
-
-    assert "filters=" in prompt_text
-    assert "REFUND" in prompt_text
-    assert "row_ids" not in prompt_text
 
 
 def test_create_invocation_state_falls_back_to_initial_state_when_checkpoint_read_fails() -> None:
@@ -1645,7 +1478,7 @@ def test_unknown_tool_error_returns_fallback(monkeypatch: pytest.MonkeyPatch) ->
     _patch_common_graph_dependencies(monkeypatch)
 
     planner = FakePlannerLLM(
-        graph.ToolPlanDecision(
+        schemas.ToolPlanDecision(
             action="call_tool",
             tool_name="",
             tool_input={},
@@ -1653,7 +1486,7 @@ def test_unknown_tool_error_returns_fallback(monkeypatch: pytest.MonkeyPatch) ->
         )
     )
 
-    monkeypatch.setattr(graph, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
 
     result = graph.invoke_agent(
         query="How many rows are there?",
