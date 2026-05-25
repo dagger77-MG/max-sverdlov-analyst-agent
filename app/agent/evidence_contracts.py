@@ -28,6 +28,23 @@ def _tool_trace_items(state: AgentState) -> list[ToolTraceItem]:
     ]
 
 
+def _append_deterministic_fast_path_trace(
+    state: AgentState,
+    reason: str,
+) -> None:
+    """Record when a deterministic fast path intentionally skips reviewer LLM."""
+    state["tool_trace"].append(
+        {
+            "event_type": "reviewer",
+            "reviewer_status": "answered",
+            "reviewer_reason": reason,
+            "reviewer_final_answer": "",
+            "suggested_tool_name": "",
+            "suggested_tool_input": {},
+        }
+    )
+
+
 def _final_answer_update(
     state: AgentState,
     final_answer: str,
@@ -167,6 +184,13 @@ def _return_deterministic_sample_examples_answer_if_ready(
         )
     ):
         final_answer = _tool_trace_items(state)[-1]["observation"]
+        _append_deterministic_fast_path_trace(
+            state=state,
+            reason=(
+                "Reviewer LLM skipped: sample_examples returned requested row "
+                "content, so deterministic fast path produced the final answer."
+            ),
+        )
         return _final_answer_update(state, final_answer)
 
     return None

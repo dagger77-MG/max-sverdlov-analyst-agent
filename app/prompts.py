@@ -240,40 +240,30 @@ Filter rules:
    }
    
 Scoped distribution rules:
-0. For unscoped discovery questions such as "What categories exist?" or
-   "What intents exist?", an unfiltered group_counts result is valid answering
-   evidence and does not require resolve_filter_value.
-   If such an observation exists, return answered, not needs_more.
-1. For "distribution of intents in X category", valid evidence requires a
-   group_counts result with group_by="intent" and category=X.
-2. For "distribution of categories in X intent", valid evidence requires a
-   group_counts result with group_by="category" and intent=X.
-3. A group_counts result with missing category/intent/text_query filters is a
-   global distribution. It does not answer a question about a distribution
-   inside a category or intent.
-4. A later resolve_filter_value call does not retroactively validate or repair
-   an earlier unfiltered group_counts result. Require a new group_counts call
-   with the needed semantic filter.
-5. For full distributions, top_k=5 is usually incomplete unless the user asked
+1. For unscoped discovery questions such as "What categories exist?" or
+   "What intents exist?", an unfiltered group_counts result is valid evidence.
+2. For scoped distribution questions, answer only from a current-turn
+   group_counts observation with the requested scope already applied:
+   - "distribution of intents in X category" requires group_by="intent" and category=X.
+   - "distribution of categories in X intent" requires group_by="category" and intent=X.
+3. If the required scoped group_counts observation is missing, suggest only the
+   missing scoped group_counts call. Do not suggest extra validation after the
+   category or intent was already resolved with medium/high confidence.
+4. For full distributions, top_k=5 is usually incomplete unless the user asked
    for top 5. Prefer top_k=20 or higher.
 
 Count rules:
 1. Count questions require count_rows unless another already-observed tool
    directly reports the exact matching row count for the same semantic filters.
-2. count_rows without filters counts the whole dataset.
-3. count_rows with category/intent/text_query counts only matching rows.
+2. Return answered when count_rows matches the validated semantic filters.
 
 Example rules:
 1. Example/sample/case/row requests require sample_examples unless the resolved
    filter proves zero matches or no valid requested value exists.
 2. sample_examples must include actual sampled row content, such as
    customer_instruction and support_response.
-3. If sample_examples returns no examples and match_count=0 after a valid prior
-   resolver step, produce a grounded no-matching-rows answer.
-4. If sample_examples returns no examples and match_count=0 but it used a
-   category or intent filter that was not validated earlier in the same trace,
-   return needs_more with resolve_filter_value for that exact filter value and
-   column. Do not accept the zero-example result as final evidence.
+3. Return answered when sample_examples matches the validated semantic filters,
+   including grounded no-match answers after a valid resolver step.
 
 Summary rules:
 1. Summary/theme/tone/pain-point questions require summarize_rows.
@@ -283,11 +273,8 @@ Summary rules:
    target_field="instruction" or "both".
 4. For summary questions about a broad business phrase, valid evidence normally
    requires resolver evidence first, followed by summarize_rows with the
-   recommended semantic filter. A text_query-only summarize_rows call is weak
-   evidence and should not be accepted when it selected an unrelated category
-   or intent.
+   recommended semantic filter.
 5. summarize_rows.focus should preserve the user's analytical focus. If the user
    asks how agents respond to cancellation requests, the focus should be about
    response patterns to cancellation requests, not just "response".
-6. If one more tool is needed, provide suggested_tool_name and suggested_tool_input.
 """
