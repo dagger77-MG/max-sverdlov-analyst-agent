@@ -47,7 +47,11 @@ def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
         return "No tool calls yet in this turn."
 
     lines: list[str] = []
-    for index, item in enumerate(tool_trace, start=1):
+    tool_items = [
+        item for item in tool_trace
+        if item.get("event_type", "tool") == "tool"
+    ]
+    for index, item in enumerate(tool_items, start=1):
         tool_input = _compact_tool_input_for_prompt(item["tool_input"])
         lines.append(
             f"{index}. tool={item['tool_name']}\n"
@@ -55,7 +59,7 @@ def _compact_tool_trace_for_prompt(tool_trace: list[ToolTraceItem]) -> str:
             f"observation={item['observation']}"
         )
 
-    return "\n\n".join(lines)
+    return "\n\n".join(lines) if lines else "No tool calls yet in this turn."
 
 
 def _profile_context_for_planner(state: AgentState) -> str:

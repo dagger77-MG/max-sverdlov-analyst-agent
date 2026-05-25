@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from typing import Annotated, Any, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 from app.router import RouteType
+
+
+TraceEventType = Literal["tool", "reviewer"]
+ReviewerTraceStatus = Literal["answered", "needs_more", "cannot_answer", "error"]
 
 
 class DatasetFilters(TypedDict):
@@ -16,12 +20,22 @@ class DatasetFilters(TypedDict):
     text_query: str | None
 
 
-class ToolTraceItem(TypedDict):
-    """One visible reasoning/tool step for CLI and Streamlit display."""
+class ToolTraceItem(TypedDict, total=False):
+    """One visible reasoning event for CLI and Streamlit display."""
 
+    event_type: TraceEventType
+
+    # Tool event fields.
     tool_name: str
     tool_input: dict[str, Any]
     observation: str
+
+    # Reviewer event fields.
+    reviewer_status: ReviewerTraceStatus
+    reviewer_reason: str
+    reviewer_final_answer: str
+    suggested_tool_name: str
+    suggested_tool_input: dict[str, Any]
 
 
 class AnalysisResult(TypedDict):

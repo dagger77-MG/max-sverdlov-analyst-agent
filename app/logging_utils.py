@@ -40,8 +40,35 @@ def format_tool_input(tool_input: dict[str, Any]) -> str:
     )
 
 
+def format_reviewer_trace_item(trace_item: ToolTraceItem) -> str:
+    """Format a reviewer decision trace item for CLI and Streamlit display."""
+    status = trace_item.get("reviewer_status", "unknown")
+    reason = trace_item.get("reviewer_reason", "")
+    suggested_tool_name = trace_item.get("suggested_tool_name", "")
+    suggested_tool_input = trace_item.get("suggested_tool_input", {})
+
+    lines = [f"[reviewer] {status}"]
+
+    if reason:
+        lines.append(f"[reason] {reason}")
+
+    if suggested_tool_name:
+        lines.append(f"[suggested_tool] {suggested_tool_name}")
+
+    if suggested_tool_input:
+        lines.append(
+            "[suggested_input]\n"
+            f"{format_tool_input(suggested_tool_input)}"
+        )
+
+    return "\n".join(lines)
+
+
 def format_trace_item(trace_item: ToolTraceItem) -> str:
-    """Format a single tool trace item for CLI display."""
+    """Format a single reasoning trace item for CLI and Streamlit display."""
+    if trace_item.get("event_type", "tool") == "reviewer":
+        return format_reviewer_trace_item(trace_item)
+
     tool_name = trace_item["tool_name"]
     tool_input = format_tool_input(trace_item["tool_input"])
     observation = trace_item["observation"]
@@ -58,7 +85,7 @@ def format_reasoning_trace(
     route_reason: str | None,
     tool_trace: list[ToolTraceItem],
 ) -> str:
-    """Format route and tool trace information for human-readable logs."""
+    """Format route and reasoning trace information for human-readable logs."""
     lines: list[str] = []
 
     if route is not None:

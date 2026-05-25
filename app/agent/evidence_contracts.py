@@ -14,6 +14,20 @@ from app.agent.tool_executor import (
 from app.state import AgentState, ToolTraceItem
 
 
+def _is_tool_trace_item(trace_item: ToolTraceItem) -> bool:
+    """Return True when a visible trace entry is an actual tool event."""
+    return trace_item.get("event_type", "tool") == "tool"
+
+
+def _tool_trace_items(state: AgentState) -> list[ToolTraceItem]:
+    """Return only tool events from the mixed visible reasoning trace."""
+    return [
+        trace_item
+        for trace_item in state["tool_trace"]
+        if _is_tool_trace_item(trace_item)
+    ]
+
+
 def _final_answer_update(
     state: AgentState,
     final_answer: str,
@@ -70,10 +84,11 @@ def _trace_observation_is_error(observation: str) -> bool:
 
 def _failed_explicit_resolver_final_answer(state: AgentState) -> str | None:
     """Return a deterministic cannot-answer after an explicit resolver miss."""
-    if not state["tool_trace"]:
+    tool_trace = _tool_trace_items(state)
+    if not tool_trace:
         return None
 
-    latest_step = state["tool_trace"][-1]
+    latest_step = tool_trace[-1]
     if latest_step["tool_name"] != "resolve_filter_value":
         return None
 
@@ -146,12 +161,12 @@ def _return_deterministic_sample_examples_answer_if_ready(
     if (
         tool_name == "sample_examples"
         and _is_example_request(latest_user_message(state["messages"]))
-        and state["tool_trace"]
+        and _tool_trace_items(state)
         and _sample_examples_observation_has_examples(
-            state["tool_trace"][-1]["observation"]
+            _tool_trace_items(state)[-1]["observation"]
         )
     ):
-        final_answer = state["tool_trace"][-1]["observation"]
+        final_answer = _tool_trace_items(state)[-1]["observation"]
         return _final_answer_update(state, final_answer)
 
     return None
@@ -163,7 +178,7 @@ def _has_filtered_group_counts_trace(
     required_filter_column: str,
 ) -> bool:
     """Return True when group_counts ran with the required semantic filter."""
-    for item in state["tool_trace"]:
+    for item in _tool_trace_items(state):
         if item["tool_name"] != "group_counts":
             continue
         if item["tool_input"].get("group_by") != group_by:
@@ -178,7 +193,7 @@ def _has_filtered_group_counts_trace(
 
 def _has_resolver_trace_for_column(state: AgentState, column: str) -> bool:
     """Return True when this turn has a resolver call that searched column."""
-    for item in state["tool_trace"]:
+    for item in _tool_trace_items(state):
         if item["tool_name"] != "resolve_filter_value":
             continue
         columns = item["tool_input"].get("columns") or []
@@ -248,7 +263,7 @@ def _semantic_summary_contract_error(state: AgentState) -> str | None:
     later found a concrete category/intent, the final answer must be based on a
     later summarize_rows call using that resolved semantic filter.
     """
-    trace = state["tool_trace"]
+    trace = _tool_trace_items(state)
 
     for resolver_index, trace_item in enumerate(trace):
         if trace_item["tool_name"] != "resolve_filter_value":

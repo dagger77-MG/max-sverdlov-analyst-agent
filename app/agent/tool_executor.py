@@ -26,6 +26,7 @@ def _append_trace(
     """Append one tool/observation step to state."""
     state["tool_trace"].append(
         ToolTraceItem(
+            event_type="tool",
             tool_name=tool_name,
             tool_input=tool_input,
             observation=observation,
@@ -144,12 +145,17 @@ def _tool_call_already_exists(
 ) -> bool:
     """Return True when the same tool call already exists in this turn trace."""
     normalized_input = _canonical_tool_input(tool_name, tool_input)
-    return any(
-        item["tool_name"] == tool_name
-        and _canonical_tool_input(item["tool_name"], item["tool_input"])
-        == normalized_input
-        for item in state["tool_trace"]
-    )
+    for item in state["tool_trace"]:
+        if item.get("event_type", "tool") != "tool":
+            continue
+
+        if item["tool_name"] != tool_name:
+            continue
+
+        if _canonical_tool_input(item["tool_name"], item["tool_input"]) == normalized_input:
+            return True
+
+    return False
 
 
 def _format_model_dict(data: dict[str, Any]) -> str:

@@ -8,6 +8,7 @@ from app.agent import loop as agent_loop
 from app.agent import profile as agent_profile
 from app.agent import schemas
 from app.agent import tool_executor
+from app.logging_utils import format_reasoning_trace
 
 
 @pytest.fixture(autouse=True)
@@ -151,6 +152,61 @@ def _review_needs_more(
     )
 
 
+def _tool_events(tool_trace: list[dict]) -> list[dict]:
+    """Return only actual tool-call events from a mixed reasoning trace."""
+    return [
+        item for item in tool_trace
+        if item.get("event_type", "tool") == "tool"
+    ]
+
+
+def _reviewer_events(tool_trace: list[dict]) -> list[dict]:
+    """Return only reviewer-decision events from a mixed reasoning trace."""
+    return [
+        item for item in tool_trace
+        if item.get("event_type") == "reviewer"
+    ]
+
+
+def test_format_reasoning_trace_renders_reviewer_decisions() -> None:
+    trace = format_reasoning_trace(
+        route="structured",
+        route_reason="The user asks for examples from a dataset category.",
+        tool_trace=[
+            {
+                "event_type": "tool",
+                "tool_name": "resolve_filter_value",
+                "tool_input": {
+                    "query": "SHIPPING",
+                    "columns": ["category"],
+                    "top_k": 5,
+                },
+                "observation": '{"confidence":"high"}',
+            },
+            {
+                "event_type": "reviewer",
+                "reviewer_status": "needs_more",
+                "reviewer_reason": "Examples require sample_examples output.",
+                "reviewer_final_answer": "",
+                "suggested_tool_name": "sample_examples",
+                "suggested_tool_input": {
+                    "category": "SHIPPING",
+                    "n": 5,
+                    "offset": 0,
+                },
+            },
+        ],
+    )
+
+    assert "[router] structured" in trace
+    assert "[tool] resolve_filter_value" in trace
+    assert "[reviewer] needs_more" in trace
+    assert "[reason] Examples require sample_examples output." in trace
+    assert "[suggested_tool] sample_examples" in trace
+    assert '"category": "SHIPPING"' in trace
+    assert '"n": 5' in trace
+
+
 def _patch_common_graph_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         agent_profile,
@@ -253,15 +309,29 @@ def test_structured_query_resolves_filter_then_counts_rows(
 
     assert result["route"] == "structured"
     assert result["final_answer"] == "There are 2,992 refund-request rows in the dataset."
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
+    tool_events = _tool_events(result["tool_trace"])
+    reviewer_events = _reviewer_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
         "resolve_filter_value",
         "count_rows",
     ]
-    assert result["tool_trace"][1]["tool_input"] == {
+    assert tool_events[1]["tool_input"] == {
         "category": "REFUND",
         "intent": None,
         "text_query": None,
     }
+    assert [step["reviewer_status"] for step in reviewer_events] == [
+        "needs_more",
+        "answered",
+    ]
+    assert reviewer_events[0]["reviewer_reason"] == (
+        "The resolver found the correct dataset filter; now count rows."
+    )
+    assert reviewer_events[0]["suggested_tool_name"] == "count_rows"
+    assert reviewer_events[0]["suggested_tool_input"] == {"category": "REFUND"}
+    assert reviewer_events[1]["reviewer_final_answer"] == (
+        "There are 2,992 refund-request rows in the dataset."
+    )
     assert result["last_structured_results"][-1] == {
         "label": "count_rows",
         "value": 2992,
@@ -348,11 +418,12 @@ def test_assignment_question_categories_exist_uses_group_counts(
     assert result["final_answer"] == (
         "The dataset categories are ORDER, SHIPPING, ACCOUNT, DELIVERY, and SUBSCRIPTION."
     )
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
         "get_dataset_schema",
         "group_counts",
     ]
-    assert result["tool_trace"][1]["tool_input"] == {
+    assert tool_events[1]["tool_input"] == {
         "group_by": "category",
         "category": None,
         "intent": None,
@@ -457,11 +528,12 @@ def test_assignment_question_shipping_examples_samples_with_filters(
         user_id="max",
     )
 
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
         "resolve_filter_value",
         "sample_examples",
     ]
-    assert result["tool_trace"][1]["tool_input"] == {
+    assert tool_events[1]["tool_input"] == {
         "category": "SHIPPING",
         "intent": None,
         "text_query": None,
@@ -577,11 +649,12 @@ def test_assignment_question_account_intent_distribution_groups_with_category_fi
         user_id="max",
     )
 
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
         "resolve_filter_value",
         "group_counts",
     ]
-    assert result["tool_trace"][1]["tool_input"] == {
+    assert tool_events[1]["tool_input"] == {
         "group_by": "intent",
         "category": "ACCOUNT",
         "intent": None,
@@ -684,11 +757,12 @@ def test_scoped_distribution_answer_contract_blocks_answer_after_only_resolve(
     assert result["final_answer"] == (
         "The ACCOUNT category has create_account (997) and delete_account (995)."
     )
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
         "resolve_filter_value",
         "group_counts",
     ]
-    assert result["tool_trace"][1]["tool_input"]["category"] == "ACCOUNT"
+    assert tool_events[1]["tool_input"]["category"] == "ACCOUNT"
 
 
 def test_unstructured_query_summarizes_with_category_filter(
@@ -782,11 +856,12 @@ def test_unstructured_query_summarizes_with_category_filter(
         user_id="max",
     )
 
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
         "resolve_filter_value",
         "summarize_rows",
     ]
-    assert result["tool_trace"][1]["tool_input"]["category"] == "FEEDBACK"
+    assert tool_events[1]["tool_input"]["category"] == "FEEDBACK"
     assert result["last_structured_results"][-1]["query_type"] == "summary"
     assert result["last_structured_results"][-1]["value"] == 2
     assert result["final_answer"] == "Customers mainly provide product feedback."
@@ -941,7 +1016,8 @@ def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
         user_id="max",
     )
 
-    assert [step["tool_name"] for step in result["tool_trace"]] == [
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
         "summarize_rows",
         "resolve_filter_value",
         "summarize_rows",
@@ -1370,7 +1446,7 @@ def test_follow_up_show_me_three_more_uses_previous_filters_and_offset(
     assert "row_id=13" in result["final_answer"]
     assert "row_id=14" in result["final_answer"]
     assert "row_id=15" in result["final_answer"]
-    assert result["tool_trace"][-1]["tool_name"] == "sample_examples"
+    assert _tool_events(result["tool_trace"])[-1]["tool_name"] == "sample_examples"
     assert state["last_structured_results"][-1] == {
         "label": "sample_examples",
         "value": 6,
@@ -1498,3 +1574,5 @@ def test_unknown_tool_error_returns_fallback(monkeypatch: pytest.MonkeyPatch) ->
         "I could not complete the analysis within the allowed number of "
         "reasoning steps. Please try asking a more specific dataset question."
     )
+
+
