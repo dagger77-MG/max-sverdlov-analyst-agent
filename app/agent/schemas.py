@@ -57,9 +57,11 @@ class ToolPlanDecision(BaseModel):
         description="Final answer when no more tools are needed.",
     )
     reason: str = Field(
+        max_length=512,
         description=(
             "One short sentence explaining the planning decision. "
-            "Do not include hidden reasoning, chains of thought, or long analysis."
+            "Maximum 512 characters. Do not include hidden reasoning, "
+            "chains of thought, self-debate, or long analysis."
         )
     )
 

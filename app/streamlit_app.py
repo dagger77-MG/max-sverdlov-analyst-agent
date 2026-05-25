@@ -90,8 +90,8 @@ def render_trace_panel(trace: str) -> None:
             "Latest reasoning trace",
             value=trace,
             height=650,
-            disabled=True,
             label_visibility="collapsed",
+            key=f"latest_reasoning_trace_text::{len(trace)}::{hash(trace)}",
         )
     else:
         st.info(

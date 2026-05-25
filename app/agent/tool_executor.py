@@ -135,6 +135,9 @@ def _canonical_tool_input(
             "max_examples": int(normalized_input.get("max_examples", 100)),
         }
 
+    if tool_name == "read_user_profile":
+        return {}
+
     return normalized_input
 
 
@@ -453,12 +456,15 @@ def _execute_selected_tool(
         return
 
     if tool_name == "read_user_profile":
-        profile_user_id = str(normalized_input.get("user_id") or state["user_id"])
+        profile_user_id = state["user_id"]
+        trace_input = {
+            "user_id": profile_user_id,
+        }
         result = read_user_profile_impl(user_id=profile_user_id)
         _append_trace(
             state,
             tool_name,
-            normalized_input,
+            trace_input,
             _format_model_dict(result.model_dump()),
         )
         return
