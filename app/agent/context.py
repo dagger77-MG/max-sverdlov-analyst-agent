@@ -116,12 +116,11 @@ def _build_reviewer_messages(state: AgentState) -> list[BaseMessage]:
     context = f"""Current route: {state["route"]}
 Route reason: {state["route_reason"]}
 
-Recent structured results:
-{_structured_results_for_prompt(state["last_structured_results"])}
-
 Current turn tool trace:
 {_compact_tool_trace_for_prompt(state["tool_trace"])}
 
+Evidence boundary: judge only the current turn tool trace. Previous structured
+results are planner context for follow-up interpretation, not current-turn evidence.
 """
 
     return [

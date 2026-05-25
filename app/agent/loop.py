@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+import logging
 
 from app.agent.context import (
     _build_planner_messages,
@@ -31,6 +32,8 @@ from app.agent.tool_executor import (
 )
 from app.config import settings
 from app.state import AgentState
+
+logger = logging.getLogger(__name__)
 
 
 def _review_observations(
@@ -372,6 +375,13 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 continue
 
         except Exception as exc:
+            logger.exception(
+                "Agent loop failed; returning fallback answer. "
+                "session_id=%s user_id=%s iteration=%s",
+                state["session_id"],
+                state["user_id"],
+                iteration_number,
+            )
             fallback = _fallback_answer()
             _debug_trace(
                 f"iteration {iteration_number}/{state['max_iterations']}: "

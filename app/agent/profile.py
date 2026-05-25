@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -10,6 +11,8 @@ from app.agent.schemas import ProfileObservationDecision
 from app.memory import read_user_profile_impl, update_user_profile_impl
 from app.prompts import PROFILE_UPDATE_SYSTEM_PROMPT
 from app.state import AgentState
+
+logger = logging.getLogger(__name__)
 
 
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
@@ -38,6 +41,9 @@ def profile_update_node(state: AgentState) -> dict[str, Any]:
         if not isinstance(decision, ProfileObservationDecision):
             decision = ProfileObservationDecision.model_validate(decision)
     except Exception:
+        logger.exception(
+            "Profile update decision failed; skipping profile update."
+        )
         return {}
 
     observation = decision.observation.strip()

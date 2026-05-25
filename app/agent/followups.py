@@ -23,6 +23,7 @@ SampleFormatter = Callable[
 def _is_more_examples_query(query: str) -> bool:
     """Return True when the user asks for additional examples from prior context."""
     normalized = query.strip().lower()
+    normalized_tokens = set(re.findall(r"\b[a-z0-9]+\b", normalized))
 
     if not normalized:
         return False
@@ -44,21 +45,27 @@ def _is_more_examples_query(query: str) -> bool:
         "rows",
     )
 
-    if any(marker in normalized for marker in more_markers) and any(
-        marker in normalized for marker in example_markers
+    has_more_marker = bool(normalized_tokens & set(more_markers))
+    has_example_marker = bool(normalized_tokens & set(example_markers))
+
+    if has_more_marker and has_example_marker:
+        return True
+
+    if re.search(
+        r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
+        normalized,
     ):
         return True
 
-    return bool(
-        re.search(
-            r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
-            normalized,
-        )
-        or re.search(
-            r"\b(?:show|give|list|display)?\s*(?:me\s+)?(?:another|next|additional)\s+\d+\b",
-            normalized,
-        )
-    )
+    if has_example_marker and re.search(
+        r"\b(?:show|give|list|display)?\s*(?:me\s+)?(?:another|next|additional)\s+\d+\b",
+        normalized,
+    ):
+        return True
+
+    return False
+
+
 
 
 def _requested_example_count(query: str, default: int = 3) -> int:

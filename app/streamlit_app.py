@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sys
+import uuid
 from pathlib import Path
+
+import streamlit as st # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT_TEXT = str(PROJECT_ROOT)
@@ -9,12 +12,11 @@ PROJECT_ROOT_TEXT = str(PROJECT_ROOT)
 if PROJECT_ROOT_TEXT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT_TEXT)
 
-
-import streamlit as st # noqa: E402
-
 from app.config import settings # noqa: E402
 from app.graph import invoke_agent # noqa: E402
 from app.logging_utils import format_reasoning_trace # noqa: E402
+
+SESSION_ID_INPUT_KEY = "agent_session_id_input"
 
 
 def get_chat_messages_key(session_id: str) -> str:
@@ -38,13 +40,33 @@ def initialize_chat_state(chat_messages_key: str, latest_trace_key: str) -> None
         st.session_state[latest_trace_key] = ""
 
 
+def clear_visible_chat(chat_messages_key: str, latest_trace_key: str) -> None:
+    """Clear only Streamlit-visible chat/trace state for the current session."""
+    st.session_state[chat_messages_key] = []
+    st.session_state[latest_trace_key] = ""
+
+
+def make_fresh_session_id() -> str:
+    """Return a new UI session ID that maps to a fresh graph checkpoint thread."""
+    return f"{settings.default_session_id}_{uuid.uuid4().hex[:8]}"
+
+
+def start_fresh_session(chat_messages_key: str, latest_trace_key: str) -> None:
+    """Switch to a new session ID so hidden checkpointed graph state is not reused."""
+    clear_visible_chat(chat_messages_key, latest_trace_key)
+    st.session_state[SESSION_ID_INPUT_KEY] = make_fresh_session_id()
+
+
 def render_sidebar() -> tuple[str, str, int, str, str]:
     """Render sidebar controls and return session/user/max-iteration settings."""
     st.sidebar.title("Agent Settings")
 
+    if SESSION_ID_INPUT_KEY not in st.session_state:
+        st.session_state[SESSION_ID_INPUT_KEY] = settings.default_session_id
+
     session_id = st.sidebar.text_input(
         "Session ID",
-        value=settings.default_session_id,
+        key=SESSION_ID_INPUT_KEY,
         help="Conversation session identifier.",
     )
     chat_messages_key = get_chat_messages_key(session_id)
@@ -65,10 +87,24 @@ def render_sidebar() -> tuple[str, str, int, str, str]:
         help="Maximum reasoning/tool-use iterations per question.",
     )
 
-    if st.sidebar.button("Clear visible chat"):
-        st.session_state[chat_messages_key] = []
-        st.session_state[latest_trace_key] = ""
-        st.rerun()
+    st.sidebar.button(
+        "Clear visible chat only",
+        help=(
+            "Clears only the messages shown in this browser tab. "
+            "The graph checkpoint for this Session ID is preserved."
+        ),
+        on_click=clear_visible_chat,
+        args=(chat_messages_key, latest_trace_key),
+    )
+    st.sidebar.button(
+        "Start fresh session",
+        help=(
+            "Creates a new Session ID so previous graph checkpoint context "
+            "will not affect follow-up questions."
+        ),
+        on_click=start_fresh_session,
+        args=(chat_messages_key, latest_trace_key),
+    )
 
     return session_id, user_id, int(max_iterations), chat_messages_key, latest_trace_key
 
