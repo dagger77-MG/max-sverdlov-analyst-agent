@@ -228,10 +228,10 @@ def _allow_embedded_category_alias(normalized_value: str) -> bool:
 def _resolve_category_alias_in_text(value: str) -> str | None:
     """Resolve category aliases without letting full questions hijack matching.
 
-        Exact aliases are always allowed. Embedded aliases are intentionally limited
-        to short filter phrases such as "people wanting their money back". This
-        prevents full analytical questions containing words like "customer service"
-        from being incorrectly resolved to the CONTACT category.
+    Exact aliases are always allowed. Embedded aliases are intentionally limited
+    to short filter phrases such as "people wanting their money back". This
+    prevents full analytical questions containing words like "customer service"
+    from being incorrectly resolved to the CONTACT category.
     """
     normalized = _normalize_filter_value(value)
 
@@ -362,6 +362,7 @@ def _canonical_dataset_value(
             return value
 
     return normalized_value
+
 
 def _effective_filters(
     category: str | None = None,
@@ -835,23 +836,23 @@ def summarize_rows_impl(
         )
         if not summary:
             summary = (
-                    "LLM summarization returned an empty response; "
-                    "deterministic fallback used.\n\n"
-                    + _deterministic_rows_summary(
+                "LLM summarization returned an empty response; "
+                "deterministic fallback used.\n\n"
+                + _deterministic_rows_summary(
+                    df=df,
+                    focus=focus,
+                    target_field=target_field,
+                )
+            )
+    except Exception as exc:
+        summary = (
+            "LLM summarization failed; deterministic fallback used. "
+            f"Error: {type(exc).__name__}: {exc}\n\n"
+            + _deterministic_rows_summary(
                 df=df,
                 focus=focus,
                 target_field=target_field,
             )
-            )
-    except Exception as exc:
-        summary = (
-                "LLM summarization failed; deterministic fallback used. "
-                f"Error: {type(exc).__name__}: {exc}\n\n"
-                + _deterministic_rows_summary(
-            df=df,
-            focus=focus,
-            target_field=target_field,
-        )
         )
 
     return SummarizeRowsOutput(

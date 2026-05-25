@@ -28,7 +28,7 @@ def _tool_trace_items(state: AgentState) -> list[ToolTraceItem]:
     ]
 
 
-def _append_deterministic_fast_path_trace(
+def _append_reviewer_fast_path_trace(
     state: AgentState,
     reason: str,
 ) -> None:
@@ -184,7 +184,7 @@ def _return_deterministic_sample_examples_answer_if_ready(
         )
     ):
         final_answer = _tool_trace_items(state)[-1]["observation"]
-        _append_deterministic_fast_path_trace(
+        _append_reviewer_fast_path_trace(
             state=state,
             reason=(
                 "Reviewer LLM skipped: sample_examples returned requested row "

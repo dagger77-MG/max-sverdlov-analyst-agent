@@ -12,11 +12,12 @@ from app.agent.tool_executor import (
     _format_sample_examples_observation,
 )
 from app.state import AgentState, AnalysisResult
+from app.agent.evidence_contracts import _append_reviewer_fast_path_trace
 
 
 SampleFormatter = Callable[
     [dict[str, str | None], int, int],
-    tuple[str, int, int],
+    tuple[str, int, int, dict[str, str | None]],
 ]
 
 
@@ -123,7 +124,12 @@ def _handle_more_examples_follow_up(
     n = _requested_example_count(user_query)
 
     formatter = sample_formatter or _format_sample_examples_observation
-    observation, next_offset, match_count = formatter(
+    (
+        observation,
+        next_offset,
+        match_count,
+        applied_filters,
+    ) = formatter(
         filters,
         n,
         offset,
@@ -141,8 +147,17 @@ def _handle_more_examples_follow_up(
             label="sample_examples",
             value=next_offset,
             query_type="sample",
-            filters=filters,
+            filters=applied_filters,
             match_count=match_count,
+        ),
+    )
+
+    _append_reviewer_fast_path_trace(
+        state=state,
+        reason=(
+            "Planner and reviewer LLMs skipped: user asked for more examples "
+            "from the previous sample context, so deterministic follow-up "
+            "pagination produced the final answer."
         ),
     )
 

@@ -221,7 +221,7 @@ def _format_sample_examples_observation(
     filters: dict[str, str | None],
     n: int,
     offset: int,
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, dict[str, str | None]]:
     """Call sample_examples and format the observation text."""
     result = sample_examples_impl(
         category=filters.get("category"),
@@ -249,7 +249,7 @@ def _format_sample_examples_observation(
         + ("\n\n" + "\n\n---\n\n".join(example_lines) if example_lines else "")
     )
 
-    return observation, result.next_offset, result.match_count
+    return observation, result.next_offset, result.match_count, result.applied_filters
 
 
 def _execute_selected_tool(
@@ -323,7 +323,12 @@ def _execute_selected_tool(
         filters = _tool_filters(normalized_input)
         n = int(normalized_input.get("n", 3))
         offset = int(normalized_input.get("offset", 0))
-        observation, next_offset, match_count = _format_sample_examples_observation(
+        (
+            observation,
+            next_offset,
+            match_count,
+            applied_filters,
+        ) = _format_sample_examples_observation(
             filters=filters,
             n=n,
             offset=offset,
@@ -340,7 +345,7 @@ def _execute_selected_tool(
                 label="sample_examples",
                 value=next_offset,
                 query_type="sample",
-                filters=filters,
+                filters=applied_filters,
                 match_count=match_count,
             ),
         )
