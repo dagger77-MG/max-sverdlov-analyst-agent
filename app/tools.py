@@ -219,8 +219,20 @@ _CATEGORY_ALIASES: dict[str, str] = {
 }
 
 
+def _allow_embedded_category_alias(normalized_value: str) -> bool:
+    """Return True only for short filter phrases, not full user questions."""
+    tokens = _tokenize_filter_text(normalized_value)
+    return len(tokens) <= 5
+
+
 def _resolve_category_alias_in_text(value: str) -> str | None:
-    """Resolve exact or embedded natural-language category aliases."""
+    """Resolve category aliases without letting full questions hijack matching.
+
+        Exact aliases are always allowed. Embedded aliases are intentionally limited
+        to short filter phrases such as "people wanting their money back". This
+        prevents full analytical questions containing words like "customer service"
+        from being incorrectly resolved to the CONTACT category.
+    """
     normalized = _normalize_filter_value(value)
 
     if normalized is None:
@@ -230,14 +242,22 @@ def _resolve_category_alias_in_text(value: str) -> str | None:
     if exact_alias is not None:
         return exact_alias
 
-    for alias, category in _CATEGORY_ALIASES.items():
-        if alias in normalized:
+    if not _allow_embedded_category_alias(normalized):
+        return None
+
+    for alias, category in sorted(
+        _CATEGORY_ALIASES.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if re.search(rf"\b{re.escape(alias)}\b", normalized):
             return category
 
     return None
 
+
 def _normalize_category_filter(value: str | None) -> str | None:
-    """Normalize category filter values, including common natural-language aliases."""
+    """Normalize category filter values, including safe natural-language aliases."""
     normalized = _normalize_filter_value(value)
 
     if normalized is None:
@@ -320,16 +340,56 @@ def _confidence_from_score(score: float) -> Literal["none", "low", "medium", "hi
     return "none"
 
 
+def _canonical_dataset_value(
+    column: Literal["category", "intent"],
+    normalized_value: str | None,
+) -> str | None:
+    """Return the dataset's canonical casing for a normalized filter value."""
+    if normalized_value is None:
+        return None
+
+    df = get_dataset_df()
+    values = (
+        df[column]
+        .dropna()
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+    )
+
+    for value in values:
+        if value.lower() == normalized_value:
+            return value
+
+    return normalized_value
+
+def _effective_filters(
+    category: str | None = None,
+    intent: str | None = None,
+    text_query: str | None = None,
+) -> dict[str, str | None]:
+    """Return normalized semantic filters used for execution and trace output."""
+    normalized_category = _normalize_category_filter(category)
+    normalized_intent = _normalize_filter_value(intent)
+    normalized_text_query = _normalize_filter_value(text_query)
+
+    return {
+        "category": _canonical_dataset_value("category", normalized_category),
+        "intent": _canonical_dataset_value("intent", normalized_intent),
+        "text_query": normalized_text_query,
+    }
+
+
 def _applied_filters(
     category: str | None = None,
     intent: str | None = None,
     text_query: str | None = None,
 ) -> dict[str, str | None]:
-    return {
-        "category": category,
-        "intent": intent,
-        "text_query": text_query,
-    }
+    return _effective_filters(
+        category=category,
+        intent=intent,
+        text_query=text_query,
+    )
 
 
 def _filter_dataset(
@@ -343,9 +403,14 @@ def _filter_dataset(
     row ID lists between tools.
     """
     df = get_dataset_df()
-    category_filter = _normalize_category_filter(category)
-    intent_filter = _normalize_filter_value(intent)
-    text_filter = _normalize_filter_value(text_query)
+    effective_filters = _effective_filters(
+        category=category,
+        intent=intent,
+        text_query=text_query,
+    )
+    category_filter = _normalize_filter_value(effective_filters["category"])
+    intent_filter = _normalize_filter_value(effective_filters["intent"])
+    text_filter = effective_filters["text_query"]
 
     filtered = df
 
@@ -769,16 +834,24 @@ def summarize_rows_impl(
             target_field=target_field,
         )
         if not summary:
-            summary = _deterministic_rows_summary(
+            summary = (
+                    "LLM summarization returned an empty response; "
+                    "deterministic fallback used.\n\n"
+                    + _deterministic_rows_summary(
                 df=df,
                 focus=focus,
                 target_field=target_field,
             )
-    except Exception:
-        summary = _deterministic_rows_summary(
+            )
+    except Exception as exc:
+        summary = (
+                "LLM summarization failed; deterministic fallback used. "
+                f"Error: {type(exc).__name__}: {exc}\n\n"
+                + _deterministic_rows_summary(
             df=df,
             focus=focus,
             target_field=target_field,
+        )
         )
 
     return SummarizeRowsOutput(
