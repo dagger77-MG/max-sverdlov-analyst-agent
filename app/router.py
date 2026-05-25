@@ -114,11 +114,13 @@ def _parse_route_decision(output_text: str) -> RouteDecision:
 
 
 def _extract_embedded_json_object(text: str) -> str | None:
-    """Return the outermost JSON-looking object from a text response."""
-    start = text.find("{")
+    """Return the final JSON-looking object from a text response."""
     end = text.rfind("}")
+    if end == -1:
+        return None
 
-    if start == -1 or end == -1 or start >= end:
+    start = text.rfind("{", 0, end + 1)
+    if start == -1 or start >= end:
         return None
 
     return text[start: end + 1]

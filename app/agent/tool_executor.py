@@ -26,6 +26,7 @@ def _append_trace(
     """Append one tool/observation step to state."""
     state["tool_trace"].append(
         ToolTraceItem(
+            event_type="tool",
             tool_name=tool_name,
             tool_input=tool_input,
             observation=observation,
@@ -134,6 +135,9 @@ def _canonical_tool_input(
             "max_examples": int(normalized_input.get("max_examples", 100)),
         }
 
+    if tool_name == "read_user_profile":
+        return {}
+
     return normalized_input
 
 
@@ -144,12 +148,17 @@ def _tool_call_already_exists(
 ) -> bool:
     """Return True when the same tool call already exists in this turn trace."""
     normalized_input = _canonical_tool_input(tool_name, tool_input)
-    return any(
-        item["tool_name"] == tool_name
-        and _canonical_tool_input(item["tool_name"], item["tool_input"])
-        == normalized_input
-        for item in state["tool_trace"]
-    )
+    for item in state["tool_trace"]:
+        if item.get("event_type", "tool") != "tool":
+            continue
+
+        if item["tool_name"] != tool_name:
+            continue
+
+        if _canonical_tool_input(item["tool_name"], item["tool_input"]) == normalized_input:
+            return True
+
+    return False
 
 
 def _format_model_dict(data: dict[str, Any]) -> str:
@@ -447,12 +456,15 @@ def _execute_selected_tool(
         return
 
     if tool_name == "read_user_profile":
-        profile_user_id = str(normalized_input.get("user_id") or state["user_id"])
+        profile_user_id = state["user_id"]
+        trace_input = {
+            "user_id": profile_user_id,
+        }
         result = read_user_profile_impl(user_id=profile_user_id)
         _append_trace(
             state,
             tool_name,
-            normalized_input,
+            trace_input,
             _format_model_dict(result.model_dump()),
         )
         return

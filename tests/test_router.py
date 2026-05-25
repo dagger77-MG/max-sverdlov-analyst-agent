@@ -33,6 +33,8 @@ class FailingStructuredRouterLLM:
         ("What is the distribution of intents in the ACCOUNT category?", "structured"),
         ("Give me a few reimbursement cases", "structured"),
         ("Show me examples of people wanting their money back.", "structured"),
+        ("What do you know about me?", "structured"),
+        ("What do you remember about me?", "structured"),
         ("Summarize FEEDBACK", "unstructured"),
         ("Summarize the FEEDBACK category.", "unstructured"),
         ("What are common themes in complaints?", "unstructured"),
@@ -130,6 +132,34 @@ def test_parse_route_decision_accepts_reasoning_text_before_json() -> None:
     )
 
 
+def test_parse_route_decision_accepts_profile_reasoning_with_final_json() -> None:
+    raw_output = (
+        'We need to classify the user query "What do you know about me?" '
+        "According to instructions, this is a question about the saved user "
+        "profile, so it should be structured. "
+        'So output: {"route":"structured","reason":"question about saved user profile"}\n\n'
+        '{"route":"structured","reason":"question about saved user profile"}'
+    )
+
+    result = router._parse_route_decision(raw_output)
+
+    assert result == router.RouteDecision(
+        route="structured",
+        reason="question about saved user profile",
+    )
+
+
+def test_extract_embedded_json_object_returns_final_json_object() -> None:
+    raw_output = (
+        'Example JSON: {"route":"out_of_scope","reason":"example only"}\n'
+        '{"route":"structured","reason":"final answer"}'
+    )
+
+    assert router._extract_embedded_json_object(raw_output) == (
+        '{"route":"structured","reason":"final answer"}'
+    )
+
+
 def test_route_query_with_reason_wraps_router_llm_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -182,7 +212,6 @@ def test_build_responses_payload_requests_json_object_format() -> None:
 
     text_format = payload["text"]["format"]
     assert text_format == {"type": "json_object"}
-
 
 
 def test_extract_response_text_prefers_top_level_output_text() -> None:

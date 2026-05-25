@@ -74,7 +74,7 @@ class AppConfig:
             agent_model="nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
             debug_trace=True,
             router_max_tokens=256,
-            max_tokens=3084,
+            max_tokens=1024,
         )
 
     def ensure_runtime_dirs(self) -> None:

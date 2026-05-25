@@ -23,6 +23,22 @@ def _state(query: str = "How many refund requests?") -> dict[str, Any]:
     }
 
 
+def _tool_events(tool_trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only actual tool-call events from a mixed reasoning trace."""
+    return [
+        item for item in tool_trace
+        if item.get("event_type", "tool") == "tool"
+    ]
+
+
+def _reviewer_events(tool_trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only reviewer-decision events from a mixed reasoning trace."""
+    return [
+        item for item in tool_trace
+        if item.get("event_type") == "reviewer"
+    ]
+
+
 class FakePlannerLLM:
     def __init__(self, *decisions: schemas.ToolPlanDecision) -> None:
         self.decisions = list(decisions)
@@ -133,6 +149,7 @@ def test_loop_executes_tool_then_returns_reviewer_answer(monkeypatch) -> None:
     ) -> None:
         state["tool_trace"].append(
             {
+                "event_type": "tool",
                 "tool_name": tool_name,
                 "tool_input": {
                     "category": "REFUND",
@@ -172,8 +189,9 @@ def test_loop_executes_tool_then_returns_reviewer_answer(monkeypatch) -> None:
     assert result["final_answer"] == (
         "There are 2,992 refund-request rows in the dataset."
     )
-    assert state["tool_trace"] == [
+    assert _tool_events(state["tool_trace"]) == [
         {
+            "event_type": "tool",
             "tool_name": "count_rows",
             "tool_input": {
                 "category": "REFUND",
@@ -184,6 +202,18 @@ def test_loop_executes_tool_then_returns_reviewer_answer(monkeypatch) -> None:
                 '{"count": 2992, "applied_filters": '
                 '{"category": "REFUND", "intent": null, "text_query": null}}'
             ),
+        }
+    ]
+    assert _reviewer_events(state["tool_trace"]) == [
+        {
+            "event_type": "reviewer",
+            "reviewer_status": "answered",
+            "reviewer_reason": "The observations are sufficient.",
+            "reviewer_final_answer": (
+                "There are 2,992 refund-request rows in the dataset."
+            ),
+            "suggested_tool_name": "",
+            "suggested_tool_input": {},
         }
     ]
 
@@ -222,6 +252,7 @@ def test_loop_executes_reviewer_suggested_tool_directly(monkeypatch) -> None:
         executed_tools.append((tool_name, tool_input))
         state["tool_trace"].append(
             {
+                "event_type": "tool",
                 "tool_name": tool_name,
                 "tool_input": tool_input,
                 "observation": "{}",
@@ -257,6 +288,18 @@ def test_loop_executes_reviewer_suggested_tool_directly(monkeypatch) -> None:
     assert result["final_answer"] == (
         "There are 2,992 refund-request rows in the dataset."
     )
+    reviewer_events = _reviewer_events(state["tool_trace"])
+    assert [event["reviewer_status"] for event in reviewer_events] == [
+        "needs_more",
+        "answered",
+    ]
+    assert reviewer_events[0]["suggested_tool_name"] == "count_rows"
+    assert reviewer_events[0]["suggested_tool_input"] == {
+        "category": "REFUND",
+    }
+    assert reviewer_events[1]["reviewer_final_answer"] == (
+        "There are 2,992 refund-request rows in the dataset."
+    )
 
 
 def test_loop_blocks_duplicate_planner_tool_call_and_uses_existing_observation(
@@ -265,6 +308,7 @@ def test_loop_blocks_duplicate_planner_tool_call_and_uses_existing_observation(
     state = _state("How many refund requests?")
     state["tool_trace"] = [
         {
+            "event_type": "tool",
             "tool_name": "count_rows",
             "tool_input": {
                 "category": "REFUND",
@@ -333,6 +377,7 @@ def test_loop_blocks_planner_final_answer_when_contract_requires_tool(
         executed_tools.append((tool_name, tool_input))
         state["tool_trace"].append(
             {
+                "event_type": "tool",
                 "tool_name": tool_name,
                 "tool_input": tool_input,
                 "observation": "{}",
@@ -400,6 +445,7 @@ def test_loop_continues_after_reviewer_exception(monkeypatch) -> None:
     ) -> None:
         state["tool_trace"].append(
             {
+                "event_type": "tool",
                 "tool_name": tool_name,
                 "tool_input": tool_input,
                 "observation": '{"count": 2992}',
@@ -419,3 +465,17 @@ def test_loop_continues_after_reviewer_exception(monkeypatch) -> None:
     assert result["final_answer"] == (
         "There are 2,992 refund-request rows in the dataset."
     )
+    reviewer_events = _reviewer_events(state["tool_trace"])
+    assert reviewer_events == [
+        {
+            "event_type": "reviewer",
+            "reviewer_status": "error",
+            "reviewer_reason": (
+                "Reviewer failed to return a valid structured decision after "
+                "the latest tool call: RuntimeError: Simulated reviewer failure."
+            ),
+            "reviewer_final_answer": "",
+            "suggested_tool_name": "",
+            "suggested_tool_input": {},
+        }
+    ]

@@ -187,6 +187,7 @@ def test_handle_more_examples_follow_up_appends_trace_and_structured_result() ->
         "Returned 2 examples from 6 matching rows. Next offset = 5."
     )
     assert state["tool_trace"][-1] == {
+        "event_type": "tool",
         "tool_name": "sample_examples",
         "tool_input": {
             "category": "REFUND",

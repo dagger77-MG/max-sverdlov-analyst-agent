@@ -44,6 +44,44 @@ def _review_observations(
     return review
 
 
+def _append_reviewer_trace(
+    state: AgentState,
+    review: ObservationReviewDecision,
+) -> None:
+    """Append one reviewer decision to the visible reasoning trace."""
+    state["tool_trace"].append(
+        {
+            "event_type": "reviewer",
+            "reviewer_status": review.status,
+            "reviewer_reason": review.reason,
+            "reviewer_final_answer": review.final_answer,
+            "suggested_tool_name": review.suggested_tool_name,
+            "suggested_tool_input": review.suggested_tool_input,
+        }
+    )
+
+
+def _append_reviewer_error_trace(
+    state: AgentState,
+    exc: Exception,
+    context: str,
+) -> None:
+    """Append a reviewer structured-output failure to the visible trace."""
+    state["tool_trace"].append(
+        {
+            "event_type": "reviewer",
+            "reviewer_status": "error",
+            "reviewer_reason": (
+                "Reviewer failed to return a valid structured decision "
+                f"{context}: {type(exc).__name__}: {exc}"
+            ),
+            "reviewer_final_answer": "",
+            "suggested_tool_name": "",
+            "suggested_tool_input": {},
+        }
+    )
+
+
 def _fallback_answer() -> str:
     """Return a safe graph fallback for planner/reviewer/tool errors."""
     return (
@@ -218,6 +256,11 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
             try:
                 review = _review_observations(state)
             except Exception as exc:
+                _append_reviewer_error_trace(
+                    state=state,
+                    exc=exc,
+                    context="after the latest tool call",
+                )
                 must_call_tool_before_final_answer = False
                 reviewer_feedback = _reviewer_exception_feedback(
                     exc,
@@ -236,6 +279,8 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 f"suggested_tool={review.suggested_tool_name or '-'}; "
                 f"reason={review.reason}"
             )
+
+            _append_reviewer_trace(state, review)
 
             if review.status in {"answered", "cannot_answer"}:
                 if review.status == "answered":
@@ -358,6 +403,11 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                 try:
                     follow_up_review = _review_observations(state)
                 except Exception as exc:
+                    _append_reviewer_error_trace(
+                        state=state,
+                        exc=exc,
+                        context="after the reviewer-suggested tool",
+                    )
                     must_call_tool_before_final_answer = False
                     reviewer_feedback = _reviewer_exception_feedback(
                         exc,
@@ -376,6 +426,8 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     f"suggested_tool={follow_up_review.suggested_tool_name or '-'}; "
                     f"reason={follow_up_review.reason}"
                 )
+
+                _append_reviewer_trace(state, follow_up_review)
 
                 if follow_up_review.status in {"answered", "cannot_answer"}:
                     if follow_up_review.status == "answered":

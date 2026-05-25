@@ -22,13 +22,23 @@ def get_chat_messages_key(session_id: str) -> str:
     normalized_session_id = session_id.strip() or settings.default_session_id
     return f"chat_messages::{normalized_session_id}"
 
-def initialize_chat_state(chat_messages_key: str) -> None:
-    """Initialize Streamlit session state for visible chat messages."""
+
+def get_latest_trace_key(session_id: str) -> str:
+    """Return the Streamlit session-state key for the latest reasoning trace."""
+    normalized_session_id = session_id.strip() or settings.default_session_id
+    return f"latest_trace::{normalized_session_id}"
+
+
+def initialize_chat_state(chat_messages_key: str, latest_trace_key: str) -> None:
+    """Initialize Streamlit session state for visible chat and latest trace."""
     if chat_messages_key not in st.session_state:
         st.session_state[chat_messages_key] = []
 
+    if latest_trace_key not in st.session_state:
+        st.session_state[latest_trace_key] = ""
 
-def render_sidebar() -> tuple[str, str, int, str]:
+
+def render_sidebar() -> tuple[str, str, int, str, str]:
     """Render sidebar controls and return session/user/max-iteration settings."""
     st.sidebar.title("Agent Settings")
 
@@ -38,6 +48,7 @@ def render_sidebar() -> tuple[str, str, int, str]:
         help="Conversation session identifier.",
     )
     chat_messages_key = get_chat_messages_key(session_id)
+    latest_trace_key = get_latest_trace_key(session_id)
 
     user_id = st.sidebar.text_input(
         "User ID",
@@ -56,9 +67,10 @@ def render_sidebar() -> tuple[str, str, int, str]:
 
     if st.sidebar.button("Clear visible chat"):
         st.session_state[chat_messages_key] = []
+        st.session_state[latest_trace_key] = ""
         st.rerun()
 
-    return session_id, user_id, int(max_iterations), chat_messages_key
+    return session_id, user_id, int(max_iterations), chat_messages_key, latest_trace_key
 
 
 def render_existing_messages(chat_messages_key: str) -> None:
@@ -67,10 +79,24 @@ def render_existing_messages(chat_messages_key: str) -> None:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-            trace = message.get("trace")
-            if trace:
-                with st.expander("Reasoning trace"):
-                    st.text(trace)
+
+def render_trace_panel(trace: str) -> None:
+    """Render the latest reasoning trace in a dedicated side panel."""
+    st.subheader("Reasoning trace")
+    st.caption("Shows only the latest request trace.")
+
+    if trace:
+        st.text_area(
+            "Latest reasoning trace",
+            value=trace,
+            height=650,
+            label_visibility="collapsed",
+            key=f"latest_reasoning_trace_text::{len(trace)}::{hash(trace)}",
+        )
+    else:
+        st.info(
+            "Ask a question to see router, tool, observation, and reviewer steps."
+        )
 
 
 def append_user_message(chat_messages_key: str, content: str) -> None:
@@ -82,12 +108,11 @@ def append_user_message(chat_messages_key: str, content: str) -> None:
     )
 
 
-def append_assistant_message(chat_messages_key: str, content: str, trace: str) -> None:
+def append_assistant_message(chat_messages_key: str, content: str) -> None:
     st.session_state[chat_messages_key].append(
         {
             "role": "assistant",
             "content": content,
-            "trace": trace,
         }
     )
 
@@ -105,10 +130,24 @@ def main() -> None:
         "Ask structured or qualitative questions about the Bitext customer service dataset."
     )
 
-    session_id, user_id, max_iterations, chat_messages_key = render_sidebar()
-    initialize_chat_state(chat_messages_key)
+    (
+        session_id,
+        user_id,
+        max_iterations,
+        chat_messages_key,
+        latest_trace_key,
+    ) = render_sidebar()
+    initialize_chat_state(chat_messages_key, latest_trace_key)
 
-    render_existing_messages(chat_messages_key)
+    chat_column, trace_column = st.columns([0.62, 0.38], gap="large")
+
+    with chat_column:
+        render_existing_messages(chat_messages_key)
+
+    with trace_column:
+        trace_placeholder = st.empty()
+        with trace_placeholder.container():
+            render_trace_panel(st.session_state[latest_trace_key])
 
     query = st.chat_input("Ask about the dataset...")
 
@@ -117,40 +156,52 @@ def main() -> None:
 
     append_user_message(chat_messages_key, query)
 
-    with st.chat_message("user"):
-        st.markdown(query)
+    st.session_state[latest_trace_key] = ""
+    with trace_column:
+        trace_placeholder.empty()
+        with trace_placeholder.container():
+            st.subheader("Reasoning trace")
+            st.caption("Shows only the latest request trace.")
+            st.info("Running agent... trace will appear here after this request completes.")
 
-    with st.chat_message("assistant"):
-        with st.spinner("Analyzing..."):
-            try:
-                result = invoke_agent(
-                    query=query,
-                    session_id=session_id,
-                    user_id=user_id,
-                    max_iterations=max_iterations,
-                )
+    with chat_column:
+        with st.chat_message("user"):
+            st.markdown(query)
 
-                trace = format_reasoning_trace(
-                    route=result.get("route"),
-                    route_reason=result.get("route_reason"),
-                    tool_trace=result.get("tool_trace", []),
-                )
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing..."):
+                try:
+                    result = invoke_agent(
+                        query=query,
+                        session_id=session_id,
+                        user_id=user_id,
+                        max_iterations=max_iterations,
+                    )
 
-                final_answer = result.get("final_answer") or (
-                    "I could not produce a final answer."
-                )
+                    trace = format_reasoning_trace(
+                        route=result.get("route"),
+                        route_reason=result.get("route_reason"),
+                        tool_trace=result.get("tool_trace", []),
+                    )
 
-            except RuntimeError as exc:
-                trace = ""
-                final_answer = f"Error: {exc}"
+                    final_answer = result.get("final_answer") or (
+                        "I could not produce a final answer."
+                    )
 
-        st.markdown(final_answer)
+                except RuntimeError as exc:
+                    trace = ""
+                    final_answer = f"Error: {exc}"
 
-        if trace:
-            with st.expander("Reasoning trace"):
-                st.text(trace)
+            st.markdown(final_answer)
 
-    append_assistant_message(chat_messages_key, final_answer, trace)
+    st.session_state[latest_trace_key] = trace
+
+    with trace_column:
+        trace_placeholder.empty()
+        with trace_placeholder.container():
+            render_trace_panel(trace)
+
+    append_assistant_message(chat_messages_key, final_answer)
 
 
 if __name__ == "__main__":
