@@ -225,8 +225,8 @@ def _is_distribution_query(query: str) -> bool:
         r"\bbreak\s+down\b",
         r"\bintents?\s+breakdown\b",
         r"\bcategor(?:y|ies)\s+breakdown\b",
-        r"\bwhat\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
-        r"\bwhat\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+        r"\b(?:what|which)\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+        r"\b(?:what|which)\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
         r"\bintents?\s+(?:under|within|inside)\b",
         r"\bcategor(?:y|ies)\s+(?:under|within|inside)\b",
     )
@@ -268,7 +268,7 @@ def _requires_grouped_filtered_scope(query: str, group_by: str) -> bool:
                     normalized,
                 )
                 or re.search(
-                    r"\bwhat\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+                    r"\b(?:what|which)\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
                     normalized,
                 )
                 or re.search(r"\bintents?\s+(?:under|within|inside)\b", normalized)
@@ -285,7 +285,7 @@ def _requires_grouped_filtered_scope(query: str, group_by: str) -> bool:
                     normalized,
                 )
                 or re.search(
-                    r"\bwhat\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+                    r"\b(?:what|which)\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
                     normalized,
                 )
                 or re.search(r"\bcategor(?:y|ies)\s+(?:under|within|inside)\b", normalized)

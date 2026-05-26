@@ -871,6 +871,44 @@ def test_assignment_question_account_intent_distribution_groups_with_category_fi
     )
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Break down ACCOUNT by intent",
+        "Intent breakdown for ACCOUNT",
+        "What intents appear under ACCOUNT?",
+        "Show intents within ACCOUNT",
+        "Which intents occur inside ACCOUNT?",
+    ],
+)
+def test_scoped_intent_distribution_phrasings_require_category_filter(
+    query: str,
+) -> None:
+    assert tool_executor._requires_grouped_filtered_scope(
+        query=query,
+        group_by="intent",
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Break down track_refund by category",
+        "Category breakdown for track_refund",
+        "What categories appear under track_refund?",
+        "Show categories within delete_account",
+        "Which categories occur inside check_refund_status?",
+    ],
+)
+def test_scoped_category_distribution_phrasings_require_intent_filter(
+    query: str,
+) -> None:
+    assert tool_executor._requires_grouped_filtered_scope(
+        query=query,
+        group_by="category",
+    )
+
+
 def test_scoped_distribution_answer_contract_blocks_answer_after_only_resolve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
