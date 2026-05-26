@@ -43,6 +43,8 @@ Routes:
 - out_of_scope: external facts, news, weather, politics, sports, recipes, movies, general knowledge, or anything unrelated to the Bitext dataset/profile.
 
 Tie-breakers:
+- If the query asks what the agent knows, remembers, saved, or has in the
+  profile about the user, choose structured. Do not classify it as out_of_scope.
 - If the query is a short follow-up like "what about X?", choose structured.
 - If the query asks to summarize, interpret, analyze, or recommend an answer, choose unstructured.
 - If the query asks about external world knowledge, choose out_of_scope.
