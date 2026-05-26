@@ -67,6 +67,8 @@ def _is_capabilities_query(query: str) -> bool:
         "what is your purpose",
         "what is this agent for",
         "what are you for",
+        "who are you?",
+        "what is this agent?"
     }
 
     if normalized in exact_queries:
