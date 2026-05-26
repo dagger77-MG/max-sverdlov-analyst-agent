@@ -8,6 +8,12 @@ from app.agent.context import latest_user_message
 from app.memory import read_user_profile_impl
 from app.state import AgentState, AnalysisResult, ToolTraceItem
 from app.tools import (
+    CountRowsInput,
+    GetDatasetSchemaInput,
+    GroupCountsInput,
+    ResolveFilterValueInput,
+    SampleExamplesInput,
+    SummarizeRowsInput,
     count_rows_impl,
     get_dataset_schema_impl,
     group_counts_impl,
@@ -85,8 +91,13 @@ def _normalize_resolve_filter_value_input(
     return {
         "query": str(query),
         "columns": normalized_input.get("columns") or ["category", "intent"],
-        "top_k": int(normalized_input.get("top_k", 5)),
+        "top_k": normalized_input.get("top_k", 5),
     }
+
+
+def _validated_tool_input(input_model: Any, data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and canonicalize an LLM-facing tool input model."""
+    return input_model.model_validate(data).model_dump()
 
 
 def _tool_filters(
@@ -107,33 +118,59 @@ def _canonical_tool_input(
     """Return canonical tool input for execution and duplicate checks."""
     normalized_input = _normalize_tool_input(tool_input)
 
+    if tool_name == "get_dataset_schema":
+        return _validated_tool_input(
+            GetDatasetSchemaInput,
+            {
+                "include_sample_values": normalized_input.get(
+                    "include_sample_values",
+                    True,
+                ),
+            },
+        )
+
     if tool_name == "resolve_filter_value":
-        return _normalize_resolve_filter_value_input(normalized_input)
+        return _validated_tool_input(
+            ResolveFilterValueInput,
+            _normalize_resolve_filter_value_input(normalized_input),
+        )
 
     if tool_name == "count_rows":
-        return _tool_filters(normalized_input)
+        return _validated_tool_input(
+            CountRowsInput,
+            _tool_filters(normalized_input),
+        )
 
     if tool_name == "sample_examples":
-        return {
-            **_tool_filters(normalized_input),
-            "n": int(normalized_input.get("n", 3)),
-            "offset": int(normalized_input.get("offset", 0)),
-        }
+        return _validated_tool_input(
+            SampleExamplesInput,
+            {
+                **_tool_filters(normalized_input),
+                "n": normalized_input.get("n", 3),
+                "offset": normalized_input.get("offset", 0),
+            },
+        )
 
     if tool_name == "group_counts":
-        return {
-            "group_by": normalized_input.get("group_by"),
-            **_tool_filters(normalized_input),
-            "top_k": int(normalized_input.get("top_k", 20)),
-        }
+        return _validated_tool_input(
+            GroupCountsInput,
+            {
+                "group_by": normalized_input.get("group_by"),
+                **_tool_filters(normalized_input),
+                "top_k": normalized_input.get("top_k", 20),
+            },
+        )
 
     if tool_name == "summarize_rows":
-        return {
-            **_tool_filters(normalized_input),
-            "focus": normalized_input.get("focus"),
-            "target_field": normalized_input.get("target_field", "both"),
-            "max_examples": int(normalized_input.get("max_examples", 100)),
-        }
+        return _validated_tool_input(
+            SummarizeRowsInput,
+            {
+                **_tool_filters(normalized_input),
+                "focus": normalized_input.get("focus") or "",
+                "target_field": normalized_input.get("target_field", "both"),
+                "max_examples": normalized_input.get("max_examples", 100),
+            },
+        )
 
     if tool_name == "read_user_profile":
         return {}
