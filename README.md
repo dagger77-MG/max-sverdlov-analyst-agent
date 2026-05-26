@@ -23,6 +23,7 @@ It uses a graph-owned planner → tool executor → observation reviewer loop, s
 - FastMCP server exposing dataset/profile tools
 - Visible reasoning traces with route decisions, tool calls, reviewer decisions, inputs, and observations
 - Deterministic handling for high-risk follow-up example pagination such as `Show me 3 more.`
+- Deterministic help/capabilities answer for questions such as `help` or `What can you do?`
 - Tests for loader, tools, router, memory, graph behavior, MCP wrappers, and config behavior
 
 ## Dataset
@@ -700,16 +701,19 @@ START
   ↓
 load_user_profile_node
   ↓
-router_node
-  ↓
  ┌────────────────────────────┬────────────────────────┐
- │ structured/unstructured     │ out_of_scope            │
+ │ capabilities/help          │ all other queries      │
  ↓                            ↓
-data_agent_loop_node           refusal_node
+capabilities_help_node         router_node
   ↓                            ↓
-profile_update_node            profile_update_node
-  ↓                            ↓
-END                          END
+END                 ┌────────────────────────────┬────────────────────────┐
+                    │ structured/unstructured    │ out_of_scope           │
+                    ↓                            ↓
+                    data_agent_loop_node         refusal_node
+                    ↓                            ↓
+                    profile_update_node          profile_update_node
+                    ↓                            ↓
+                    END                          END
 ```
 
 The router classifies each query into:
