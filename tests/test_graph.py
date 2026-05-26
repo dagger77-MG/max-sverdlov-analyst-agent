@@ -332,6 +332,59 @@ def test_planner_tool_set_does_not_expose_filter_rows_or_row_id_workflow() -> No
     assert "summarize_rows" in schemas.VALID_PLANNER_TOOL_NAMES
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        (
+            "resolve_filter_value",
+            {
+                "query": "refund requests",
+                "columns": ["category", "intent"],
+                "top_k": 0,
+            },
+        ),
+        (
+            "sample_examples",
+            {
+                "category": "REFUND",
+                "n": 999,
+                "offset": 0,
+            },
+        ),
+        (
+            "sample_examples",
+            {
+                "category": "REFUND",
+                "n": 3,
+               "offset": -1,
+            },
+        ),
+        (
+            "group_counts",
+            {
+                "group_by": "intent",
+                "category": "ACCOUNT",
+                "top_k": 100000,
+            },
+        ),
+        (
+            "summarize_rows",
+            {
+                "category": "REFUND",
+                "focus": "refund requests",
+                "max_examples": 99999,
+            },
+        ),
+    ],
+)
+def test_tool_executor_rejects_invalid_tool_input_at_boundary(
+    tool_name: str,
+    tool_input: dict,
+) -> None:
+    with pytest.raises(ValueError):
+        tool_executor._canonical_tool_input(tool_name, tool_input)
+
+
 def test_structured_query_resolves_filter_then_counts_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
