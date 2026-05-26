@@ -50,10 +50,34 @@ Choose exactly one next action: call one tool, or produce a final answer only wh
 Rules:
 - Do not answer from general knowledge.
 - Use only the current user query, recent structured results, user profile, and tool observations.
-- If reviewer feedback suggests a specific tool and input, follow it unless it is impossible.
+- Reviewer feedback is advisory, not authoritative. Follow it when it is useful
+  and consistent with the tool trace.
+- If reviewer feedback says a filtered category/intent analysis call lacked
+  validation, call the suggested resolve_filter_value next unless that exact
+  resolver call already exists in the current trace. Do not repeat the same
+  invalid filtered analysis call.
+- If a current-turn analysis observation is valid evidence and answers the
+  exact request, produce a final answer instead of looking for extra tools.
+- Do not follow reviewer feedback that repeats an already executed tool call,
+  contradicts resolver finality rules, or asks to narrow a broad phrase to
+  intent after resolve_filter_value already searched both category and intent
+  and recommended a category with medium/high confidence.
+- In that case, produce a grounded final answer from the existing valid analysis
+  observation instead of calling another tool.
 - Never use previous unrelated results as proof that a new user-provided category
   or intent value is valid. A previous successful REFUND resolution does not
   validate SHIPPING, ACCOUNT, DELIVERY, or any other new value.
+- Do not repeat the tool call if you have enough evidence from previous observations.
+- If existing observations answer the exact request, the structured output must
+  use action="final_answer". Set tool_name="", tool_input={{}}, and final_answer
+  to the grounded answer text.
+- Never set action="call_tool" when your reason says the existing observations
+  are sufficient, no extra tool is needed, or a final answer should be produced.
+- action="call_tool" is only for a useful tool call that is still missing from
+  the current turn trace.
+- If reviewer feedback says an already-executed tool call was suggested as a
+  duplicate, and that existing observation answers the request, return
+  action="final_answer" instead of calling the duplicate tool.
 
 Evidence rules:
 - For all distinct categories or intents, use group_counts, not get_dataset_schema sample values.
@@ -74,6 +98,10 @@ Filter resolution rules:
   resolve_filter_value first. The analysis tool may only be called after
   resolve_filter_value returns confidence medium/high and recommended_filter
   contains the exact column/value to use.
+- Values that look like dataset labels are not self-validating. Snake_case
+  values such as "delete_account", "cancel_subscription", or "track_order",
+  and uppercase values such as "SHIPPING" or "ACCOUNT", must still be resolved
+  before they are used as category or intent filters.
 - If an analysis tool input has category=None and intent=None, it is unfiltered
   and does not require resolve_filter_value.
 - If the user explicitly says "intent", resolve only against columns=["intent"].
@@ -182,6 +210,9 @@ Hard rules:
    input. Never suggest dataset tools for profile/memory questions.
 10. Never re-validate a category or intent after resolve_filter_value already
    recommended that exact value with medium/high confidence in the same trace.
+11. If a current-turn observation is valid evidence and answers the exact user
+   request, return answered instead of recommending another tool.
+12. Do not recommend re-run tool if you have enough evidence from previous observations.
 
 Filter rules:
 1. A filtered count_rows, sample_examples, group_counts, or summarize_rows call
@@ -202,13 +233,29 @@ Filter rules:
    final answer saying no matching category exists. Do not broaden to intent.
 6. If resolve_filter_value recommends a filter, the next tool is normally
    the exact analysis tool needed by the user, using that recommended_filter.
-7. A summarize_rows call with category=None and intent=None but a text_query
+7. Resolver finality rule:
+   If resolve_filter_value was already called with the columns implied by the
+   user's wording and returned confidence medium/high, treat its
+   recommended_filter as the validated semantic scope for this turn.
+   Do not ask for an additional narrower resolve_filter_value call, such as
+   resolving only intent after a category was recommended, unless:
+   - the user explicitly asked for that narrower column, or
+   - the already-executed analysis tool used a filter different from the
+     recommended_filter.
+   For broad phrases like "refund requests", "money back requests",
+   "shipping issues", or "cancellation requests", if resolve_filter_value
+   searched both category and intent and recommended category=<value>, then a
+   matching count_rows(category=<value>), sample_examples(category=<value>),
+   group_counts(category=<value>), or summarize_rows(category=<value>) call is
+   valid evidence. Return answered when that analysis observation satisfies the
+   user's requested operation.   
+8. A summarize_rows call with category=None and intent=None but a text_query
    based on a broad business phrase is not valid evidence for a question about
    that business area when no resolver evidence exists in the same trace.
    Examples of broad business phrases include "cancellation requests",
    "refund requests", "shipping issues", "delivery questions", "account
    problems", and "people wanting their money back".
-8. When rule 7 applies, return needs_more with:
+9. When rule 8 applies, return needs_more with:
    suggested_tool_name="resolve_filter_value"
    suggested_tool_input={
      "query": <the broad business phrase>,
@@ -217,40 +264,35 @@ Filter rules:
    }
    
 Scoped distribution rules:
-0. For unscoped discovery questions such as "What categories exist?" or
-   "What intents exist?", an unfiltered group_counts result is valid answering
-   evidence and does not require resolve_filter_value.
-   If such an observation exists, return answered, not needs_more.
-1. For "distribution of intents in X category", valid evidence requires a
-   group_counts result with group_by="intent" and category=X.
-2. For "distribution of categories in X intent", valid evidence requires a
-   group_counts result with group_by="category" and intent=X.
-3. A group_counts result with missing category/intent/text_query filters is a
-   global distribution. It does not answer a question about a distribution
-   inside a category or intent.
-4. A later resolve_filter_value call does not retroactively validate or repair
-   an earlier unfiltered group_counts result. Require a new group_counts call
-   with the needed semantic filter.
+1. For unscoped discovery questions such as "What categories exist?" or
+   "What intents exist?", an unfiltered group_counts result is valid evidence.
+2. For scoped distribution questions, answer only from a current-turn
+   group_counts observation with the requested scope already applied:
+   - "distribution of intents in X category" requires group_by="intent" and category=X.
+   - "distribution of categories in X intent" requires group_by="category" and intent=X.
+3. If the trace already contains both:
+   - resolve_filter_value validating the required scope value with medium/high
+     confidence, and
+   - group_counts with the requested group_by and that resolved filter,
+   return answered. Do not suggest the same group_counts call again.
+4. If the required scoped group_counts observation is missing, suggest only the
+   missing scoped group_counts call. Do not suggest extra validation after the
+   category or intent was already resolved with medium/high confidence.
 5. For full distributions, top_k=5 is usually incomplete unless the user asked
    for top 5. Prefer top_k=20 or higher.
 
 Count rules:
 1. Count questions require count_rows unless another already-observed tool
    directly reports the exact matching row count for the same semantic filters.
-2. count_rows without filters counts the whole dataset.
-3. count_rows with category/intent/text_query counts only matching rows.
+2. Return answered when count_rows matches the validated semantic filters.
 
 Example rules:
 1. Example/sample/case/row requests require sample_examples unless the resolved
    filter proves zero matches or no valid requested value exists.
 2. sample_examples must include actual sampled row content, such as
    customer_instruction and support_response.
-3. If sample_examples returns no examples and match_count=0 after a valid prior
-   resolver step, produce a grounded no-matching-rows answer.
-4. If sample_examples returns no examples and match_count=0 but it used a
-   category or intent filter that was not validated earlier in the same trace,
-   return needs_more with resolve_filter_value for that exact filter value and
-   column. Do not accept the zero-example result as final evidence.
+3. Return answered when sample_examples matches the validated semantic filters,
+   including grounded no-match answers after a valid resolver step.
 
 Summary rules:
 1. Summary/theme/tone/pain-point questions require summarize_rows.
@@ -260,11 +302,8 @@ Summary rules:
    target_field="instruction" or "both".
 4. For summary questions about a broad business phrase, valid evidence normally
    requires resolver evidence first, followed by summarize_rows with the
-   recommended semantic filter. A text_query-only summarize_rows call is weak
-   evidence and should not be accepted when it selected an unrelated category
-   or intent.
+   recommended semantic filter.
 5. summarize_rows.focus should preserve the user's analytical focus. If the user
    asks how agents respond to cancellation requests, the focus should be about
    response patterns to cancellation requests, not just "response".
-6. If one more tool is needed, provide suggested_tool_name and suggested_tool_input.
 """

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
 
 from langchain_core.messages import HumanMessage
 
@@ -136,3 +137,26 @@ def test_profile_update_node_saves_durable_observation(monkeypatch) -> None:
             "- User prefers file-by-file implementation review.\n"
         ),
     }
+
+
+def test_profile_update_node_logs_and_skips_on_decision_failure(
+    monkeypatch,
+    caplog,
+) -> None:
+    class FailingProfileLLM:
+        def invoke(self, messages):
+            raise RuntimeError("Simulated profile decision failure.")
+
+    monkeypatch.setattr(
+        profile,
+        "get_structured_profile_llm",
+        lambda: FailingProfileLLM(),
+    )
+
+    caplog.set_level(logging.ERROR, logger=profile.__name__)
+
+    result = profile.profile_update_node(_state())
+
+    assert result == {}
+    assert "Profile update decision failed; skipping profile update." in caplog.text
+    assert "Simulated profile decision failure." in caplog.text

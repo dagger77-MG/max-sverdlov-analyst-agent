@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+import logging
 
 from app.agent.context import (
     _build_planner_messages,
@@ -31,6 +32,8 @@ from app.agent.tool_executor import (
 )
 from app.config import settings
 from app.state import AgentState
+
+logger = logging.getLogger(__name__)
 
 
 def _review_observations(
@@ -355,115 +358,30 @@ def data_agent_loop_node(state: AgentState) -> dict[str, Any]:
                     )
                     continue
 
+                reviewer_feedback = (
+                    f"{review.reason}\n"
+                    f"Suggested next tool: {review.suggested_tool_name}\n"
+                    "Suggested next input: "
+                    f"{json.dumps(_compact_tool_input_for_prompt(review.suggested_tool_input), ensure_ascii=False, default=str)}\n"
+                    "The reviewer only suggests the next step. The planner must now "
+                    "decide and call exactly one tool; do not treat this reviewer "
+                    "decision as executed evidence."
+                )
                 _debug_trace(
                     f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"reviewer requested next tool={review.suggested_tool_name}"
-                    "\nexecuting directly"
+                    f"reviewer suggested next tool={review.suggested_tool_name}; "
+                    "returning suggestion to planner"
                 )
-
-                _execute_selected_tool(
-                    state=state,
-                    tool_name=review.suggested_tool_name,
-                    tool_input=review.suggested_tool_input,
-                )
-
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"executed reviewer tool={review.suggested_tool_name}; "
-                    f"trace_steps={len(state['tool_trace'])}"
-                )
-
-                failed_resolver_answer = (
-                    _return_failed_explicit_resolver_answer_if_ready(state)
-                )
-                if failed_resolver_answer is not None:
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "returning deterministic reviewer failed resolver answer"
-                    )
-                    return failed_resolver_answer
-
-                deterministic_sample_answer = (
-                    _return_deterministic_sample_examples_answer_if_ready(
-                        state=state,
-                        tool_name=review.suggested_tool_name,
-                    )
-                )
-                if deterministic_sample_answer is not None:
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        "returning deterministic reviewer sample_examples answer"
-                    )
-                    return deterministic_sample_answer
-
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    "reviewer start after direct tool execution"
-                )
-                try:
-                    follow_up_review = _review_observations(state)
-                except Exception as exc:
-                    _append_reviewer_error_trace(
-                        state=state,
-                        exc=exc,
-                        context="after the reviewer-suggested tool",
-                    )
-                    must_call_tool_before_final_answer = False
-                    reviewer_feedback = _reviewer_exception_feedback(
-                        exc,
-                        "after the reviewer-suggested tool",
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        f"follow-up reviewer exception={type(exc).__name__}: {exc}; "
-                        "continuing with planner feedback"
-                    )
-                    continue
-
-                _debug_trace(
-                    f"iteration {iteration_number}/{state['max_iterations']}: "
-                    f"follow-up reviewer status={follow_up_review.status}; "
-                    f"suggested_tool={follow_up_review.suggested_tool_name or '-'}; "
-                    f"reason={follow_up_review.reason}"
-                )
-
-                _append_reviewer_trace(state, follow_up_review)
-
-                if follow_up_review.status in {"answered", "cannot_answer"}:
-                    if follow_up_review.status == "answered":
-                        contract_error = _answer_contract_error(state)
-                        if contract_error:
-                            must_call_tool_before_final_answer = True
-                            reviewer_feedback = _build_final_answer_block_feedback(
-                                contract_error
-                            )
-                            _debug_trace(
-                                f"iteration {iteration_number}/{state['max_iterations']}: "
-                                "blocked follow-up reviewer answered by evidence contract"
-                            )
-                            continue
-
-                    final_answer = (
-                        follow_up_review.final_answer.strip()
-                        or follow_up_review.reason.strip()
-                    )
-                    _debug_trace(
-                        f"iteration {iteration_number}/{state['max_iterations']}: "
-                        f"returning follow-up reviewer status={follow_up_review.status}"
-                    )
-                    return _final_answer_update(state, final_answer)
-
-                if follow_up_review.status == "needs_more":
-                    must_call_tool_before_final_answer = True
-                    reviewer_feedback = (
-                        f"{follow_up_review.reason}\n"
-                        f"Suggested next tool: {follow_up_review.suggested_tool_name}\n"
-                        f"Suggested next input: "
-                        f"{json.dumps(_compact_tool_input_for_prompt(follow_up_review.suggested_tool_input), ensure_ascii=False, default=str)}"
-                    )
-                    continue
+                continue
 
         except Exception as exc:
+            logger.exception(
+                "Agent loop failed; returning fallback answer. "
+                "session_id=%s user_id=%s iteration=%s",
+                state["session_id"],
+                state["user_id"],
+                iteration_number,
+            )
             fallback = _fallback_answer()
             _debug_trace(
                 f"iteration {iteration_number}/{state['max_iterations']}: "

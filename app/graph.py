@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from functools import lru_cache
 from typing import Any
@@ -14,6 +15,8 @@ from app.config import settings
 from app.prompts import OUT_OF_SCOPE_REFUSAL
 from app.router import RouteDecision, route_query_with_reason
 from app.state import AgentState
+
+logger = logging.getLogger(__name__)
 
 
 def create_initial_state(
@@ -162,6 +165,13 @@ def _create_invocation_state(
     try:
         checkpoint_state = graph.get_state(config)
     except Exception:
+        logger.warning(
+            "Could not read checkpoint state; starting a fresh invocation state. "
+            "session_id=%s user_id=%s",
+            session_id,
+            user_id,
+            exc_info=True,
+        )
         return create_initial_state(
             query=query,
             session_id=session_id,

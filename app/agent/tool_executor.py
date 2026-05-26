@@ -5,9 +5,19 @@ import re
 from typing import Any
 
 from app.agent.context import latest_user_message
+from app.agent.grouping_intent import (
+    analyze_grouping_request,
+    requires_scope_filter,
+)
 from app.memory import read_user_profile_impl
 from app.state import AgentState, AnalysisResult, ToolTraceItem
 from app.tools import (
+    CountRowsInput,
+    GetDatasetSchemaInput,
+    GroupCountsInput,
+    ResolveFilterValueInput,
+    SampleExamplesInput,
+    SummarizeRowsInput,
     count_rows_impl,
     get_dataset_schema_impl,
     group_counts_impl,
@@ -85,8 +95,13 @@ def _normalize_resolve_filter_value_input(
     return {
         "query": str(query),
         "columns": normalized_input.get("columns") or ["category", "intent"],
-        "top_k": int(normalized_input.get("top_k", 5)),
+        "top_k": normalized_input.get("top_k", 5),
     }
+
+
+def _validated_tool_input(input_model: Any, data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and canonicalize an LLM-facing tool input model."""
+    return input_model.model_validate(data).model_dump()
 
 
 def _tool_filters(
@@ -107,33 +122,59 @@ def _canonical_tool_input(
     """Return canonical tool input for execution and duplicate checks."""
     normalized_input = _normalize_tool_input(tool_input)
 
+    if tool_name == "get_dataset_schema":
+        return _validated_tool_input(
+            GetDatasetSchemaInput,
+            {
+                "include_sample_values": normalized_input.get(
+                    "include_sample_values",
+                    True,
+                ),
+            },
+        )
+
     if tool_name == "resolve_filter_value":
-        return _normalize_resolve_filter_value_input(normalized_input)
+        return _validated_tool_input(
+            ResolveFilterValueInput,
+            _normalize_resolve_filter_value_input(normalized_input),
+        )
 
     if tool_name == "count_rows":
-        return _tool_filters(normalized_input)
+        return _validated_tool_input(
+            CountRowsInput,
+            _tool_filters(normalized_input),
+        )
 
     if tool_name == "sample_examples":
-        return {
-            **_tool_filters(normalized_input),
-            "n": int(normalized_input.get("n", 3)),
-            "offset": int(normalized_input.get("offset", 0)),
-        }
+        return _validated_tool_input(
+            SampleExamplesInput,
+            {
+                **_tool_filters(normalized_input),
+                "n": normalized_input.get("n", 3),
+                "offset": normalized_input.get("offset", 0),
+            },
+        )
 
     if tool_name == "group_counts":
-        return {
-            "group_by": normalized_input.get("group_by"),
-            **_tool_filters(normalized_input),
-            "top_k": int(normalized_input.get("top_k", 20)),
-        }
+        return _validated_tool_input(
+            GroupCountsInput,
+            {
+                "group_by": normalized_input.get("group_by"),
+                **_tool_filters(normalized_input),
+                "top_k": normalized_input.get("top_k", 20),
+            },
+        )
 
     if tool_name == "summarize_rows":
-        return {
-            **_tool_filters(normalized_input),
-            "focus": normalized_input.get("focus"),
-            "target_field": normalized_input.get("target_field", "both"),
-            "max_examples": int(normalized_input.get("max_examples", 100)),
-        }
+        return _validated_tool_input(
+            SummarizeRowsInput,
+            {
+                **_tool_filters(normalized_input),
+                "focus": normalized_input.get("focus") or "",
+                "target_field": normalized_input.get("target_field", "both"),
+                "max_examples": normalized_input.get("max_examples", 100),
+            },
+        )
 
     if tool_name == "read_user_profile":
         return {}
@@ -168,23 +209,7 @@ def _format_model_dict(data: dict[str, Any]) -> str:
 
 def _is_distribution_query(query: str) -> bool:
     """Return True when the user asks for a distribution or breakdown."""
-    normalized = query.strip().lower()
-
-    if not normalized:
-        return False
-
-    distribution_markers = (
-        "distribution",
-        "breakdown",
-        "group count",
-        "group counts",
-        "count by",
-        "counts by",
-        "by category",
-        "by intent",
-    )
-
-    return any(marker in normalized for marker in distribution_markers)
+    return analyze_grouping_request(query).is_grouping_request
 
 
 def _has_explicit_top_k_request(query: str) -> bool:
@@ -203,25 +228,14 @@ def _has_explicit_top_k_request(query: str) -> bool:
 
 def _requires_grouped_filtered_scope(query: str, group_by: str) -> bool:
     """Detect grouped questions that require a prior filtered subset."""
-    normalized = query.strip().lower()
-
-    if not _is_distribution_query(normalized):
-        return False
-
-    if group_by == "intent" and "category" in normalized:
-        return True
-
-    if group_by == "category" and "intent" in normalized:
-        return True
-
-    return False
+    return requires_scope_filter(query=query, group_by=group_by)
 
 
 def _format_sample_examples_observation(
     filters: dict[str, str | None],
     n: int,
     offset: int,
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, dict[str, str | None]]:
     """Call sample_examples and format the observation text."""
     result = sample_examples_impl(
         category=filters.get("category"),
@@ -249,7 +263,7 @@ def _format_sample_examples_observation(
         + ("\n\n" + "\n\n---\n\n".join(example_lines) if example_lines else "")
     )
 
-    return observation, result.next_offset, result.match_count
+    return observation, result.next_offset, result.match_count, result.applied_filters
 
 
 def _execute_selected_tool(
@@ -323,7 +337,12 @@ def _execute_selected_tool(
         filters = _tool_filters(normalized_input)
         n = int(normalized_input.get("n", 3))
         offset = int(normalized_input.get("offset", 0))
-        observation, next_offset, match_count = _format_sample_examples_observation(
+        (
+            observation,
+            next_offset,
+            match_count,
+            applied_filters,
+        ) = _format_sample_examples_observation(
             filters=filters,
             n=n,
             offset=offset,
@@ -340,7 +359,7 @@ def _execute_selected_tool(
                 label="sample_examples",
                 value=next_offset,
                 query_type="sample",
-                filters=filters,
+                filters=applied_filters,
                 match_count=match_count,
             ),
         )
@@ -354,10 +373,15 @@ def _execute_selected_tool(
             )
 
         user_query = latest_user_message(state["messages"])
+        grouping_request = analyze_grouping_request(user_query)
+        required_filter_column = (
+            grouping_request.required_filter_column
+            if grouping_request.requested_group_by == group_by
+            else None
+        )
         if (
-            _requires_grouped_filtered_scope(user_query, group_by)
-            and group_by == "intent"
-            and not normalized_input.get("category")
+                required_filter_column == "category"
+                and not normalized_input.get(required_filter_column)
         ):
             _append_tool_error(
                 state=state,
@@ -375,9 +399,8 @@ def _execute_selected_tool(
             return
 
         if (
-            _requires_grouped_filtered_scope(user_query, group_by)
-            and group_by == "category"
-            and not normalized_input.get("intent")
+            required_filter_column == "intent"
+            and not normalized_input.get(required_filter_column)
         ):
             _append_tool_error(
                 state=state,

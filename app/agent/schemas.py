@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 PlannerToolName = Literal[
@@ -101,3 +101,14 @@ class ObservationReviewDecision(BaseModel):
         default_factory=dict,
         description="Minimal next tool input when status is needs_more; otherwise empty.",
     )
+
+    @model_validator(mode="after")
+    def normalize_status_fields(self) -> "ObservationReviewDecision":
+        """Keep reviewer traces semantically consistent with status."""
+        if self.status != "needs_more":
+            self.suggested_tool_name = ""
+            self.suggested_tool_input = {}
+        else:
+            self.final_answer = ""
+
+        return self

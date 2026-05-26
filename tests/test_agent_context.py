@@ -199,11 +199,24 @@ def test_build_reviewer_messages_includes_trace_without_profile() -> None:
         {
             "tool_name": "count_rows",
             "tool_input": {
-                "category": "REFUND",
+                "category": "SHIPPING",
                 "intent": None,
                 "text_query": None,
             },
             "observation": '{"count": 842}',
+        }
+    ]
+    state["last_structured_results"] = [
+        {
+            "label": "previous_refund_count",
+            "value": 842,
+            "query_type": "count",
+            "filters": {
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+            },
+            "match_count": 842,
         }
     ]
 
@@ -217,4 +230,9 @@ def test_build_reviewer_messages_includes_trace_without_profile() -> None:
     reviewer_context = messages[1].content
     assert "Current route: structured" in reviewer_context
     assert "tool=count_rows" in reviewer_context
+    assert "Evidence boundary: judge only the current turn tool trace." in reviewer_context
+    assert "Recent structured results:" not in reviewer_context
+    assert "previous_refund_count" not in reviewer_context
+    assert '"category": "SHIPPING"' in reviewer_context
+    assert '"category": "REFUND"' not in reviewer_context
     assert "User profile:" not in reviewer_context

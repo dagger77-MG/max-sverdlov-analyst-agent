@@ -86,7 +86,7 @@ def test_failed_explicit_intent_resolver_returns_cannot_answer_update() -> None:
     assert result is not None
     assert result["final_answer"] == (
         'No matching intent value exists for "SHIPPING" in the dataset, '
-        "so I can't show examples for that intent."
+        "so I can't answer that request using that intent."
     )
     assert state["final_answer"] == result["final_answer"]
 
@@ -122,7 +122,7 @@ def test_failed_explicit_category_resolver_returns_cannot_answer_update() -> Non
     assert result is not None
     assert result["final_answer"] == (
         'No matching category value exists for "UNKNOWN" in the dataset, '
-        "so I can't show examples for that category."
+        "so I can't answer that request using that category."
     )
 
 
@@ -199,6 +199,18 @@ def test_deterministic_sample_examples_answer_requires_actual_examples() -> None
     assert result is not None
     assert result["final_answer"].startswith("Returned 2 examples from 6 matching rows.")
     assert state["final_answer"] == result["final_answer"]
+    assert state["tool_trace"][-1] == {
+        "event_type": "reviewer",
+        "reviewer_status": "answered",
+        "reviewer_reason": (
+            "Reviewer LLM skipped: sample_examples returned requested row "
+            "content, so deterministic fast path produced the final answer."
+        ),
+        "reviewer_final_answer": "",
+        "suggested_tool_name": "",
+        "suggested_tool_input": {},
+    }
+    assert result["tool_trace"][-1] == state["tool_trace"][-1]
 
 
 def test_deterministic_sample_examples_answer_ignores_zero_example_observation() -> None:
@@ -224,6 +236,84 @@ def test_deterministic_sample_examples_answer_ignores_zero_example_observation()
 
     assert result is None
     assert state["final_answer"] is None
+
+
+def test_answer_contract_blocks_global_category_distribution_without_group_counts() -> None:
+    state = _state("Break down the dataset by category.")
+
+    error = evidence_contracts._answer_contract_error(state)
+
+    assert error == (
+        "The user asked for a full-dataset category distribution. "
+        "Valid evidence requires an unfiltered group_counts call with "
+        "group_by='category'."
+    )
+
+
+def test_answer_contract_allows_global_category_distribution_with_unfiltered_group_counts() -> None:
+    state = _state("Break down the dataset by category.")
+    state["tool_trace"] = [
+        {
+            "tool_name": "group_counts",
+            "tool_input": {
+                "group_by": "category",
+                "category": None,
+                "intent": None,
+                "text_query": None,
+                "top_k": 20,
+            },
+            "observation": json.dumps(
+                {
+                    "group_by": "category",
+                    "counts": [
+                        {
+                            "label": "ACCOUNT",
+                            "count": 5986,
+                        }
+                    ],
+                    "match_count": 26872,
+                }
+            ),
+        }
+    ]
+
+    assert evidence_contracts._answer_contract_error(state) is None
+
+
+def test_answer_contract_blocks_global_category_distribution_with_filtered_group_counts() -> None:
+    state = _state("Break down the dataset by category.")
+    state["tool_trace"] = [
+        {
+            "tool_name": "group_counts",
+            "tool_input": {
+                "group_by": "category",
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+                "top_k": 20,
+            },
+            "observation": json.dumps(
+                {
+                    "group_by": "category",
+                    "counts": [
+                        {
+                            "label": "REFUND",
+                            "count": 2992,
+                        }
+                    ],
+                    "match_count": 2992,
+                }
+            ),
+        }
+    ]
+
+    error = evidence_contracts._answer_contract_error(state)
+
+    assert error == (
+        "The user asked for a full-dataset category distribution. "
+        "Valid evidence requires an unfiltered group_counts call with "
+        "group_by='category'."
+    )
 
 
 def test_answer_contract_blocks_scoped_intent_distribution_without_resolver() -> None:
@@ -296,6 +386,108 @@ def test_answer_contract_allows_scoped_intent_distribution_with_filtered_group_c
     ]
 
     assert evidence_contracts._answer_contract_error(state) is None
+
+
+def test_answer_contract_blocks_scoped_category_distribution_without_resolver() -> None:
+    state = _state("Break down track_refund by category.")
+
+    error = evidence_contracts._answer_contract_error(state)
+
+    assert error is not None
+    assert "category distribution inside an intent" in error
+    assert "resolving the intent" in error
+    assert "group_counts" in error
+
+
+def test_answer_contract_blocks_scoped_category_distribution_after_resolver_only() -> None:
+    state = _state("Break down track_refund by category.")
+    state["tool_trace"] = [
+        {
+            "tool_name": "resolve_filter_value",
+            "tool_input": {
+                "query": "track_refund",
+                "columns": ["intent"],
+                "top_k": 5,
+            },
+            "observation": json.dumps(
+                {
+                    "query": "track_refund",
+                    "recommended_filter": {
+                        "category": None,
+                        "intent": "track_refund",
+                    },
+                    "confidence": "high",
+                }
+            ),
+        }
+    ]
+
+    error = evidence_contracts._answer_contract_error(state)
+
+    assert error == (
+        "The intent has been resolved, but group_counts has not been "
+        "called with group_by='category' and that intent filter yet."
+    )
+
+
+def test_answer_contract_allows_scoped_category_distribution_with_filtered_group_counts() -> None:
+    state = _state("Break down track_refund by category.")
+    state["tool_trace"] = [
+        {
+            "tool_name": "group_counts",
+            "tool_input": {
+                "group_by": "category",
+                "category": None,
+                "intent": "track_refund",
+                "text_query": None,
+                "top_k": 20,
+            },
+            "observation": json.dumps(
+                {
+                    "group_by": "category",
+                    "counts": [
+                        {
+                            "label": "REFUND",
+                            "count": 11,
+                        }
+                    ],
+                    "match_count": 11,
+                }
+            ),
+        }
+    ]
+
+    assert evidence_contracts._answer_contract_error(state) is None
+
+
+def test_answer_contract_rejects_error_group_counts_observation() -> None:
+    state = _state("Break down the dataset by category.")
+    state["tool_trace"] = [
+        {
+            "tool_name": "group_counts",
+            "tool_input": {
+                "group_by": "category",
+                "category": None,
+                "intent": None,
+                "text_query": None,
+                "top_k": 20,
+            },
+            "observation": json.dumps(
+                {
+                    "error": "group_counts failed.",
+                    "required_next_step": "Retry with valid input.",
+                }
+            ),
+        }
+    ]
+
+    error = evidence_contracts._answer_contract_error(state)
+
+    assert error == (
+        "The user asked for a full-dataset category distribution. "
+        "Valid evidence requires an unfiltered group_counts call with "
+        "group_by='category'."
+    )
 
 
 def test_semantic_summary_contract_blocks_text_query_summary_after_resolution() -> None:

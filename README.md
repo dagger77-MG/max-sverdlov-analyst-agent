@@ -2,21 +2,28 @@
 
 A LangGraph-based data analyst agent for the Bitext Customer Service dataset.
 
-The agent can answer structured analytical questions and qualitative dataset questions, while staying scoped to the dataset and the saved user profile.
+The agent answers structured analytical questions and qualitative dataset questions while staying scoped to:
+
+- the Bitext Customer Service dataset
+- the current conversation context
+- the saved user profile
+
+It uses a graph-owned planner → tool executor → observation reviewer loop, semantic dataset filters, visible traces, and persistent session/profile state.
 
 ## Features
 
 - LangGraph workflow with a graph-owned planner → tool executor → observation reviewer loop
 - LLM-based query router
 - SQLite-backed LangGraph checkpoint persistence for conversation state
-- Structured dataset tools
-- LLM-backed qualitative row summarization tool with deterministic fallback
+- Semantic dataset tools with Pydantic input validation
+- LLM-backed qualitative row summarization with deterministic fallback
 - Persistent user profile memory
 - CLI chat interface
 - Streamlit chat interface
-- FastMCP server exposing dataset tools
-- Visible reasoning traces with route decisions, tool calls, inputs, and observations
-- Unit tests for loader, tools, router, memory, graph behavior, and config behavior
+- FastMCP server exposing dataset/profile tools
+- Visible reasoning traces with route decisions, tool calls, reviewer decisions, inputs, and observations
+- Deterministic handling for high-risk follow-up example pagination such as `Show me 3 more.`
+- Tests for loader, tools, router, memory, graph behavior, MCP wrappers, and config behavior
 
 ## Dataset
 
@@ -26,7 +33,7 @@ Dataset source:
 bitext/Bitext-customer-support-llm-chatbot-training-dataset
 ```
 
-The app loads the dataset through Hugging Face `datasets`, normalizes the DataFrame columns, adds a stable `row_id`, and caches the normalized CSV locally under:
+The app loads the dataset through Hugging Face `datasets`, normalizes DataFrame columns, adds a stable integer `row_id`, and caches the normalized CSV locally under:
 
 ```text
 data/bitext_customer_service.csv
@@ -41,7 +48,7 @@ category
 intent
 ```
 
-The code inspects and normalizes the dataset instead of assuming extra columns.
+The code normalizes known column aliases and works from these core analysis columns.
 
 ## Project Structure
 
@@ -60,20 +67,29 @@ bitext_agent/
 │   ├── state.py
 │   ├── router.py
 │   ├── tools.py
-│   ├── langchain_tools.py
 │   ├── data_loader.py
 │   ├── memory.py
 │   ├── prompts.py
 │   ├── config.py
-│   └── logging_utils.py
+│   ├── logging_utils.py
+│   └── agent/
+│       ├── __init__.py
+│       ├── context.py
+│       ├── evidence_contracts.py
+│       ├── followups.py
+│       ├── llm_factory.py
+│       ├── loop.py
+│       ├── profile.py
+│       ├── schemas.py
+│       └── tool_executor.py
 ├── tests/
 │   ├── test_config.py
 │   ├── test_data_loader.py
 │   ├── test_tools.py
 │   ├── test_router.py
 │   ├── test_memory.py
-│   ├── test_langchain_tools.py
-│   └── test_graph.py
+│   ├── test_graph.py
+│   └── test_mcp_server.py
 ├── .checkpoints/
 │   └── checkpoint.sqlite
 └── .user_profiles/
@@ -105,34 +121,38 @@ Or with pip:
 pip install -e ".[dev]"
 ```
 
-The model names and Nebius base URL are configured in:
+The model names, Nebius base URL, runtime folders, and iteration limits are configured in:
 
 ```text
 app/config.py
 ```
 
-Current model configuration:
+Current model configuration in the codebase:
 
 ```text
-router_model = Qwen/Qwen3-30B-A3B-Instruct-2507
-agent_model = Qwen/Qwen3-235B-A22B-Instruct-2507
+router_model = nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
+agent_model = nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
 nebius_base_url = https://api.tokenfactory.nebius.com/v1/
 ```
 
-### Nebius Model Role Split
+## Nebius Model Role Split
 
 All LLM calls use Nebius Token Factory through the OpenAI-compatible API. No non-Nebius model provider is used for routing, agent reasoning, profile-update decisions, or row summarization.
 
-- Router model: `Qwen/Qwen3-30B-A3B-Instruct-2507`
+- Router model:
   - Used for structured route classification into `structured`, `unstructured`, or `out_of_scope`.
-  - Chosen because routing is a short, low-temperature classification task that benefits from a smaller/faster model.
-- Main data-analysis agent model: `Qwen/Qwen3-235B-A22B-Instruct-2507`
-  - Used by the graph-owned planner and observation reviewer nodes for tool selection, answer-readiness checks, and grounded final answer generation.
-  - Chosen because the main agent needs stronger instruction following, reliable tool-use planning, and careful observation review.
-- Summarizer model: `Qwen/Qwen3-235B-A22B-Instruct-2507`
-  - Used by `summarize_rows` when LLM summarization is available. The same larger model is used because qualitative summaries must stay grounded in selected dataset rows and follow the dataset-only scope rule.
-
-Configuration is centralized in `app/config.py`. The app loads `.env` before creating the global `settings` object, so `NEBIUS_API_KEY` is available consistently to the CLI, Streamlit app, router, graph agent, and summarizer.
+  - Uses a small direct Responses API client and requests JSON-object output.
+  - Chosen because routing is a short, low-temperature classification task where a smaller model is faster and cheaper.
+- Main data-analysis agent model:
+  - Used by the planner and observation reviewer for tool selection, answer-readiness checks, and grounded final answers.
+  - Chosen because the main loop needs stronger instruction following, reliable tool planning, and careful observation review.
+- Profile-update model:
+  - Used to decide whether a user message contains a durable fact/preference worth saving.
+  - Uses the same larger agent model because profile updates require conservative instruction following.
+- Summarizer model:
+  - Used by `summarize_rows` when LLM summarization is available.
+  - Uses the same larger agent model because summaries must stay grounded in selected dataset rows.
+  - Falls back to deterministic summary if the summarizer is unavailable.
 
 ## Running the CLI Agent
 
@@ -155,14 +175,32 @@ You: How many refund requests did we get?
 
 [router] structured
 [router_reason] The user asks for an exact dataset count.
-[tool] filter_rows
+
+[tool] resolve_filter_value
 [input]
 {
-  "category": "REFUND"
+  "query": "refund requests",
+  "columns": [
+    "category",
+    "intent"
+  ],
+  "top_k": 5
 }
-[observation] Found 842 matching rows. Returned 842 row IDs [1, 4, 9, 12, 20...]
+[observation] {"query":"refund requests","candidates":[...],"recommended_filter":{"category":"REFUND","intent":null},"confidence":"high"}
 
-Agent: There are 842 refund-request rows in the dataset.
+[tool] count_rows
+[input]
+{
+  "category": "REFUND",
+  "intent": null,
+  "text_query": null
+}
+[observation] {"count":2992,"applied_filters":{"category":"REFUND","intent":null,"text_query":null}}
+
+[reviewer] answered
+[reason] The observations are sufficient.
+
+Agent: There are 2,992 refund-request rows in the dataset.
 ```
 
 ## Running the Streamlit App
@@ -178,13 +216,16 @@ The sidebar includes:
 - Session ID
 - User ID
 - Max iterations
-- Clear visible chat button
+- Clear visible chat only
+- Start fresh session
 
-The main chat area shows:
+The app shows:
 
-- User messages
-- Agent responses
-- Reasoning trace expanders with route and tool steps
+- chat messages
+- the latest reasoning trace in a separate side panel
+- router decision
+- tool calls and observations
+- reviewer decisions
 
 The Streamlit app uses the same `invoke_agent()` function as the CLI.
 
@@ -196,46 +237,363 @@ Run:
 python -m app.mcp_server
 ```
 
-The MCP server exposes these dataset tools:
+The MCP server exposes these tools:
 
 ```text
+read_user_profile
 get_dataset_schema
-filter_rows
+resolve_filter_value
 count_rows
 sample_examples
 group_counts
 summarize_rows
 ```
 
-## Connecting an MCP Client
+The MCP server does **not** expose:
 
-Example client:
+```text
+filter_rows
+update_user_profile
+```
+
+The dataset tools use semantic filters directly:
+
+```text
+category
+intent
+text_query
+```
+
+Row-id list workflows are intentionally not exposed.
+
+## MCP Tool Reply Format
+
+Each MCP tool returns a plain dictionary created from the corresponding Pydantic output model with:
 
 ```python
-from __future__ import annotations
+result.model_dump()
+```
 
-import asyncio
+### read_user_profile
 
-from fastmcp import Client
+```json
+{
+  "user_id": "max",
+  "profile": "# User Profile\n\n- User prefers file-by-file implementation review.\n"
+}
+```
+
+### get_dataset_schema
+
+```json
+{
+  "columns": ["row_id", "instruction", "response", "category", "intent"],
+  "row_count": 26872,
+  "sample_values": {
+    "category": ["ORDER", "SHIPPING", "ACCOUNT"],
+    "intent": ["track_order", "recover_password"]
+  }
+}
+```
+
+If `include_sample_values=false`, then `sample_values` is `null`.
+
+### resolve_filter_value
+
+```json
+{
+  "query": "refund requests",
+  "candidates": [
+    {
+      "column": "category",
+      "value": "REFUND",
+      "count": 2992,
+      "score": 1.0,
+      "reason": "Category alias resolves exactly to this dataset value."
+    }
+  ],
+  "recommended_filter": {
+    "category": "REFUND",
+    "intent": null
+  },
+  "confidence": "high"
+}
+```
+
+`confidence` is one of:
+
+```text
+none
+low
+medium
+high
+```
+
+### count_rows
+
+```json
+{
+  "count": 2992,
+  "applied_filters": {
+    "category": "REFUND",
+    "intent": null,
+    "text_query": null
+  }
+}
+```
+
+### sample_examples
+
+```json
+{
+  "examples": [
+    {
+      "row_id": 20,
+      "instruction": "Where is my package?",
+      "response": "You can track it from your account.",
+      "category": "SHIPPING",
+      "intent": "track_order"
+    }
+  ],
+  "next_offset": 5,
+  "match_count": 6,
+  "applied_filters": {
+    "category": "SHIPPING",
+    "intent": null,
+    "text_query": null
+  }
+}
+```
+
+### group_counts
+
+```json
+{
+  "group_by": "intent",
+  "counts": [
+    {
+      "label": "recover_password",
+      "count": 997
+    },
+    {
+      "label": "delete_account",
+      "count": 995
+    }
+  ],
+  "match_count": 5986,
+  "applied_filters": {
+    "category": "ACCOUNT",
+    "intent": null,
+    "text_query": null
+  }
+}
+```
+
+### summarize_rows
+
+```json
+{
+  "summary": "Agents explain cancellation policy and guide customers through next steps.",
+  "row_count_used": 100,
+  "match_count": 950,
+  "focus": "How agents respond to cancellation requests",
+  "target_field": "response",
+  "applied_filters": {
+    "category": "CANCEL",
+    "intent": null,
+    "text_query": null
+  }
+}
+```
+
+### MCP Input Validation
+
+The MCP wrappers validate inputs through the same Pydantic input models used by the local tool executor before calling implementation functions.
+
+Invalid calls fail before the implementation runs.
+
+Examples of invalid values:
+
+```text
+resolve_filter_value(top_k=0)
+sample_examples(n=999)
+sample_examples(offset=-1)
+group_counts(top_k=100000)
+summarize_rows(max_examples=99999)
+```
+
+## Connecting an MCP Client
+
+The default MCP server entrypoint runs FastMCP with stdio transport:
+
+```bash
+python -m app.mcp_server
+```
+
+For an external MCP client that supports stdio servers, configure the server command as:
+
+```json
+{
+  "mcpServers": {
+    "bitext-data-tools": {
+      "command": "python",
+      "args": ["-m", "app.mcp_server"]
+    }
+  }
+}
+```
+
+A minimal direct Python smoke test can also call the same MCP wrapper functions used by the server:
+
+```python
+from app import mcp_server
 
 
-async def main() -> None:
-    async with Client("http://localhost:8000/mcp") as client:
-        result = await client.call_tool(
-            "group_counts",
-            {
-                "group_by": "category",
-                "top_k": 10,
-            },
-        )
-        print(result)
+def main() -> None:
+    result = mcp_server.group_counts(
+        group_by="category",
+        top_k=10,
+    )
+    print(result)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 ```
 
-The exact transport URL may depend on the FastMCP runtime configuration. If needed, check the server startup logs.
+Expected shape of the returned value:
+
+```python
+{
+    "group_by": "category",
+    "counts": [
+        {
+            "label": "REFUND",
+            "count": 2992,
+        }
+    ],
+    "match_count": 26872,
+    "applied_filters": {
+        "category": None,
+        "intent": None,
+        "text_query": None,
+    },
+}
+```
+
+If you run FastMCP with an HTTP/SSE transport instead, use the transport URL printed in the server startup logs. The exact URL depends on the FastMCP runtime configuration.
+
+## Tool Reference
+
+### get_dataset_schema
+
+Returns dataset columns, row count, and optional sample values.
+
+Important: sample values are examples only. They are not treated as the complete set of distinct categories or intents.
+
+### resolve_filter_value
+
+Resolves a natural-language phrase to actual dataset `category` and/or `intent` values.
+
+Examples:
+
+```text
+refund requests
+shipping issues
+account problems
+people wanting their money back
+```
+
+Use this before filtered analytical tools when the user provides or implies a category/intent value.
+
+### count_rows
+
+Counts all rows or rows matching semantic filters:
+
+```text
+category
+intent
+text_query
+```
+
+### sample_examples
+
+Returns example rows matching semantic filters.
+
+Supports:
+
+```text
+n
+offset
+```
+
+`offset` is used for follow-up requests like:
+
+```text
+Show me 3 more.
+```
+
+### group_counts
+
+Groups all rows or filtered rows by:
+
+```text
+category
+intent
+```
+
+Supports scoped distributions:
+
+```text
+group_counts(group_by="intent", category="ACCOUNT")
+group_counts(group_by="category", intent="track_refund")
+```
+
+For full distributions, use `top_k=20` or higher unless the user explicitly asks for a limited top-N result.
+
+### summarize_rows
+
+Summarizes matching rows for qualitative analysis.
+
+Use for:
+
+- summaries
+- themes
+- patterns
+- tone
+- support response patterns
+- customer pain points
+
+Arguments include:
+
+```text
+category
+intent
+text_query
+focus
+target_field
+max_examples
+```
+
+`target_field` can be:
+
+```text
+instruction
+response
+both
+```
+
+When `NEBIUS_API_KEY` and `langchain-openai` are available, this tool uses the configured agent model to summarize only selected rows. If summarization is unavailable, it falls back to a deterministic summary.
+
+### read_user_profile
+
+Reads the persistent profile for a user.
+
+### update_user_profile
+
+Updates the profile with a durable observation.
+
+This is called by the graph profile-update node and is not exposed as an MCP tool.
 
 ## Example Questions
 
@@ -244,9 +602,17 @@ Structured questions:
 ```text
 How many refund requests did we get?
 Show me 3 examples from the REFUND category.
-How many complaints did we get?
-Which intent is most common?
-Count rows by category.
+Show me 5 examples of the SHIPPING category.
+What categories exist in the dataset?
+What intents exist in the dataset?
+Show the distribution of categories.
+Show the distribution of intents.
+What is the distribution of intents in the ACCOUNT category?
+Break down ACCOUNT by intent.
+Intent breakdown for ACCOUNT.
+What intents appear under ACCOUNT?
+Break down track_refund by category.
+What categories appear under track_refund?
 ```
 
 Unstructured questions:
@@ -256,26 +622,33 @@ Summarize the FEEDBACK category.
 What are customers usually asking about refunds?
 Describe common complaint themes.
 What tone do customer support responses usually have?
+How do customer service representatives typically respond to cancellation requests?
+Summarize how agents respond to complaint intents.
 ```
 
 Follow-up questions:
 
 ```text
 Show me 3 more.
+Show me another 5 examples.
 What about refunds?
 What is the total count of the last two?
 ```
 
-Profile question:
+Profile questions:
 
 ```text
 What do you remember about me?
+What do you know about my saved profile?
 ```
 
-Out-of-scope question:
+Out-of-scope questions:
 
 ```text
 Who won the World Cup?
+Who is the president of France?
+What's the best CRM software for handling complaints?
+Write me a poem about customer service.
 ```
 
 Expected out-of-scope behavior:
@@ -298,7 +671,7 @@ Persistent user profile memory is stored under:
 
 It stores durable facts and preferences only, not a transcript.
 
-Examples:
+Example:
 
 ```md
 # User Profile
@@ -329,7 +702,7 @@ LangGraph checkpoints are stored under:
 
 The graph uses the CLI/Streamlit `session_id` as the LangGraph `thread_id`, so the same session can restore prior conversation context and recent structured results across app restarts.
 
-Checkpoint persistence requires the SQLite checkpoint package:
+Checkpoint persistence requires:
 
 ```text
 langgraph-checkpoint-sqlite
@@ -342,6 +715,8 @@ Show me 3 more.
 What about refunds?
 What is the total count of the last two?
 ```
+
+For follow-up example pagination, the state stores semantic filters and offsets instead of passing large row-id lists through the LLM context.
 
 ## LangGraph Graph Design
 
@@ -358,10 +733,10 @@ router_node
  │ structured/unstructured     │ out_of_scope            │
  ↓                            ↓
 data_agent_loop_node           refusal_node
-  ↓                       ↓
-profile_update_node       profile_update_node
-  ↓                       ↓
-END                     END
+  ↓                            ↓
+profile_update_node            profile_update_node
+  ↓                            ↓
+END                          END
 ```
 
 The router classifies each query into:
@@ -378,10 +753,10 @@ The data-agent node receives compact graph context:
 
 - route
 - route reason
-- saved user profile
+- hidden or loaded user profile context, depending on query type
 - recent structured results used for follow-up questions
 - current-turn tool trace
-- reviewer feedback from the previous loop step, when available 
+- reviewer feedback from the previous loop step, when available
 
 The graph-owned loop runs this cycle:
 
@@ -395,23 +770,97 @@ observation reviewer LLM
   └── needs_more → planner LLM
 ```
 
-The planner chooses the next tool or decides that existing context is already enough for a final answer. The executor safely calls exactly one selected tool. The reviewer checks whether the latest observations fully answer the user's exact question before the graph allows a final answer.
+The planner chooses the next tool or decides that existing observations are enough for a final answer. The executor safely calls exactly one selected tool. The reviewer checks whether the latest observations answer the exact user question before the graph allows a final answer.
 
 The data-agent loop can execute:
 
-- `filter_rows`
-- `count_rows`
-- `sample_examples`
-- `group_counts`
-- `summarize_rows`
-- `get_dataset_schema`
-- `read_user_profile`
+```text
+get_dataset_schema
+resolve_filter_value
+count_rows
+sample_examples
+group_counts
+summarize_rows
+read_user_profile
+```
 
-### Graph-Owned Agent Loop Note
+## Evidence and Tool-Use Rules
 
-The project uses a custom LangGraph loop instead of delegating the full ReAct cycle to LangChain's standard `create_agent` runtime.
+### Filter Resolution
 
-The goal is to keep the system agentic while making the evidence check explicit. The LLM still chooses tools and reviews observations, but the graph controls the loop boundaries:
+Before calling an analysis tool with a non-null `category` or `intent` value that comes from the current user query, the agent should call:
+
+```text
+resolve_filter_value
+```
+
+The analysis tool may then use the recommended semantic filter if resolver confidence is `medium` or `high`.
+
+Examples:
+
+```text
+How many refund requests did we get?
+Show me 5 examples of the SHIPPING category.
+Summarize the FEEDBACK category.
+How do agents respond to cancellation requests?
+```
+
+### Discovery
+
+For discovery questions, the agent should use unfiltered `group_counts`, not `get_dataset_schema.sample_values`.
+
+Examples:
+
+```text
+What categories exist in the dataset?
+What intents exist in the dataset?
+Show the distribution of categories.
+Show the distribution of intents.
+```
+
+### Scoped Distributions
+
+Scoped distribution questions require grouped counts with the requested scope applied.
+
+Category → intent examples:
+
+```text
+What is the distribution of intents in the ACCOUNT category?
+Break down ACCOUNT by intent.
+Intent breakdown for ACCOUNT.
+What intents appear under ACCOUNT?
+Which intents occur inside ACCOUNT?
+```
+
+Expected final scoped tool call:
+
+```text
+group_counts(group_by="intent", category="ACCOUNT", top_k=20)
+```
+
+Intent → category examples:
+
+```text
+What is the distribution of categories in the track_refund intent?
+Break down track_refund by category.
+Category breakdown for track_refund.
+What categories appear under track_refund?
+Which categories occur inside check_refund_status?
+```
+
+Expected final scoped tool call:
+
+```text
+group_counts(group_by="category", intent="track_refund", top_k=20)
+```
+
+A global grouped call is invalid evidence for a scoped distribution.
+
+## Graph-Owned Agent Loop Note
+
+The project uses a custom LangGraph loop instead of delegating the full ReAct cycle to LangChain's standard agent runtime.
+
+The goal is to keep the system agentic while making evidence checks explicit. The LLM still chooses tools and reviews observations, but the graph controls the loop boundaries:
 
 - route before any dataset tool use
 - execute one planned tool at a time
@@ -419,76 +868,10 @@ The goal is to keep the system agentic while making the evidence check explicit.
 - continue when the observation is incomplete
 - produce final answers only from reviewed observations
 - preserve checkpointed follow-up state
-- keep deterministic handling for high-risk example-pagination follow-ups such as `Show me 3 more.`
+- keep deterministic handling for high-risk example-pagination follow-ups
 - build visible reasoning traces directly while the graph runs
 
-This design prevents weak first observations, such as schema sample values, from being treated as complete evidence for questions that require full grouped values.
-
-## Tool Reference
-
-### get_dataset_schema
-
-Returns dataset columns, row count, and optional sample values.
-
-### filter_rows
-
-Filters rows by:
-
-- category
-- intent
-- text query over instruction and response
-- optional limit
-
-Returns matching row IDs and total match count.
-
-### count_rows
-
-Counts all dataset rows or a provided subset of row IDs.
-
-### sample_examples
-
-Returns example rows from the full dataset or a filtered subset.
-
-Supports `offset` for follow-up requests like:
-
-```text
-Show me 3 more.
-```
-
-### group_counts
-
-Groups rows by:
-
-```text
-category
-intent
-```
-
-Returns counts sorted by frequency.
-
-### summarize_rows
-
-Summarizes selected row IDs for qualitative analysis.
-
-Use for:
-
-- summaries
-- themes
-- patterns
-- tone
-- customer pain points
-
-When `NEBIUS_API_KEY` and `langchain-openai` are available, this tool uses the configured agent model to summarize only the selected rows. If the summarizer is unavailable, it falls back to a deterministic summary with row counts, top categories, top intents, and representative customer instructions.
-
-### read_user_profile
-
-Reads the persistent profile for a user.
-
-### update_user_profile
-
-Updates the profile with a durable observation.
-
-This is called by the graph profile-update node, not normally by the main data-analysis loop.
+This design prevents weak first observations, such as schema sample values or global distributions, from being treated as complete evidence for questions that require full grouped values or scoped grouped values.
 
 ## Debugging with LangGraph Studio
 
@@ -498,6 +881,7 @@ LangGraph Studio can be used to inspect:
 - route decisions
 - state transitions
 - tool traces
+- reviewer decisions
 - final answers
 - checkpoint behavior
 - agent fallback behavior
@@ -512,10 +896,18 @@ graph = build_graph()
 
 ## Running Tests
 
-Run:
+Run the full suite:
 
 ```bash
 pytest
+```
+
+Run focused suites:
+
+```bash
+pytest tests/test_graph.py -q
+pytest tests/test_mcp_server.py -q
+pytest tests/test_tools.py -q
 ```
 
 The test suite covers:
@@ -524,248 +916,15 @@ The test suite covers:
 - data loader normalization
 - stable row IDs
 - tool filtering/counting/sampling/grouping/summarization
+- tool input schema boundaries
+- MCP wrapper validation
 - LLM router behavior with mocked model calls
-- LangChain tool adapters
 - persistent profile file behavior
-- graph routing, planner/reviewer loop behavior, deterministic follow-ups, refusal, profile updates, checkpoint config, and fallback behavior
-
-## Validation Checklist
-
-Before submission, manually validate these cases.
-
-### Test Questions
-
-#### Structured dataset questions
-
-Question:
-
-```text
-What categories exist in the dataset?
-```
-
-Expected:
-
-- Route: `structured`
-- Uses `group_counts` with `group_by="category"`
-- Does not treat `get_dataset_schema.sample_values` as the full category list
-- Returns dataset-grounded category values only
-
-Question:
-
-```text
-How many refund requests did we get?
-```
-
-Expected:
-
-- Route: `structured`
-- Uses `filter_rows`
-- Returns exact count from `filter_rows.match_count`
-
-Question:
-
-```text
-Show me 5 examples of the SHIPPING category.
-```
-
-Expected:
-
-- Route: `structured`
-- Uses `filter_rows`
-- Uses `sample_examples` with `n=5`
-- Shows actual dataset rows from the `SHIPPING` category
-
-Question:
-
-```text
-What is the distribution of intents in the ACCOUNT category?
-```
-
-Expected:
-
-- Route: `structured`
-- Uses `filter_rows` for the `ACCOUNT` category
-- Uses `group_counts` with `group_by="intent"` on the filtered row IDs
-- Returns intent counts grounded in the filtered dataset subset
-
-#### Unstructured dataset questions
-
-Question:
-
-```text
-Summarize the FEEDBACK category.
-```
-
-Expected:
-
-- Route: `unstructured`
-- Uses `filter_rows`
-- Uses `summarize_rows`
-- Produces a dataset-grounded summary only from selected rows
-
-Question:
-
-```text
-Summarize how agents respond to complaint intents.
-```
-
-Expected:
-
-- Route: `unstructured`
-- Selects complaint-related rows with tools
-- Uses `summarize_rows`
-- Summarizes support response patterns only from selected dataset rows
-
-Question:
-
-```text
-How do customer service representatives typically respond to cancellation requests?
-```
-
-Expected:
-
-- Route: `unstructured`
-- Selects cancellation-related rows with tools, using category, intent, or text search as appropriate
-- Uses `summarize_rows`
-- Does not add generic customer-service advice beyond the selected rows
-
-#### Natural-language alias / semantic matching question
-
-Question:
-
-```text
-Show me examples of people wanting their money back.
-```
-
-Expected:
-
-- Route: `structured`
-- Treats “money back” as a refund-related alias
-- Uses `filter_rows`
-- Uses `sample_examples`
-- Shows actual refund-related examples from the dataset
-
-#### Out-of-scope questions
-
-Questions:
-
-```text
-What's the best CRM software for handling complaints?
-Who is the president of France?
-Who won the 2024 Champions League?
-Write me a poem about customer service.
-```
-
-Expected:
-
-- Route: `out_of_scope`
-- Returns the scoped refusal message
-- Does not answer from general knowledge
-- Does not recommend software, answer political/sports facts, or generate creative writing
-
-### Structured Count
-
-Question:
-
-```text
-How many refund requests did we get?
-```
-
-Expected:
-
-- Route: `structured`
-- Uses `filter_rows`
-- Returns exact count from `filter_rows.match_count`
-
-### Structured Examples
-
-Question:
-
-```text
-Show me 3 examples from the REFUND category.
-```
-
-Expected:
-
-- Route: `structured`
-- Uses `filter_rows`
-- Uses `sample_examples`
-- Shows 3 examples
-
-### Follow-Up Examples
-
-Question:
-
-```text
-Show me 3 more.
-```
-
-Expected:
-
-- Uses previous row IDs
-- Uses previous offset
-- Shows the next examples
-- Does not pass thousands of row IDs through the LLM
-
-### Follow-Up After Restart
-
-Run the CLI with the same session ID after restarting the app:
-
-```bash
-python -m app.main --session demo --user max
-```
-
-Expected:
-
-- The agent restores checkpointed conversation state for `demo`.
-- The agent can use recent structured results for follow-up questions.
-
-### Unstructured Summary
-
-Question:
-
-```text
-Summarize the FEEDBACK category.
-```
-
-Expected:
-
-- Route: `unstructured`
-- Uses `filter_rows`
-- Uses `summarize_rows`
-- Produces a dataset-grounded summary
-
-### User Profile Memory
-
-Question:
-
-```text
-What do you remember about me?
-```
-
-Expected:
-
-- Reads persistent user profile
-- Does not hallucinate unknown facts
-- Clearly says if profile is empty
-
-### Out-of-Scope Refusal
-
-Question:
-
-```text
-Who won the World Cup?
-```
-
-Expected:
-
-- Route: `out_of_scope`
-- Refuses politely
-- Does not answer from general knowledge
-
-## Known Limitations
-
-- Some follow-up behavior still depends on the planner correctly using recent structured results. Known high-risk example-pagination follow-ups such as "show me more examples" are handled deterministically before the planner runs.
-- SQLite checkpoint persistence requires `langgraph-checkpoint-sqlite` to be installed.
-- The router, planner, observation reviewer, profile updater, and summarizer rely on Nebius model support for structured output through LangChain.
-- The exact FastMCP transport URL should be verified from server startup logs.
+- graph routing
+- planner/reviewer loop behavior
+- deterministic follow-ups
+- scoped distribution guardrails
+- out-of-scope refusal
+- profile updates
+- checkpoint config
+- graceful fallback behavior

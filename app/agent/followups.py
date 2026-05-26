@@ -12,17 +12,19 @@ from app.agent.tool_executor import (
     _format_sample_examples_observation,
 )
 from app.state import AgentState, AnalysisResult
+from app.agent.evidence_contracts import _append_reviewer_fast_path_trace
 
 
 SampleFormatter = Callable[
     [dict[str, str | None], int, int],
-    tuple[str, int, int],
+    tuple[str, int, int, dict[str, str | None]],
 ]
 
 
 def _is_more_examples_query(query: str) -> bool:
     """Return True when the user asks for additional examples from prior context."""
     normalized = query.strip().lower()
+    normalized_tokens = set(re.findall(r"\b[a-z0-9]+\b", normalized))
 
     if not normalized:
         return False
@@ -44,21 +46,27 @@ def _is_more_examples_query(query: str) -> bool:
         "rows",
     )
 
-    if any(marker in normalized for marker in more_markers) and any(
-        marker in normalized for marker in example_markers
+    has_more_marker = bool(normalized_tokens & set(more_markers))
+    has_example_marker = bool(normalized_tokens & set(example_markers))
+
+    if has_more_marker and has_example_marker:
+        return True
+
+    if re.search(
+        r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
+        normalized,
     ):
         return True
 
-    return bool(
-        re.search(
-            r"\b(show|give|list|display)\s+(?:me\s+)?\d+\s+more\b",
-            normalized,
-        )
-        or re.search(
-            r"\b(?:show|give|list|display)?\s*(?:me\s+)?(?:another|next|additional)\s+\d+\b",
-            normalized,
-        )
-    )
+    if has_example_marker and re.search(
+        r"\b(?:show|give|list|display)?\s*(?:me\s+)?(?:another|next|additional)\s+\d+\b",
+        normalized,
+    ):
+        return True
+
+    return False
+
+
 
 
 def _requested_example_count(query: str, default: int = 3) -> int:
@@ -116,7 +124,12 @@ def _handle_more_examples_follow_up(
     n = _requested_example_count(user_query)
 
     formatter = sample_formatter or _format_sample_examples_observation
-    observation, next_offset, match_count = formatter(
+    (
+        observation,
+        next_offset,
+        match_count,
+        applied_filters,
+    ) = formatter(
         filters,
         n,
         offset,
@@ -134,8 +147,17 @@ def _handle_more_examples_follow_up(
             label="sample_examples",
             value=next_offset,
             query_type="sample",
-            filters=filters,
+            filters=applied_filters,
             match_count=match_count,
+        ),
+    )
+
+    _append_reviewer_fast_path_trace(
+        state=state,
+        reason=(
+            "Planner and reviewer LLMs skipped: user asked for more examples "
+            "from the previous sample context, so deterministic follow-up "
+            "pagination produced the final answer."
         ),
     )
 

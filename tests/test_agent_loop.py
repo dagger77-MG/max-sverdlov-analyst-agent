@@ -218,7 +218,7 @@ def test_loop_executes_tool_then_returns_reviewer_answer(monkeypatch) -> None:
     ]
 
 
-def test_loop_executes_reviewer_suggested_tool_directly(monkeypatch) -> None:
+def test_loop_returns_reviewer_suggestion_to_planner(monkeypatch) -> None:
     state = _state("How many refund requests?")
 
     planner = FakePlannerLLM(
@@ -229,7 +229,13 @@ def test_loop_executes_reviewer_suggested_tool_directly(monkeypatch) -> None:
                 "columns": ["category", "intent"],
                 "top_k": 5,
             },
-        )
+        ),
+        _plan_call(
+            "count_rows",
+            {
+                "category": "REFUND",
+            },
+        ),
     )
     reviewer = FakeReviewerLLM(
         _review_needs_more(
@@ -293,12 +299,16 @@ def test_loop_executes_reviewer_suggested_tool_directly(monkeypatch) -> None:
         "needs_more",
         "answered",
     ]
+    assert len(planner.received_messages) == 2
     assert reviewer_events[0]["suggested_tool_name"] == "count_rows"
     assert reviewer_events[0]["suggested_tool_input"] == {
         "category": "REFUND",
     }
     assert reviewer_events[1]["reviewer_final_answer"] == (
         "There are 2,992 refund-request rows in the dataset."
+    )
+    assert "The reviewer only suggests the next step" in (
+        planner.received_messages[1][1].content
     )
 
 

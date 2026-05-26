@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from app import mcp_server
+import pytest
+from pydantic import ValidationError
 
 
 def _model_result(**values):
@@ -380,3 +382,92 @@ def test_summarize_rows_delegates_to_tools_impl(monkeypatch) -> None:
             "text_query": None,
         },
     }
+
+
+def test_mcp_resolve_filter_value_rejects_invalid_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(**kwargs):
+        raise AssertionError("Implementation should not run for invalid input.")
+
+    monkeypatch.setattr(
+        mcp_server,
+        "resolve_filter_value_impl",
+        fail_if_called,
+    )
+
+    with pytest.raises(ValidationError):
+        mcp_server.resolve_filter_value(
+            query="refund requests",
+            columns=["category", "intent"],
+            top_k=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("n", "offset"),
+    [
+        (999, 0),
+        (3, -1),
+    ],
+)
+def test_mcp_sample_examples_rejects_invalid_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    n: int,
+    offset: int,
+) -> None:
+    def fail_if_called(**kwargs):
+        raise AssertionError("Implementation should not run for invalid input.")
+
+    monkeypatch.setattr(
+        mcp_server,
+        "sample_examples_impl",
+        fail_if_called,
+    )
+
+    with pytest.raises(ValidationError):
+        mcp_server.sample_examples(
+            category="REFUND",
+            n=n,
+            offset=offset,
+        )
+
+
+def test_mcp_group_counts_rejects_invalid_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(**kwargs):
+        raise AssertionError("Implementation should not run for invalid input.")
+
+    monkeypatch.setattr(
+        mcp_server,
+        "group_counts_impl",
+        fail_if_called,
+    )
+
+    with pytest.raises(ValidationError):
+        mcp_server.group_counts(
+            group_by="intent",
+            category="ACCOUNT",
+            top_k=100000,
+        )
+
+
+def test_mcp_summarize_rows_rejects_invalid_max_examples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(**kwargs):
+        raise AssertionError("Implementation should not run for invalid input.")
+
+    monkeypatch.setattr(
+        mcp_server,
+        "summarize_rows_impl",
+        fail_if_called,
+    )
+
+    with pytest.raises(ValidationError):
+        mcp_server.summarize_rows(
+            category="REFUND",
+            focus="refund requests",
+            max_examples=99999,
+        )

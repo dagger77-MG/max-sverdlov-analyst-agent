@@ -4,6 +4,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app import graph
+from app.agent import context as agent_context
+from app.agent import followups as agent_followups
 from app.agent import loop as agent_loop
 from app.agent import profile as agent_profile
 from app.agent import schemas
@@ -168,6 +170,34 @@ def _reviewer_events(tool_trace: list[dict]) -> list[dict]:
     ]
 
 
+def test_observation_review_decision_clears_suggested_tool_when_answered() -> None:
+    decision = schemas.ObservationReviewDecision(
+        status="answered",
+        reason="The observations are sufficient.",
+        final_answer="There are 2,992 refund rows.",
+        suggested_tool_name="count_rows",
+        suggested_tool_input={"category": "REFUND"},
+    )
+
+    assert decision.suggested_tool_name == ""
+    assert decision.suggested_tool_input == {}
+    assert decision.final_answer == "There are 2,992 refund rows."
+
+
+def test_observation_review_decision_clears_final_answer_when_needs_more() -> None:
+    decision = schemas.ObservationReviewDecision(
+        status="needs_more",
+        reason="A count_rows call is still needed.",
+        final_answer="Premature answer.",
+        suggested_tool_name="count_rows",
+        suggested_tool_input={"category": "REFUND"},
+    )
+
+    assert decision.final_answer == ""
+    assert decision.suggested_tool_name == "count_rows"
+    assert decision.suggested_tool_input == {"category": "REFUND"}
+
+
 def test_format_reasoning_trace_renders_reviewer_decisions() -> None:
     trace = format_reasoning_trace(
         route="structured",
@@ -223,12 +253,136 @@ def _patch_common_graph_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_planner_context_includes_recent_structured_results_for_followups() -> None:
+    state = graph.create_initial_state(
+        query="Show me 3 more.",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for more examples from prior context."
+    state["user_profile"] = "# User Profile\n"
+    state["last_structured_results"] = [
+        {
+            "label": "sample_examples",
+            "value": 3,
+            "query_type": "sample",
+            "filters": {
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+            },
+            "match_count": 6,
+        }
+    ]
+
+    messages = agent_context._build_planner_messages(
+        state=state,
+        reviewer_feedback=None,
+    )
+    context_message = messages[1].content
+
+    assert "Recent structured results:" in context_message
+    assert "label=sample_examples" in context_message
+    assert "value=3" in context_message
+    assert "query_type=sample" in context_message
+    assert "REFUND" in context_message
+
+
+def test_reviewer_context_excludes_previous_structured_results() -> None:
+    state = graph.create_initial_state(
+       query="Show me 3 more.",
+        session_id="test_session",
+        user_id="max",
+    )
+    state["route"] = "structured"
+    state["route_reason"] = "The user asks for more examples from prior context."
+    state["user_profile"] = "# User Profile\n"
+    state["last_structured_results"] = [
+        {
+            "label": "sample_examples",
+            "value": 3,
+            "query_type": "sample",
+            "filters": {
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+            },
+            "match_count": 6,
+       }
+    ]
+
+    messages = agent_context._build_reviewer_messages(state)
+    context_message = messages[1].content
+
+    assert "Current turn tool trace:" in context_message
+    assert "Evidence boundary: judge only the current turn tool trace." in context_message
+    assert "Previous structured" in context_message
+    assert "Recent structured results:" not in context_message
+    assert "label=sample_examples" not in context_message
+    assert "REFUND" not in context_message
+    assert "value=3" not in context_message
+
+
 def test_planner_tool_set_does_not_expose_filter_rows_or_row_id_workflow() -> None:
     assert "filter_rows" not in schemas.VALID_PLANNER_TOOL_NAMES
     assert "count_rows" in schemas.VALID_PLANNER_TOOL_NAMES
     assert "sample_examples" in schemas.VALID_PLANNER_TOOL_NAMES
     assert "group_counts" in schemas.VALID_PLANNER_TOOL_NAMES
     assert "summarize_rows" in schemas.VALID_PLANNER_TOOL_NAMES
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        (
+            "resolve_filter_value",
+            {
+                "query": "refund requests",
+                "columns": ["category", "intent"],
+                "top_k": 0,
+            },
+        ),
+        (
+            "sample_examples",
+            {
+                "category": "REFUND",
+                "n": 999,
+                "offset": 0,
+            },
+        ),
+        (
+            "sample_examples",
+            {
+                "category": "REFUND",
+                "n": 3,
+               "offset": -1,
+            },
+        ),
+        (
+            "group_counts",
+            {
+                "group_by": "intent",
+                "category": "ACCOUNT",
+                "top_k": 100000,
+            },
+        ),
+        (
+            "summarize_rows",
+            {
+                "category": "REFUND",
+                "focus": "refund requests",
+                "max_examples": 99999,
+            },
+        ),
+    ],
+)
+def test_tool_executor_rejects_invalid_tool_input_at_boundary(
+    tool_name: str,
+    tool_input: dict,
+) -> None:
+    with pytest.raises(ValueError):
+        tool_executor._canonical_tool_input(tool_name, tool_input)
 
 
 def test_structured_query_resolves_filter_then_counts_rows(
@@ -345,6 +499,102 @@ def test_structured_query_resolves_filter_then_counts_rows(
     }
     assert isinstance(result["messages"][-1], AIMessage)
 
+
+def test_reviewer_suggestion_is_advisory_not_directly_executed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for an exact refund count.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "REFUND",
+                    "count": 2992,
+                    "score": 1.0,
+                    "reason": "Category alias resolves exactly to this dataset value.",
+                }
+            ],
+            recommended_filter={
+                "category": "REFUND",
+                "intent": None,
+            },
+            confidence="high",
+        ),
+    )
+    monkeypatch.setattr(
+        tool_executor,
+        "count_rows_impl",
+        lambda category=None, intent=None, text_query=None: _model_result(
+            count=2992,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    def fail_if_sample_examples_called(**kwargs):
+        raise AssertionError(
+            "Reviewer-suggested sample_examples should not be executed directly."
+        )
+
+    monkeypatch.setattr(
+        tool_executor,
+        "sample_examples_impl",
+        fail_if_sample_examples_called,
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "refund requests",
+                "columns": ["category", "intent"],
+                "top_k": 5,
+            },
+        ),
+        _plan_call("count_rows", {"category": "REFUND"}),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="Intentionally suggest the wrong next tool.",
+            suggested_tool_name="sample_examples",
+            suggested_tool_input={"category": "REFUND", "n": 3, "offset": 0},
+        ),
+        _review_answer("There are 2,992 refund-request rows in the dataset."),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="How many refund requests did we get?",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
+        "resolve_filter_value",
+        "count_rows",
+    ]
+    assert result["final_answer"] == (
+        "There are 2,992 refund-request rows in the dataset."
+    )
 
 def test_assignment_question_categories_exist_uses_group_counts(
     monkeypatch: pytest.MonkeyPatch,
@@ -553,6 +803,431 @@ def test_assignment_question_shipping_examples_samples_with_filters(
     }
     assert "row_id=20" in result["final_answer"]
     assert "category=SHIPPING" in result["final_answer"]
+    reviewer_events = _reviewer_events(result["tool_trace"])
+    assert [step["reviewer_status"] for step in reviewer_events] == [
+        "needs_more",
+        "answered",
+    ]
+    assert reviewer_events[-1]["suggested_tool_name"] == ""
+    assert reviewer_events[-1]["suggested_tool_input"] == {}
+    assert "Reviewer LLM skipped" in reviewer_events[-1]["reviewer_reason"]
+
+
+def test_global_category_breakdown_uses_single_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for a full-dataset category distribution.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "ACCOUNT", "count": 5986},
+                {"label": "ORDER", "count": 3988},
+                {"label": "REFUND", "count": 2992},
+            ],
+            match_count=26872,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "category",
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_answer(
+            "ACCOUNT has 5,986 rows, ORDER has 3,988 rows, and REFUND has 2,992 rows."
+        ),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down the dataset by category.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["route"] == "structured"
+    assert result["final_answer"] == (
+        "ACCOUNT has 5,986 rows, ORDER has 3,988 rows, and REFUND has 2,992 rows."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    reviewer_events = _reviewer_events(result["tool_trace"])
+
+    assert [step["tool_name"] for step in tool_events] == ["group_counts"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "category",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert [step["reviewer_status"] for step in reviewer_events] == ["answered"]
+
+
+def test_global_intent_breakdown_uses_single_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for a full-dataset intent distribution.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "create_account", "count": 997},
+                {"label": "delete_account", "count": 995},
+                {"label": "get_refund", "count": 990},
+            ],
+            match_count=26872,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "intent",
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_answer(
+            "create_account has 997 rows, delete_account has 995 rows, and get_refund has 990 rows."
+        ),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down the dataset by intent.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["route"] == "structured"
+    assert result["final_answer"] == (
+        "create_account has 997 rows, delete_account has 995 rows, and get_refund has 990 rows."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    reviewer_events = _reviewer_events(result["tool_trace"])
+
+    assert [step["tool_name"] for step in tool_events] == ["group_counts"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "intent",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert [step["reviewer_status"] for step in reviewer_events] == ["answered"]
+
+
+def test_scoped_category_to_intent_breakdown_guards_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for intent distribution within a category.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "ACCOUNT",
+                    "count": 5986,
+                    "score": 1.0,
+                    "reason": "Exact normalized value match.",
+                }
+            ],
+            recommended_filter={
+                "category": "ACCOUNT",
+                "intent": None,
+            },
+            confidence="high",
+        ),
+    )
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "create_account", "count": 997},
+                {"label": "delete_account", "count": 995},
+            ],
+            match_count=5986,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "intent",
+            },
+        ),
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "ACCOUNT",
+                "columns": ["category"],
+                "top_k": 5,
+            },
+        ),
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "intent",
+                "category": "ACCOUNT",
+                "top_k": 20,
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="A category value must be resolved before scoped intent grouping.",
+            suggested_tool_name="resolve_filter_value",
+            suggested_tool_input={
+                "query": "ACCOUNT",
+                "columns": ["category"],
+                "top_k": 5,
+            },
+        ),
+        _review_needs_more(
+            reason="Now group intents using the resolved ACCOUNT category filter.",
+            suggested_tool_name="group_counts",
+            suggested_tool_input={
+                "group_by": "intent",
+                "category": "ACCOUNT",
+                "top_k": 20,
+            },
+        ),
+        _review_answer(
+            "The ACCOUNT category has create_account (997) and delete_account (995)."
+        ),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down ACCOUNT by intent.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["final_answer"] == (
+        "The ACCOUNT category has create_account (997) and delete_account (995)."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
+        "group_counts",
+        "resolve_filter_value",
+        "group_counts",
+    ]
+    assert "group_counts needs a category filter" in tool_events[0]["observation"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "intent",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert tool_events[2]["tool_input"] == {
+        "group_by": "intent",
+        "category": "ACCOUNT",
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+
+
+def test_scoped_intent_to_category_breakdown_guards_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for category distribution within an intent.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "intent",
+                    "value": "track_refund",
+                    "count": 11,
+                    "score": 1.0,
+                    "reason": "Exact normalized value match.",
+                }
+            ],
+            recommended_filter={
+                "category": None,
+                "intent": "track_refund",
+            },
+            confidence="high",
+        ),
+    )
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "REFUND", "count": 11},
+            ],
+            match_count=11,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "category",
+            },
+        ),
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "track_refund",
+                "columns": ["intent"],
+                "top_k": 5,
+            },
+        ),
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "category",
+                "intent": "track_refund",
+                "top_k": 20,
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="An intent value must be resolved before scoped category grouping.",
+            suggested_tool_name="resolve_filter_value",
+            suggested_tool_input={
+                "query": "track_refund",
+                "columns": ["intent"],
+                "top_k": 5,
+            },
+        ),
+        _review_needs_more(
+            reason="Now group categories using the resolved track_refund intent filter.",
+            suggested_tool_name="group_counts",
+            suggested_tool_input={
+                "group_by": "category",
+                "intent": "track_refund",
+                "top_k": 20,
+            },
+        ),
+        _review_answer("The track_refund intent appears under REFUND 11 times."),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down track_refund by category.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["final_answer"] == (
+        "The track_refund intent appears under REFUND 11 times."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
+        "group_counts",
+        "resolve_filter_value",
+        "group_counts",
+    ]
+    assert "group_counts needs an intent filter" in tool_events[0]["observation"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "category",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert tool_events[2]["tool_input"] == {
+        "group_by": "category",
+        "category": None,
+        "intent": "track_refund",
+        "text_query": None,
+        "top_k": 20,
+    }
 
 
 def test_assignment_question_account_intent_distribution_groups_with_category_filter(
@@ -663,6 +1338,44 @@ def test_assignment_question_account_intent_distribution_groups_with_category_fi
     }
     assert result["final_answer"] == (
         "In ACCOUNT, recover_password appears 2 times and delete_account appears once."
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Break down ACCOUNT by intent",
+        "Intent breakdown for ACCOUNT",
+        "What intents appear under ACCOUNT?",
+        "Show intents within ACCOUNT",
+        "Which intents occur inside ACCOUNT?",
+    ],
+)
+def test_scoped_intent_distribution_phrasings_require_category_filter(
+    query: str,
+) -> None:
+    assert tool_executor._requires_grouped_filtered_scope(
+        query=query,
+        group_by="intent",
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Break down track_refund by category",
+        "Category breakdown for track_refund",
+        "What categories appear under track_refund?",
+        "Show categories within delete_account",
+        "Which categories occur inside check_refund_status?",
+    ],
+)
+def test_scoped_category_distribution_phrasings_require_intent_filter(
+    query: str,
+) -> None:
+    assert tool_executor._requires_grouped_filtered_scope(
+        query=query,
+        group_by="category",
     )
 
 
@@ -961,6 +1674,14 @@ def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
 
     planner = FakePlannerLLM(
         _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "cancellation requests",
+                "columns": ["category", "intent"],
+                "top_k": 5,
+            },
+        ),
+        _plan_call(
             "summarize_rows",
             {
                 "text_query": "cancellation requests",
@@ -1018,8 +1739,8 @@ def test_semantic_summary_contract_blocks_text_query_summary_after_resolution(
 
     tool_events = _tool_events(result["tool_trace"])
     assert [step["tool_name"] for step in tool_events] == [
-        "summarize_rows",
         "resolve_filter_value",
+        "summarize_rows",
         "summarize_rows",
     ]
     assert captured_summaries == [
@@ -1447,6 +2168,12 @@ def test_follow_up_show_me_three_more_uses_previous_filters_and_offset(
     assert "row_id=14" in result["final_answer"]
     assert "row_id=15" in result["final_answer"]
     assert _tool_events(result["tool_trace"])[-1]["tool_name"] == "sample_examples"
+    reviewer_events = _reviewer_events(result["tool_trace"])
+    assert len(reviewer_events) == 1
+    assert reviewer_events[0]["reviewer_status"] == "answered"
+    assert reviewer_events[0]["suggested_tool_name"] == ""
+    assert reviewer_events[0]["suggested_tool_input"] == {}
+    assert "Planner and reviewer LLMs skipped" in reviewer_events[0]["reviewer_reason"]
     assert state["last_structured_results"][-1] == {
         "label": "sample_examples",
         "value": 6,
@@ -1458,6 +2185,64 @@ def test_follow_up_show_me_three_more_uses_previous_filters_and_offset(
         },
         "match_count": 6,
     }
+
+
+def test_sample_formatter_returns_applied_filters_for_follow_up_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tool_executor,
+        "sample_examples_impl",
+        lambda category=None, intent=None, text_query=None, n=3, offset=0: _model_result(
+            examples=[
+                _example_row(
+                    row_id=1,
+                    category="REFUND",
+                    intent="get_refund",
+                    instruction="I want my money back.",
+                    response="You can request a refund from your account.",
+                )
+            ],
+            next_offset=1,
+            match_count=2,
+            applied_filters={
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+            },
+        ),
+    )
+
+    observation, next_offset, match_count, applied_filters = (
+        tool_executor._format_sample_examples_observation(
+            filters={
+                "category": "money back",
+                "intent": None,
+                "text_query": None,
+            },
+            n=1,
+            offset=0,
+        )
+    )
+
+    assert "row_id=1" in observation
+    assert next_offset == 1
+    assert match_count == 2
+    assert applied_filters == {
+        "category": "REFUND",
+        "intent": None,
+        "text_query": None,
+    }
+
+
+def test_more_examples_detector_requires_example_context_for_ambiguous_next_counts() -> None:
+    assert agent_followups._is_more_examples_query("next 2") is False
+    assert agent_followups._is_more_examples_query("another 2") is False
+
+    assert agent_followups._is_more_examples_query("next 2 rows") is True
+    assert agent_followups._is_more_examples_query("another 2 examples") is True
+    assert agent_followups._is_more_examples_query("show me 3 more") is True
+    assert agent_followups._is_more_examples_query("give me 2 more cases") is True
 
 
 def test_total_of_last_two_follow_up_goes_to_planner_with_filter_context(
