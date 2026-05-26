@@ -564,6 +564,16 @@ When `NEBIUS_API_KEY` and `langchain-openai` are available, this tool uses the c
 
 Reads the persistent profile for a user.
 
+### read_recent_results
+
+Reads compact recent structured results from previous turns, including:
+
+```text
+labels, values, filters, query types, and match counts
+```
+
+Use this for follow-up questions that refer to previous results, such as totals, comparisons, repeated filters, or “the last two”.
+
 ### update_user_profile
 
 Updates the profile with a durable observation.
@@ -760,6 +770,7 @@ sample_examples
 group_counts
 summarize_rows
 read_user_profile
+read_recent_results
 ```
 
 ## Evidence and Tool-Use Rules
@@ -833,6 +844,23 @@ group_counts(group_by="category", intent="track_refund", top_k=20)
 ```
 
 A global grouped call is invalid evidence for a scoped distribution.
+
+### Follow-up Result Readback
+
+For follow-up questions that refer to prior results, the agent should call:
+
+```text 
+read_recent_results
+``` 
+
+Examples:
+
+```text 
+What is the total count of the last two? 
+Which one was bigger? 
+What filters did you use? 
+Repeat the previous one. 
+```
 
 ## Graph-Owned Agent Loop Note
 
