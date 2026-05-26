@@ -120,7 +120,7 @@ def test_count_rows_filters_by_category_case_insensitive() -> None:
 
     assert result.count == 2
     assert result.applied_filters == {
-        "category": "refund",
+        "category": "REFUND",
         "intent": None,
         "text_query": None,
     }
@@ -143,43 +143,45 @@ def test_count_rows_normalizes_refund_category_aliases(
     result = tools.count_rows_impl(category=category_alias)
 
     assert result.count == 2
-    assert result.applied_filters["category"] == category_alias
+    assert result.applied_filters["category"] == "REFUND"
 
 
 def test_assignment_money_back_alias_maps_to_refund_rows() -> None:
     result = tools.sample_examples_impl(category="money back", n=2)
 
     assert result.match_count == 2
-    assert result.applied_filters["category"] == "money back"
+    assert result.applied_filters["category"] == "REFUND"
     assert [example.row_id for example in result.examples] == [0, 3]
     assert all(example.category == "REFUND" for example in result.examples)
 
 
 @pytest.mark.parametrize(
-    ("category_alias", "expected_count"),
+    ("category_alias", "expected_count", "expected_category"),
     [
-        ("customer feedback", 1),
-        ("product feedback", 1),
-        ("complaints", 1),
-        ("contact support", 1),
-        ("customer service", 1),
-        ("contact customer service", 1),
+        ("customer feedback", 1, "FEEDBACK"),
+        ("product feedback", 1, "FEEDBACK"),
+        ("complaints", 1, "COMPLAINT"),
+        ("contact support", 1, "CONTACT"),
+        ("customer service", 1, "CONTACT"),
+        ("contact customer service", 1, "CONTACT"),
     ],
 )
 def test_count_rows_normalizes_non_refund_category_aliases(
     category_alias: str,
     expected_count: int,
+    expected_category: str,
 ) -> None:
     result = tools.count_rows_impl(category=category_alias)
 
     assert result.count == expected_count
+    assert result.applied_filters["category"] == expected_category
 
 
 def test_count_rows_filters_by_intent_case_insensitive() -> None:
     result = tools.count_rows_impl(intent="GET_REFUND")
 
     assert result.count == 1
-    assert result.applied_filters["intent"] == "GET_REFUND"
+    assert result.applied_filters["intent"] == "get_refund"
 
 
 def test_count_rows_filters_by_text_query() -> None:
@@ -235,6 +237,38 @@ def test_resolve_filter_value_maps_shipping_to_category_when_category_allowed() 
     }
     assert result.candidates[0].column == "category"
     assert result.candidates[0].value == "SHIPPING"
+
+
+def test_resolve_filter_value_exact_customer_service_alias_maps_to_contact() -> None:
+    result = tools.resolve_filter_value_impl(
+        query="customer service",
+        columns=["category"],
+        top_k=5,
+    )
+
+    assert result.confidence == "high"
+    assert result.recommended_filter == {
+        "category": "CONTACT",
+        "intent": None,
+    }
+    assert result.candidates[0].column == "category"
+    assert result.candidates[0].value == "CONTACT"
+
+
+def test_resolve_filter_value_does_not_hijack_long_question_with_embedded_alias() -> None:
+    result = tools.resolve_filter_value_impl(
+        query="How do customer service representatives typically respond to cancellation requests?",
+        columns=["category"],
+        top_k=5,
+    )
+
+    assert result.recommended_filter["category"] != "CONTACT"
+    assert all(candidate.value != "CONTACT" for candidate in result.candidates)
+    assert result.confidence == "high"
+    assert result.recommended_filter == {
+        "category": "CANCELLATION",
+        "intent": None,
+    }
 
 
 def test_assignment_cancellation_text_query_finds_cancellation_rows() -> None:

@@ -199,6 +199,18 @@ def test_deterministic_sample_examples_answer_requires_actual_examples() -> None
     assert result is not None
     assert result["final_answer"].startswith("Returned 2 examples from 6 matching rows.")
     assert state["final_answer"] == result["final_answer"]
+    assert state["tool_trace"][-1] == {
+        "event_type": "reviewer",
+        "reviewer_status": "answered",
+        "reviewer_reason": (
+            "Reviewer LLM skipped: sample_examples returned requested row "
+            "content, so deterministic fast path produced the final answer."
+        ),
+        "reviewer_final_answer": "",
+        "suggested_tool_name": "",
+        "suggested_tool_input": {},
+    }
+    assert result["tool_trace"][-1] == state["tool_trace"][-1]
 
 
 def test_deterministic_sample_examples_answer_ignores_zero_example_observation() -> None:

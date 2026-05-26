@@ -170,7 +170,7 @@ def test_format_sample_examples_observation_includes_full_example_details(
         ),
     )
 
-    observation, next_offset, match_count = (
+    observation, next_offset, match_count, applied_filters = (
         tool_executor._format_sample_examples_observation(
             filters={
                 "category": "REFUND",
@@ -184,6 +184,11 @@ def test_format_sample_examples_observation_includes_full_example_details(
 
     assert next_offset == 1
     assert match_count == 1
+    assert applied_filters == {
+        "category": "REFUND",
+        "intent": None,
+        "text_query": None,
+    }
     assert "row_id=10" in observation
     assert "category=REFUND" in observation
     assert "intent=check_refund_status" in observation
@@ -569,7 +574,9 @@ def test_execute_read_user_profile_appends_profile_observation(monkeypatch) -> N
     )
 
     assert state["tool_trace"][-1]["tool_name"] == "read_user_profile"
-    assert state["tool_trace"][-1]["tool_input"] == {}
+    assert state["tool_trace"][-1]["tool_input"] == {
+        "user_id": "max",
+    }
     assert json.loads(state["tool_trace"][-1]["observation"]) == {
         "user_id": "max",
         "profile": "# User Profile\n\n- User prefers concise answers.\n",

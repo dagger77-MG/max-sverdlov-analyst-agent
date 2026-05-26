@@ -159,9 +159,18 @@ def test_handle_more_examples_follow_up_appends_trace_and_structured_result() ->
         filters: dict[str, str | None],
         n: int,
         offset: int,
-    ) -> tuple[str, int, int]:
+    ) -> tuple[str, int, int, dict[str, str | None]]:
         captured_formatter_inputs.append((filters, n, offset))
-        return "Returned 2 examples from 6 matching rows. Next offset = 5.", 5, 6
+        return (
+            "Returned 2 examples from 6 matching rows. Next offset = 5.",
+            5,
+            6,
+            {
+                "category": "REFUND",
+                "intent": None,
+                "text_query": None,
+            },
+        )
 
     result = followups._handle_more_examples_follow_up(
         state,
@@ -186,7 +195,7 @@ def test_handle_more_examples_follow_up_appends_trace_and_structured_result() ->
     assert state["final_answer"] == (
         "Returned 2 examples from 6 matching rows. Next offset = 5."
     )
-    assert state["tool_trace"][-1] == {
+    assert state["tool_trace"][0] == {
         "event_type": "tool",
         "tool_name": "sample_examples",
         "tool_input": {
@@ -197,6 +206,18 @@ def test_handle_more_examples_follow_up_appends_trace_and_structured_result() ->
             "offset": 3,
         },
         "observation": "Returned 2 examples from 6 matching rows. Next offset = 5.",
+    }
+    assert state["tool_trace"][1] == {
+        "event_type": "reviewer",
+        "reviewer_status": "answered",
+        "reviewer_reason": (
+            "Planner and reviewer LLMs skipped: user asked for more examples "
+            "from the previous sample context, so deterministic follow-up "
+            "pagination produced the final answer."
+        ),
+        "reviewer_final_answer": "",
+        "suggested_tool_name": "",
+        "suggested_tool_input": {},
     }
     assert state["last_structured_results"][-1] == {
         "label": "sample_examples",
