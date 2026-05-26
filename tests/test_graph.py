@@ -813,6 +813,423 @@ def test_assignment_question_shipping_examples_samples_with_filters(
     assert "Reviewer LLM skipped" in reviewer_events[-1]["reviewer_reason"]
 
 
+def test_global_category_breakdown_uses_single_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for a full-dataset category distribution.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "ACCOUNT", "count": 5986},
+                {"label": "ORDER", "count": 3988},
+                {"label": "REFUND", "count": 2992},
+            ],
+            match_count=26872,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "category",
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_answer(
+            "ACCOUNT has 5,986 rows, ORDER has 3,988 rows, and REFUND has 2,992 rows."
+        ),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down the dataset by category.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["route"] == "structured"
+    assert result["final_answer"] == (
+        "ACCOUNT has 5,986 rows, ORDER has 3,988 rows, and REFUND has 2,992 rows."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    reviewer_events = _reviewer_events(result["tool_trace"])
+
+    assert [step["tool_name"] for step in tool_events] == ["group_counts"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "category",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert [step["reviewer_status"] for step in reviewer_events] == ["answered"]
+
+
+def test_global_intent_breakdown_uses_single_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for a full-dataset intent distribution.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "create_account", "count": 997},
+                {"label": "delete_account", "count": 995},
+                {"label": "get_refund", "count": 990},
+            ],
+            match_count=26872,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "intent",
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_answer(
+            "create_account has 997 rows, delete_account has 995 rows, and get_refund has 990 rows."
+        ),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down the dataset by intent.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["route"] == "structured"
+    assert result["final_answer"] == (
+        "create_account has 997 rows, delete_account has 995 rows, and get_refund has 990 rows."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    reviewer_events = _reviewer_events(result["tool_trace"])
+
+    assert [step["tool_name"] for step in tool_events] == ["group_counts"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "intent",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert [step["reviewer_status"] for step in reviewer_events] == ["answered"]
+
+
+def test_scoped_category_to_intent_breakdown_guards_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for intent distribution within a category.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "category",
+                    "value": "ACCOUNT",
+                    "count": 5986,
+                    "score": 1.0,
+                    "reason": "Exact normalized value match.",
+                }
+            ],
+            recommended_filter={
+                "category": "ACCOUNT",
+                "intent": None,
+            },
+            confidence="high",
+        ),
+    )
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "create_account", "count": 997},
+                {"label": "delete_account", "count": 995},
+            ],
+            match_count=5986,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "intent",
+            },
+        ),
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "ACCOUNT",
+                "columns": ["category"],
+                "top_k": 5,
+            },
+        ),
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "intent",
+                "category": "ACCOUNT",
+                "top_k": 20,
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="A category value must be resolved before scoped intent grouping.",
+            suggested_tool_name="resolve_filter_value",
+            suggested_tool_input={
+                "query": "ACCOUNT",
+                "columns": ["category"],
+                "top_k": 5,
+            },
+        ),
+        _review_needs_more(
+            reason="Now group intents using the resolved ACCOUNT category filter.",
+            suggested_tool_name="group_counts",
+            suggested_tool_input={
+                "group_by": "intent",
+                "category": "ACCOUNT",
+                "top_k": 20,
+            },
+        ),
+        _review_answer(
+            "The ACCOUNT category has create_account (997) and delete_account (995)."
+        ),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down ACCOUNT by intent.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["final_answer"] == (
+        "The ACCOUNT category has create_account (997) and delete_account (995)."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
+        "group_counts",
+        "resolve_filter_value",
+        "group_counts",
+    ]
+    assert "group_counts needs a category filter" in tool_events[0]["observation"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "intent",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert tool_events[2]["tool_input"] == {
+        "group_by": "intent",
+        "category": "ACCOUNT",
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+
+
+def test_scoped_intent_to_category_breakdown_guards_unfiltered_group_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "route_query_with_reason",
+        lambda query: graph.RouteDecision(
+            route="structured",
+            reason="The user asks for category distribution within an intent.",
+        ),
+    )
+    _patch_common_graph_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        tool_executor,
+        "resolve_filter_value_impl",
+        lambda query, columns=None, top_k=5: _model_result(
+            query=query,
+            candidates=[
+                {
+                    "column": "intent",
+                    "value": "track_refund",
+                    "count": 11,
+                    "score": 1.0,
+                    "reason": "Exact normalized value match.",
+                }
+            ],
+            recommended_filter={
+                "category": None,
+                "intent": "track_refund",
+            },
+            confidence="high",
+        ),
+    )
+    monkeypatch.setattr(
+        tool_executor,
+        "group_counts_impl",
+        lambda group_by, category=None, intent=None, text_query=None, top_k=20: _model_result(
+            group_by=group_by,
+            counts=[
+                {"label": "REFUND", "count": 11},
+            ],
+            match_count=11,
+            applied_filters={
+                "category": category,
+                "intent": intent,
+                "text_query": text_query,
+            },
+        ),
+    )
+
+    planner = FakePlannerLLM(
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "category",
+            },
+        ),
+        _plan_call(
+            "resolve_filter_value",
+            {
+                "query": "track_refund",
+                "columns": ["intent"],
+                "top_k": 5,
+            },
+        ),
+        _plan_call(
+            "group_counts",
+            {
+                "group_by": "category",
+                "intent": "track_refund",
+                "top_k": 20,
+            },
+        ),
+    )
+    reviewer = FakeReviewerLLM(
+        _review_needs_more(
+            reason="An intent value must be resolved before scoped category grouping.",
+            suggested_tool_name="resolve_filter_value",
+            suggested_tool_input={
+                "query": "track_refund",
+                "columns": ["intent"],
+                "top_k": 5,
+            },
+        ),
+        _review_needs_more(
+            reason="Now group categories using the resolved track_refund intent filter.",
+            suggested_tool_name="group_counts",
+            suggested_tool_input={
+                "group_by": "category",
+                "intent": "track_refund",
+                "top_k": 20,
+            },
+        ),
+        _review_answer("The track_refund intent appears under REFUND 11 times."),
+    )
+
+    monkeypatch.setattr(agent_loop, "get_structured_tool_planner_llm", lambda: planner)
+    monkeypatch.setattr(agent_loop, "get_structured_observation_reviewer_llm", lambda: reviewer)
+
+    result = graph.invoke_agent(
+        query="Break down track_refund by category.",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["final_answer"] == (
+        "The track_refund intent appears under REFUND 11 times."
+    )
+
+    tool_events = _tool_events(result["tool_trace"])
+    assert [step["tool_name"] for step in tool_events] == [
+        "group_counts",
+        "resolve_filter_value",
+        "group_counts",
+    ]
+    assert "group_counts needs an intent filter" in tool_events[0]["observation"]
+    assert tool_events[0]["tool_input"] == {
+        "group_by": "category",
+        "category": None,
+        "intent": None,
+        "text_query": None,
+        "top_k": 20,
+    }
+    assert tool_events[2]["tool_input"] == {
+        "group_by": "category",
+        "category": None,
+        "intent": "track_refund",
+        "text_query": None,
+        "top_k": 20,
+    }
+
+
 def test_assignment_question_account_intent_distribution_groups_with_category_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

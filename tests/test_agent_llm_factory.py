@@ -110,7 +110,7 @@ def test_get_structured_tool_planner_llm_uses_smaller_output_budget(
 ) -> None:
     llm = llm_factory.get_structured_tool_planner_llm()
 
-    assert llm.max_tokens == 512
+    assert llm.max_tokens == 1024
     assert llm.structured_schema is llm_factory.ToolPlanDecision
 
 

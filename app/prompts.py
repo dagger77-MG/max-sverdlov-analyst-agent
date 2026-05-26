@@ -52,6 +52,12 @@ Rules:
 - Use only the current user query, recent structured results, user profile, and tool observations.
 - Reviewer feedback is advisory, not authoritative. Follow it when it is useful
   and consistent with the tool trace.
+- If reviewer feedback says a filtered category/intent analysis call lacked
+  validation, call the suggested resolve_filter_value next unless that exact
+  resolver call already exists in the current trace. Do not repeat the same
+  invalid filtered analysis call.
+- If a current-turn analysis observation is valid evidence and answers the
+  exact request, produce a final answer instead of looking for extra tools.
 - Do not follow reviewer feedback that repeats an already executed tool call,
   contradicts resolver finality rules, or asks to narrow a broad phrase to
   intent after resolve_filter_value already searched both category and intent
@@ -61,6 +67,17 @@ Rules:
 - Never use previous unrelated results as proof that a new user-provided category
   or intent value is valid. A previous successful REFUND resolution does not
   validate SHIPPING, ACCOUNT, DELIVERY, or any other new value.
+- Do not repeat the tool call if you have enough evidence from previous observations.
+- If existing observations answer the exact request, the structured output must
+  use action="final_answer". Set tool_name="", tool_input={{}}, and final_answer
+  to the grounded answer text.
+- Never set action="call_tool" when your reason says the existing observations
+  are sufficient, no extra tool is needed, or a final answer should be produced.
+- action="call_tool" is only for a useful tool call that is still missing from
+  the current turn trace.
+- If reviewer feedback says an already-executed tool call was suggested as a
+  duplicate, and that existing observation answers the request, return
+  action="final_answer" instead of calling the duplicate tool.
 
 Evidence rules:
 - For all distinct categories or intents, use group_counts, not get_dataset_schema sample values.
@@ -81,6 +98,10 @@ Filter resolution rules:
   resolve_filter_value first. The analysis tool may only be called after
   resolve_filter_value returns confidence medium/high and recommended_filter
   contains the exact column/value to use.
+- Values that look like dataset labels are not self-validating. Snake_case
+  values such as "delete_account", "cancel_subscription", or "track_order",
+  and uppercase values such as "SHIPPING" or "ACCOUNT", must still be resolved
+  before they are used as category or intent filters.
 - If an analysis tool input has category=None and intent=None, it is unfiltered
   and does not require resolve_filter_value.
 - If the user explicitly says "intent", resolve only against columns=["intent"].
@@ -189,6 +210,9 @@ Hard rules:
    input. Never suggest dataset tools for profile/memory questions.
 10. Never re-validate a category or intent after resolve_filter_value already
    recommended that exact value with medium/high confidence in the same trace.
+11. If a current-turn observation is valid evidence and answers the exact user
+   request, return answered instead of recommending another tool.
+12. Do not recommend re-run tool if you have enough evidence from previous observations.
 
 Filter rules:
 1. A filtered count_rows, sample_examples, group_counts, or summarize_rows call
@@ -246,10 +270,15 @@ Scoped distribution rules:
    group_counts observation with the requested scope already applied:
    - "distribution of intents in X category" requires group_by="intent" and category=X.
    - "distribution of categories in X intent" requires group_by="category" and intent=X.
-3. If the required scoped group_counts observation is missing, suggest only the
+3. If the trace already contains both:
+   - resolve_filter_value validating the required scope value with medium/high
+     confidence, and
+   - group_counts with the requested group_by and that resolved filter,
+   return answered. Do not suggest the same group_counts call again.
+4. If the required scoped group_counts observation is missing, suggest only the
    missing scoped group_counts call. Do not suggest extra validation after the
    category or intent was already resolved with medium/high confidence.
-4. For full distributions, top_k=5 is usually incomplete unless the user asked
+5. For full distributions, top_k=5 is usually incomplete unless the user asked
    for top 5. Prefer top_k=20 or higher.
 
 Count rules:
