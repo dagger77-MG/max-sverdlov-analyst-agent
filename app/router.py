@@ -26,56 +26,28 @@ class RouteDecision(BaseModel):
         )
     )
     reason: str = Field(
+        min_length=1,
+        max_length=160,
         description="Brief explanation of why this route was selected."
     )
 
 
-ROUTER_SYSTEM_PROMPT = """You are a router for a Bitext Customer Service dataset analyst agent.
+ROUTER_SYSTEM_PROMPT = """Return exactly one JSON object. The first character must be "{". No prose, no markdown, no analysis.
 
-Your only task is to classify the user's query into exactly one route:
+Schema:
+{"route":"structured|unstructured|out_of_scope","reason":"short reason"}
 
-1. structured
-Use this when the user asks for exact dataset operations over the Bitext Customer Service dataset, including:
-- counts
-- filters
-- examples
-- samples
-- group counts
-- category or intent distributions
-- most common category or intent
-- row counts
-- follow-up requests like "show me more", "what about refunds?", or "total of the last two"
-- questions about the saved user profile, such as "what do you remember about me?"
+Routes:
+- structured: exact dataset/profile operations: counts, filters, examples, samples, group counts, category/intent distributions, row counts, "show more", "what about X?", "total of last two", or saved-profile questions.
+- unstructured: qualitative dataset analysis: summaries, themes, patterns, tone, pain points, interpretation, or recommended/support response patterns.
+- out_of_scope: external facts, news, weather, politics, sports, recipes, movies, general knowledge, or anything unrelated to the Bitext dataset/profile.
 
-2. unstructured
-Use this when the user asks for qualitative analysis over Bitext Customer Service dataset rows, including:
-- summaries
-- themes
-- patterns
-- common customer requests
-- tone analysis
-- customer pain points
-- interpretation of categories or intents
-- recommended/support response patterns, such as a recommended answer for complaints
+Tie-breakers:
+- If the query is a short follow-up like "what about X?", choose structured.
+- If the query asks to summarize, interpret, analyze, or recommend an answer, choose unstructured.
+- If the query asks about external world knowledge, choose out_of_scope.
 
-3. out_of_scope
-Use this when the query is not about:
-- the Bitext Customer Service dataset,
-- dataset analysis,
-- the current conversation context,
-- or the saved user profile.
-
-Rules:
-- Do not answer the user question.
-- Do not use general knowledge.
-- Only classify the route.
-- Dataset-related paraphrases should still be routed correctly.
-  For example, "reimbursement cases" can be structured if it likely means refund examples.
-- If the user asks about external facts, news, weather, politics, sports, recipes, movies, or general knowledge, classify as out_of_scope.
-
-- Return exactly one JSON object and no other text:
-  {"route":"structured|unstructured|out_of_scope","reason":"short reason"}
-- Do not include reasoning, markdown, prose, or text before/after the JSON.
+Output JSON only.
 """
 
 
@@ -163,6 +135,9 @@ def _build_responses_payload(messages: list[BaseMessage]) -> dict[str, Any]:
             },
         },
         "max_output_tokens": settings.router_max_tokens,
+        "reasoning": {
+            "effort": "minimal",
+        },
         "parallel_tool_calls": False,
         "tool_choice": "none",
         "stream": False,
@@ -222,13 +197,8 @@ def _response_failure_details(response_body: dict[str, Any]) -> str:
     )
 
 
-def _extract_response_text(response_body: dict[str, Any]) -> str:
-    """Extract output text from a Responses API response body."""
-    if response_body.get("error") or response_body.get("incomplete_details"):
-        raise ValueError(
-            "Nebius router response was not complete. "
-            f"{_response_failure_details(response_body)}"
-        )
+def _collect_response_text(response_body: dict[str, Any]) -> str:
+    """Collect output text from a Responses API response body when available."""
 
     output_text = response_body.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
@@ -248,6 +218,36 @@ def _extract_response_text(response_body: dict[str, Any]) -> str:
     combined_text = "".join(text_parts).strip()
     if combined_text:
         return combined_text
+
+    return ""
+
+
+def _response_text_preview(text: str, max_chars: int = 1000) -> str:
+    """Return a compact repr-friendly preview of partial model output."""
+    stripped_text = text.strip()
+
+    if not stripped_text:
+        return "<empty>"
+
+    if len(stripped_text) <= max_chars:
+        return stripped_text
+
+    return stripped_text[:max_chars] + "...<truncated>"
+
+
+def _extract_response_text(response_body: dict[str, Any]) -> str:
+    """Extract output text from a Responses API response body."""
+    collected_text = _collect_response_text(response_body)
+
+    if response_body.get("error") or response_body.get("incomplete_details"):
+        raise ValueError(
+            "Nebius router response was not complete. "
+            f"{_response_failure_details(response_body)}; "
+            f"partial_output_preview={_response_text_preview(collected_text)!r}"
+        )
+
+    if collected_text:
+        return collected_text
 
     raise ValueError(
         "Nebius router response did not contain output text. "
