@@ -82,7 +82,8 @@ bitext_agent/
 │       ├── loop.py
 │       ├── profile.py
 │       ├── schemas.py
-│       └── tool_executor.py
+│       ├── tool_executor.py
+|       └── grouping_intent.py
 ├── tests/
 │   ├── test_config.py
 │   ├── test_data_loader.py
