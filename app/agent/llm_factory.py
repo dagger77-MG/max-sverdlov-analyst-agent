@@ -49,7 +49,7 @@ def get_agent_llm():
 def get_structured_tool_planner_llm():
     """Return a cached model configured for next-tool planning decisions."""
     return _create_agent_chat_llm(
-        max_tokens=min(settings.max_tokens, 512),
+        max_tokens=min(settings.max_tokens, 1024),
     ).with_structured_output(ToolPlanDecision)
 
 

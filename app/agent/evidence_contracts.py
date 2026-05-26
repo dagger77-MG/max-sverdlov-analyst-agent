@@ -7,10 +7,11 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from app.agent.context import latest_user_message
-from app.agent.tool_executor import (
-    _normalize_resolve_filter_value_input,
-    _requires_grouped_filtered_scope,
+from app.agent.grouping_intent import (
+    analyze_grouping_request,
+    is_valid_group_counts_evidence,
 )
+from app.agent.tool_executor import _normalize_resolve_filter_value_input
 from app.state import AgentState, ToolTraceItem
 
 
@@ -196,23 +197,22 @@ def _return_deterministic_sample_examples_answer_if_ready(
     return None
 
 
-def _has_filtered_group_counts_trace(
+def _has_valid_group_counts_evidence(
     state: AgentState,
-    group_by: str,
-    required_filter_column: str,
+    query: str,
 ) -> bool:
-    """Return True when group_counts ran with the required semantic filter."""
+    """Return True when group_counts evidence matches the parsed request."""
     for item in _tool_trace_items(state):
         if item["tool_name"] != "group_counts":
             continue
-        if item["tool_input"].get("group_by") != group_by:
-            continue
-        if not item["tool_input"].get(required_filter_column):
-            continue
-        if _trace_observation_is_error(item["observation"]):
-            continue
-        return True
+        if is_valid_group_counts_evidence(
+            query=query,
+            tool_input=item["tool_input"],
+            observation=item["observation"],
+        ):
+            return True
     return False
+
 
 
 def _has_resolver_trace_for_column(state: AgentState, column: str) -> bool:
@@ -349,48 +349,53 @@ def _semantic_summary_contract_error(state: AgentState) -> str | None:
 
 
 def _answer_contract_error(state: AgentState) -> str | None:
-    """Block final answers for scoped distributions until scoped grouping exists."""
+    """Block final answers until required deterministic evidence exists."""
     user_query = latest_user_message(state["messages"])
+    grouping_request = analyze_grouping_request(user_query)
 
-    if _requires_grouped_filtered_scope(user_query, group_by="intent"):
-        if _has_filtered_group_counts_trace(
-            state=state,
-            group_by="intent",
-            required_filter_column="category",
-        ):
+    if grouping_request.is_grouping_request:
+        if _has_valid_group_counts_evidence(state=state, query=user_query):
             return None
 
-        if _has_resolver_trace_for_column(state, "category"):
-            return (
-                "The category has been resolved, but group_counts has not been "
-                "called with group_by='intent' and that category filter yet."
-            )
-
-        return (
-            "The user asked for an intent distribution inside a category. "
-            "Valid evidence requires resolving the category and calling "
-            "group_counts with group_by='intent' and category=<resolved_category>."
-        )
-
-    if _requires_grouped_filtered_scope(user_query, group_by="category"):
-        if _has_filtered_group_counts_trace(
-            state=state,
-            group_by="category",
-            required_filter_column="intent",
-        ):
+        requested_group_by = grouping_request.requested_group_by
+        if requested_group_by is None:
             return None
 
-        if _has_resolver_trace_for_column(state, "intent"):
+        if not grouping_request.is_scoped:
             return (
-                "The intent has been resolved, but group_counts has not been "
-                "called with group_by='category' and that intent filter yet."
+                "The user asked for a full-dataset "
+                f"{requested_group_by} distribution. Valid evidence requires "
+                "an unfiltered group_counts call with "
+                f"group_by='{requested_group_by}'."
             )
 
-        return (
-            "The user asked for a category distribution inside an intent. "
-            "Valid evidence requires resolving the intent and calling "
-            "group_counts with group_by='category' and intent=<resolved_intent>."
-        )
+        required_filter_column = grouping_request.required_filter_column
+        if required_filter_column is None:
+            return None
+
+        if _has_resolver_trace_for_column(state, required_filter_column):
+            return (
+                f"The {required_filter_column} has been resolved, but "
+                "group_counts has not been called with "
+                f"group_by='{requested_group_by}' and that "
+                f"{required_filter_column} filter yet."
+            )
+
+        if required_filter_column == "category":
+            return (
+                "The user asked for an intent distribution inside a category. "
+                "Valid evidence requires resolving the category and calling "
+                "group_counts with group_by='intent' and "
+                "category=<resolved_category>."
+            )
+
+        if required_filter_column == "intent":
+            return (
+                "The user asked for a category distribution inside an intent. "
+                "Valid evidence requires resolving the intent and calling "
+                "group_counts with group_by='category' and "
+                "intent=<resolved_intent>."
+            )
 
     semantic_summary_error = _semantic_summary_contract_error(state)
     if semantic_summary_error:

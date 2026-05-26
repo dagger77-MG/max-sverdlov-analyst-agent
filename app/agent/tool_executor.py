@@ -5,6 +5,10 @@ import re
 from typing import Any
 
 from app.agent.context import latest_user_message
+from app.agent.grouping_intent import (
+    analyze_grouping_request,
+    requires_scope_filter,
+)
 from app.memory import read_user_profile_impl
 from app.state import AgentState, AnalysisResult, ToolTraceItem
 from app.tools import (
@@ -205,36 +209,7 @@ def _format_model_dict(data: dict[str, Any]) -> str:
 
 def _is_distribution_query(query: str) -> bool:
     """Return True when the user asks for a distribution or breakdown."""
-    normalized = query.strip().lower()
-
-    if not normalized:
-        return False
-
-    distribution_markers = (
-        "distribution",
-        "breakdown",
-        "group count",
-        "group counts",
-        "count by",
-        "counts by",
-        "by category",
-        "by intent",
-    )
-
-    scoped_grouping_patterns = (
-        r"\bbreak\s+down\b",
-        r"\bintents?\s+breakdown\b",
-        r"\bcategor(?:y|ies)\s+breakdown\b",
-        r"\b(?:what|which)\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
-        r"\b(?:what|which)\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
-        r"\bintents?\s+(?:under|within|inside)\b",
-        r"\bcategor(?:y|ies)\s+(?:under|within|inside)\b",
-    )
-
-    return (
-            any(marker in normalized for marker in distribution_markers)
-            or any(re.search(pattern, normalized) for pattern in scoped_grouping_patterns)
-    )
+    return analyze_grouping_request(query).is_grouping_request
 
 
 def _has_explicit_top_k_request(query: str) -> bool:
@@ -253,46 +228,7 @@ def _has_explicit_top_k_request(query: str) -> bool:
 
 def _requires_grouped_filtered_scope(query: str, group_by: str) -> bool:
     """Detect grouped questions that require a prior filtered subset."""
-    normalized = query.strip().lower()
-
-    if not _is_distribution_query(normalized):
-        return False
-
-    if group_by == "intent":
-        return (
-            "category" in normalized
-            or bool(
-                re.search(r"\bbreak\s+down\s+.+\s+by\s+intents?\b", normalized)
-                or re.search(
-                    r"\bintents?\s+breakdown\s+(?:for|in|inside|under|within)\b",
-                    normalized,
-                )
-                or re.search(
-                    r"\b(?:what|which)\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
-                    normalized,
-                )
-                or re.search(r"\bintents?\s+(?:under|within|inside)\b", normalized)
-            )
-        )
-
-    if group_by == "category":
-        return (
-            "intent" in normalized
-            or bool(
-                re.search(r"\bbreak\s+down\s+.+\s+by\s+categor(?:y|ies)\b", normalized)
-                or re.search(
-                    r"\bcategor(?:y|ies)\s+breakdown\s+(?:for|in|inside|under|within)\b",
-                    normalized,
-                )
-                or re.search(
-                    r"\b(?:what|which)\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
-                    normalized,
-                )
-                or re.search(r"\bcategor(?:y|ies)\s+(?:under|within|inside)\b", normalized)
-            )
-        )
-
-    return False
+    return requires_scope_filter(query=query, group_by=group_by)
 
 
 def _format_sample_examples_observation(
@@ -437,10 +373,15 @@ def _execute_selected_tool(
             )
 
         user_query = latest_user_message(state["messages"])
+        grouping_request = analyze_grouping_request(user_query)
+        required_filter_column = (
+            grouping_request.required_filter_column
+            if grouping_request.requested_group_by == group_by
+            else None
+        )
         if (
-            _requires_grouped_filtered_scope(user_query, group_by)
-            and group_by == "intent"
-            and not normalized_input.get("category")
+                required_filter_column == "category"
+                and not normalized_input.get(required_filter_column)
         ):
             _append_tool_error(
                 state=state,
@@ -458,9 +399,8 @@ def _execute_selected_tool(
             return
 
         if (
-            _requires_grouped_filtered_scope(user_query, group_by)
-            and group_by == "category"
-            and not normalized_input.get("intent")
+            required_filter_column == "intent"
+            and not normalized_input.get(required_filter_column)
         ):
             _append_tool_error(
                 state=state,
