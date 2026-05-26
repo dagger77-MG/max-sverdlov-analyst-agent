@@ -18,7 +18,6 @@ def _model_result(**values):
 
 def test_mcp_server_exposes_expected_tools_only() -> None:
     assert hasattr(mcp_server, "get_dataset_schema")
-    assert hasattr(mcp_server, "read_user_profile")
     assert hasattr(mcp_server, "resolve_filter_value")
     assert hasattr(mcp_server, "count_rows")
     assert hasattr(mcp_server, "sample_examples")
@@ -27,31 +26,6 @@ def test_mcp_server_exposes_expected_tools_only() -> None:
 
     assert not hasattr(mcp_server, "filter_rows")
     assert not hasattr(mcp_server, "update_user_profile")
-
-
-def test_read_user_profile_delegates_to_memory_impl(monkeypatch) -> None:
-    captured_inputs: list[str] = []
-
-    def fake_read_user_profile_impl(user_id: str):
-        captured_inputs.append(user_id)
-        return _model_result(
-            user_id=user_id,
-            profile="# User Profile\n\n- Test profile\n",
-        )
-
-    monkeypatch.setattr(
-        mcp_server,
-        "read_user_profile_impl",
-        fake_read_user_profile_impl,
-    )
-
-    result = mcp_server.read_user_profile(user_id="max")
-
-    assert captured_inputs == ["max"]
-    assert result == {
-        "user_id": "max",
-        "profile": "# User Profile\n\n- Test profile\n",
-    }
 
 
 def test_get_dataset_schema_delegates_to_tools_impl(monkeypatch) -> None:
