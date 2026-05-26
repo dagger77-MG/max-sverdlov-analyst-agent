@@ -131,13 +131,13 @@ def _failed_explicit_resolver_final_answer(state: AgentState) -> str | None:
     if columns == ["intent"] and "intent" in user_query:
         return (
             f'No matching intent value exists for "{query}" in the dataset, '
-            "so I can't show examples for that intent."
+            "so I can't answer that request using that intent."
         )
 
     if columns == ["category"] and "category" in user_query:
         return (
             f'No matching category value exists for "{query}" in the dataset, '
-            "so I can't show examples for that category."
+            "so I can't answer that request using that category."
         )
 
     return None

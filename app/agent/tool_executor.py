@@ -221,7 +221,20 @@ def _is_distribution_query(query: str) -> bool:
         "by intent",
     )
 
-    return any(marker in normalized for marker in distribution_markers)
+    scoped_grouping_patterns = (
+        r"\bbreak\s+down\b",
+        r"\bintents?\s+breakdown\b",
+        r"\bcategor(?:y|ies)\s+breakdown\b",
+        r"\bwhat\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+        r"\bwhat\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+        r"\bintents?\s+(?:under|within|inside)\b",
+        r"\bcategor(?:y|ies)\s+(?:under|within|inside)\b",
+    )
+
+    return (
+            any(marker in normalized for marker in distribution_markers)
+            or any(re.search(pattern, normalized) for pattern in scoped_grouping_patterns)
+    )
 
 
 def _has_explicit_top_k_request(query: str) -> bool:
@@ -245,11 +258,39 @@ def _requires_grouped_filtered_scope(query: str, group_by: str) -> bool:
     if not _is_distribution_query(normalized):
         return False
 
-    if group_by == "intent" and "category" in normalized:
-        return True
+    if group_by == "intent":
+        return (
+            "category" in normalized
+            or bool(
+                re.search(r"\bbreak\s+down\s+.+\s+by\s+intents?\b", normalized)
+                or re.search(
+                    r"\bintents?\s+breakdown\s+(?:for|in|inside|under|within)\b",
+                    normalized,
+                )
+                or re.search(
+                    r"\bwhat\s+intents?\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+                    normalized,
+                )
+                or re.search(r"\bintents?\s+(?:under|within|inside)\b", normalized)
+            )
+        )
 
-    if group_by == "category" and "intent" in normalized:
-        return True
+    if group_by == "category":
+        return (
+            "intent" in normalized
+            or bool(
+                re.search(r"\bbreak\s+down\s+.+\s+by\s+categor(?:y|ies)\b", normalized)
+                or re.search(
+                    r"\bcategor(?:y|ies)\s+breakdown\s+(?:for|in|inside|under|within)\b",
+                    normalized,
+                )
+                or re.search(
+                    r"\bwhat\s+categor(?:y|ies)\s+(?:appear|exist|occur|show\s+up)\s+(?:under|within|inside)\b",
+                    normalized,
+                )
+                or re.search(r"\bcategor(?:y|ies)\s+(?:under|within|inside)\b", normalized)
+            )
+        )
 
     return False
 
