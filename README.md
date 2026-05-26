@@ -240,7 +240,6 @@ python -m app.mcp_server
 The MCP server exposes these tools:
 
 ```text
-read_user_profile
 get_dataset_schema
 resolve_filter_value
 count_rows
@@ -249,38 +248,12 @@ group_counts
 summarize_rows
 ```
 
-The MCP server does **not** expose:
-
-```text
-filter_rows
-update_user_profile
-```
-
-The dataset tools use semantic filters directly:
-
-```text
-category
-intent
-text_query
-```
-
-Row-id list workflows are intentionally not exposed.
-
 ## MCP Tool Reply Format
 
 Each MCP tool returns a plain dictionary created from the corresponding Pydantic output model with:
 
 ```python
 result.model_dump()
-```
-
-### read_user_profile
-
-```json
-{
-  "user_id": "max",
-  "profile": "# User Profile\n\n- User prefers file-by-file implementation review.\n"
-}
 ```
 
 ### get_dataset_schema

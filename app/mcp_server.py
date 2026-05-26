@@ -25,13 +25,6 @@ mcp = FastMCP("bitext-data-tools")
 
 
 @mcp.tool
-def read_user_profile(user_id: str) -> dict:
-    """Read the persistent distilled profile for a user."""
-    result = read_user_profile_impl(user_id=user_id)
-    return result.model_dump()
-
-
-@mcp.tool
 def get_dataset_schema(include_sample_values: bool = True) -> dict:
     """Return Bitext dataset columns, row count, and optional sample values."""
     validated = GetDatasetSchemaInput(include_sample_values=include_sample_values)
