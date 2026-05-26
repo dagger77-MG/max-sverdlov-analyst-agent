@@ -41,6 +41,7 @@ AVAILABLE_TOOL_GUIDE = """Available tools:
 - group_counts(group_by: "category" | "intent", category: str | None = None, intent: str | None = None, text_query: str | None = None, top_k: int = 20): returns distinct category/intent labels with counts, optionally within semantic filters.
 - summarize_rows(category: str | None = None, intent: str | None = None, text_query: str | None = None, focus: str, target_field: "instruction" | "response" | "both" = "both", max_examples: int = 100): summarizes matching rows.
 - read_user_profile(user_id: str): reads saved user profile.
+- read_recent_results(): reads recent stored structured results from previous turns, including labels, values, filters, query types, and match counts.
 """
 
 PLANNER_SYSTEM_PROMPT = f"""You are the tool-planning node for a Bitext Customer Service dataset agent.
@@ -67,7 +68,14 @@ Rules:
 - Never use previous unrelated results as proof that a new user-provided category
   or intent value is valid. A previous successful REFUND resolution does not
   validate SHIPPING, ACCOUNT, DELIVERY, or any other new value.
-- Do not repeat the tool call if you have enough evidence from previous observations.
+- Previous-turn results are not current-turn evidence until you call
+  read_recent_results.
+- For follow-up questions that refer to previous, latest, last, earlier, the
+  last two, totals, sums, differences, comparisons, or previously used filters,
+  call read_recent_results first.
+- Do not interpret phrases like "last two", "previous result", or "latest one"
+  as dataset text_query values, category values, or intent values.
+- After read_recent_results returns enough evidence, answer from that observation.
 - If existing observations answer the exact request, the structured output must
   use action="final_answer". Set tool_name="", tool_input={{}}, and final_answer
   to the grounded answer text.
@@ -166,6 +174,12 @@ Task patterns:
   columns=["intent"], then call group_counts(group_by="category", intent=X, top_k=20).
 - group_counts without category/intent/text_query filters groups the entire
   dataset, so it is invalid evidence for a distribution inside a category or intent.
+- For follow-ups over prior results, call read_recent_results before any dataset
+  analysis tool. Examples: "total of the last two", "which one was bigger?",
+  "what filters did you use?", "repeat the previous one", "compare the last
+  results", or "what was the previous count?"
+- If read_recent_results contains enough stored values to answer arithmetic or
+  comparison questions, produce the final answer without new dataset tools.
 - For profile questions, use read_user_profile.
 
 {AVAILABLE_TOOL_GUIDE}
@@ -212,7 +226,13 @@ Hard rules:
    recommended that exact value with medium/high confidence in the same trace.
 11. If a current-turn observation is valid evidence and answers the exact user
    request, return answered instead of recommending another tool.
-12. Do not recommend re-run tool if you have enough evidence from previous observations.
+12. Do not recommend re-run tool if you have enough evidence from current-turn
+   observations.
+13. read_recent_results is valid current-turn evidence for questions about
+   previous, latest, last, earlier, the last two, totals, sums, differences,
+   comparisons, or previously used filters.
+14. If a follow-up refers to previous results and read_recent_results has not
+   run in the current trace, suggest read_recent_results with empty input.
 
 Filter rules:
 1. A filtered count_rows, sample_examples, group_counts, or summarize_rows call
@@ -285,6 +305,7 @@ Count rules:
 1. Count questions require count_rows unless another already-observed tool
    directly reports the exact matching row count for the same semantic filters.
 2. Return answered when count_rows matches the validated semantic filters.
+
 
 Example rules:
 1. Example/sample/case/row requests require sample_examples unless the resolved
