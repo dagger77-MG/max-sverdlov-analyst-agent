@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from functools import lru_cache
 from typing import Any
@@ -17,6 +18,12 @@ from app.router import RouteDecision, route_query_with_reason
 from app.state import AgentState
 
 logger = logging.getLogger(__name__)
+
+CAPABILITIES_HELP_RESPONSE = (
+    "I can analyze the Bitext Customer Service dataset: counts, examples, "
+    "category/intent breakdowns, summaries, response patterns, follow-up "
+    "questions, and your saved profile."
+)
 
 
 def create_initial_state(
@@ -38,6 +45,57 @@ def create_initial_state(
         max_iterations=settings.normalize_max_iterations(max_iterations),
         final_answer=None,
     )
+
+
+def _is_capabilities_query(query: str) -> bool:
+    """Return True when the user asks what this agent can do."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", query.lower()).strip()
+
+    if not normalized:
+        return False
+
+    exact_queries = {
+        "help",
+        "what can you do",
+        "what do you do",
+        "how can i use you",
+        "how can i use this agent",
+        "what questions can i ask",
+        "what can i ask",
+        "explain your capabilities",
+        "show your capabilities",
+        "what is your purpose",
+        "what is this agent for",
+        "what are you for",
+        "who are you?",
+        "what is this agent?"
+    }
+
+    if normalized in exact_queries:
+        return True
+
+    return bool(
+        re.search(r"\bwhat\b.*\b(can|could)\b.*\b(agent|you)\b.*\bdo\b", normalized)
+        or re.search(r"\bhow\b.*\b(use|work with)\b.*\b(agent|you)\b", normalized)
+        or re.search(r"\b(available|supported)\b.*\bquestions\b", normalized)
+        or re.search(r"\bcapabilities\b", normalized)
+    )
+
+
+def route_after_profile_load(state: AgentState) -> str:
+    """Choose whether to answer capabilities/help before router classification."""
+    if _is_capabilities_query(latest_user_message(state["messages"])):
+        return "capabilities_help_node"
+
+    return "router_node"
+
+
+def capabilities_help_node(state: AgentState) -> dict[str, Any]:
+    """Return a deterministic short capabilities answer without LLM routing."""
+    return {
+        "final_answer": CAPABILITIES_HELP_RESPONSE,
+        "messages": [AIMessage(content=CAPABILITIES_HELP_RESPONSE)],
+    }
 
 
 def load_user_profile_node(state: AgentState) -> dict[str, Any]:
@@ -109,13 +167,21 @@ def build_graph():
     graph_builder = StateGraph(AgentState)
 
     graph_builder.add_node("load_user_profile_node", load_user_profile_node)
+    graph_builder.add_node("capabilities_help_node", capabilities_help_node)
     graph_builder.add_node("router_node", router_node)
     graph_builder.add_node("data_agent_loop_node", data_agent_loop_node)
     graph_builder.add_node("refusal_node", refusal_node)
     graph_builder.add_node("profile_update_node", profile_update_node)
 
     graph_builder.add_edge(START, "load_user_profile_node")
-    graph_builder.add_edge("load_user_profile_node", "router_node")
+    graph_builder.add_conditional_edges(
+        "load_user_profile_node",
+        route_after_profile_load,
+        {
+            "capabilities_help_node": "capabilities_help_node",
+            "router_node": "router_node",
+        },
+    )
     graph_builder.add_conditional_edges(
         "router_node",
         route_after_router,
@@ -126,6 +192,7 @@ def build_graph():
     )
     graph_builder.add_edge("data_agent_loop_node", "profile_update_node")
     graph_builder.add_edge("refusal_node", "profile_update_node")
+    graph_builder.add_edge("capabilities_help_node", END)
     graph_builder.add_edge("profile_update_node", END)
 
     return graph_builder.compile(checkpointer=get_checkpointer())

@@ -179,6 +179,9 @@ def _canonical_tool_input(
     if tool_name == "read_user_profile":
         return {}
 
+    if tool_name == "read_recent_results":
+        return {}
+
     return normalized_input
 
 
@@ -489,6 +492,21 @@ def _execute_selected_tool(
             tool_name,
             trace_input,
             _format_model_dict(result.model_dump()),
+        )
+        return
+
+    if tool_name == "read_recent_results":
+        recent_results = list(state["last_structured_results"])
+        observation = {
+            "result_count": len(recent_results),
+            "recent_results": recent_results,
+        }
+
+        _append_trace(
+            state,
+            tool_name,
+            {},
+            _format_model_dict(observation),
         )
         return
 

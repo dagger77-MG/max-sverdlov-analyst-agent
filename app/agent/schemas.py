@@ -13,6 +13,7 @@ PlannerToolName = Literal[
     "group_counts",
     "summarize_rows",
     "read_user_profile",
+    "read_recent_results",
 ]
 
 VALID_PLANNER_TOOL_NAMES = {
@@ -23,6 +24,7 @@ VALID_PLANNER_TOOL_NAMES = {
     "group_counts",
     "summarize_rows",
     "read_user_profile",
+    "read_recent_results",
 }
 
 

@@ -2073,6 +2073,66 @@ def test_route_after_router_sends_out_of_scope_to_refusal_node() -> None:
     assert graph.route_after_router(state) == "refusal_node"
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "help",
+        "What can you do?",
+        "What is your purpose?",
+        "What questions can I ask?",
+    ],
+)
+def test_capabilities_query_detector_matches_core_help_queries(
+    query: str,
+) -> None:
+    assert graph._is_capabilities_query(query) is True
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What do you remember about me?",
+        "How many refund requests did we get?",
+        "Summarize FEEDBACK.",
+    ],
+)
+def test_capabilities_query_detector_does_not_hijack_agent_queries(
+    query: str,
+) -> None:
+    assert graph._is_capabilities_query(query) is False
+
+
+def test_capabilities_help_query_bypasses_router_and_agent_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_common_graph_dependencies(monkeypatch)
+
+    def fail_if_router_called(query: str):
+        raise AssertionError("Router should not be called for capabilities help.")
+
+    def fail_if_planner_called():
+        raise AssertionError("Planner should not be called for capabilities help.")
+
+    monkeypatch.setattr(graph, "route_query_with_reason", fail_if_router_called)
+    monkeypatch.setattr(
+        agent_loop,
+        "get_structured_tool_planner_llm",
+        fail_if_planner_called,
+    )
+
+    result = graph.invoke_agent(
+        query="What is your purpose?",
+        session_id="test_session",
+        user_id="max",
+    )
+
+    assert result["route"] is None
+    assert result["route_reason"] is None
+    assert result["tool_trace"] == []
+    assert result["final_answer"] == graph.CAPABILITIES_HELP_RESPONSE
+    assert isinstance(result["messages"][-1], AIMessage)
+    assert result["messages"][-1].content == graph.CAPABILITIES_HELP_RESPONSE
+
 def test_follow_up_show_me_three_more_uses_previous_filters_and_offset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
