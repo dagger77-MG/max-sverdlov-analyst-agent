@@ -13,17 +13,22 @@ PROFILE_UPDATE_SYSTEM_PROMPT = """You decide whether a user message contains a d
 Save only stable information that may help future interactions, such as:
 - the user's name
 - durable preferences about how they want answers or code reviews
-- recurring project interests
+- explicitly stated recurring project interests
 - preferred tools or workflow style
 
+Save nothing unless the durable fact or preference is directly stated by the
+user. Do not infer interests, goals, preferences, or project context from a
+question they ask.
+
 If a message mixes a durable personal fact/preference with a dataset question,
-save only the durable personal fact/preference.
+save only the explicitly stated durable personal fact/preference.
 
 Do not save:
 - temporary questions
 - one-off dataset values
 - category, intent, row, count, or example requests from the Bitext dataset
 - facts inferred only from the user's current dataset query
+- inferred interests in dataset categories
 - full conversation history
 - sensitive information
 - facts about other people unless the user clearly wants them saved
